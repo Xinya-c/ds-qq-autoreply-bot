@@ -1,0 +1,861 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""记忆模块：QQ 自动回复机器人的全部记忆状态与读写。
+
+2026-10-23 从 qq_autoreply.py **纯搬迁**而来（第一批次：逻辑原样、
+零行为变化，由 tools/golden_prompt.py 哈希证明）。主程序只通过
+self.mem 访问这里的一切；LLM 调用经构造时注入的 llm_fn（内含模型链
+与 429 冷却逻辑，留在主程序）—— 记忆模块不直接碰模型细节。
+
+分层记忆：
+  短期  recent       每会话最近 N 条原文（recall 供数，同步写）
+  中期  stages       每 200 条压一段阶段回顾
+  长期  summary      每 50 条一次事实摘要（按会话）
+        profile      关系档案（私聊按人 / 群按群）
+        user_profile 群内个人档案（g<gid>|u<uid>，与群级并存）
+        style        说话风格档案（全局）
+        mood         情绪轨迹（关键词粗判，不花额度）
+  归档  qq_messages/*.md  全部消息原文（append-only，1MB 轮转）
+
+第二批（未做）计划：后台 writer 线程、pending 两次命中过滤器、
+关键词检索（tools/search_replay.py 已标定阈值）、/forget 命令。
+"""
+
+import glob
+import os
+import re
+import threading
+import time
+from collections import Counter, deque
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(BASE, "qq_autoreply.log")
+
+from qq_mcp_server import flatten_message  # noqa: E402
+
+_log_lock = threading.Lock()
+ARCH_LOCK = threading.Lock()
+
+
+def log(msg):
+    line = "[%s] %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    with _log_lock:
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+class BotMemory:
+    """一台机器人的全部记忆。llm_fn(prompt) 由主程序注入。"""
+
+    def __init__(self, cfg, llm_fn):
+        self.cfg = cfg
+        self.llm_fn = llm_fn
+        self.self_id = None              # 主程序连上 OneBot 后回填
+        self.history = {}                # conv_key -> deque of messages（API 后端用）
+        self.recent = {}                 # conv_key -> deque 最近消息（含未 @ 我的群消息）
+        self.summary = {}                # conv_key -> 长期记忆摘要文本
+        self.pending = {}
+        self.stage_pos = {}              # conv -> 归档里已压缩到第几行（中期记忆游标）
+        self.stages = {}                 # conv -> 阶段回顾文本（中期记忆）
+        self.profile = {}                # conv -> 关系档案（称呼/亲密度/禁忌）
+        self.user_profile = {}           # "g<gid>|u<uid>" -> 群内个人档案（与群级并存）
+        self.mood = {}                   # conv -> deque 最近情绪（情绪轨迹）
+        self.samples = []                # 手挑的风格样本（self_samples.md，可选）
+        self.style = ""                  # 长期养成的说话风格（全局，跨会话）
+        self.sent_since_style = 0        # 距上次提炼风格累计说过多少句
+
+    # ---------- 初始化（主程序 run() 里调用） ----------
+    def load_all(self):
+        self._restore_context()
+        self._load_summaries()
+        self._load_stages()
+        self._load_profiles()
+        self._load_style()
+        self._load_samples()
+
+    def start_backlog(self):
+        """启动时把积压的历史补压成阶段回顾（后台线程，不挡着收消息）。"""
+        threading.Thread(target=self._backlog_stages, daemon=True).start()
+
+    # ---------- 上下文缓冲 ----------
+    def allowed(self, evt):
+        if evt.get("message_type") == "private":
+            return int(evt.get("user_id")) in [int(x) for x in self.cfg.get("allowed_private") or []]
+        if evt.get("message_type") == "group":
+            return int(evt.get("group_id")) in [int(x) for x in self.cfg.get("allowed_groups") or []]
+        return False
+
+    def conv_of(self, evt):
+        if evt.get("message_type") == "group":
+            return "g%s" % evt.get("group_id")
+        return "u%s" % evt.get("user_id")
+
+    def remember_incoming(self, evt):
+        """把所有消息（含没 @ 我的群消息）记入上下文缓冲。"""
+        if not self.allowed(evt):
+            return
+        conv = self.conv_of(evt)
+        at_me = False
+        for seg in (evt.get("message") or []):
+            if isinstance(seg, dict) and seg.get("type") == "at" \
+                    and str((seg.get("data") or {}).get("qq")) == str(self.self_id):
+                at_me = True
+                break
+        sender = evt.get("sender") or {}
+        text = flatten_message(evt.get("message")).replace("@%s" % self.self_id, "").strip()
+        self._note_mood(conv, text)
+        d = self.recent.get(conv)
+        if d is None:
+            d = deque(maxlen=int(self.cfg.get("context_messages", 12)))
+            self.recent[conv] = d
+        d.append({
+            "mid": evt.get("message_id"),
+            "nick": sender.get("card") or sender.get("nickname") or str(evt.get("user_id")),
+            "uid": evt.get("user_id"),
+            "text": text or "[图片]",
+            "at_me": at_me,
+        })
+
+    def remember_bot(self, conv, text):
+        d = self.recent.get(conv)
+        if d is None:
+            d = deque(maxlen=int(self.cfg.get("context_messages", 12)))
+            self.recent[conv] = d
+        d.append({"mid": None, "nick": "我", "uid": self.self_id,
+                  "text": text, "at_me": False})
+        self.sent_since_style += 1
+
+    # ---------- 归档（按会话独立文档，超 1MB 轮转）----------
+    @staticmethod
+    def _ts(t=None):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(t)))
+        except Exception:
+            return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def archive_dir(self):
+        cfg = self.cfg.get("archive") or {}
+        d = cfg.get("dir") or os.path.join(BASE, "qq_messages")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def archive_write(self, conv, line):
+        cfg = self.cfg.get("archive") or {}
+        if not cfg.get("enabled", True):
+            return
+        try:
+            d = self.archive_dir()
+            prefix = "group" if conv.startswith("g") else "private"
+            cid = conv[1:]
+            path = os.path.join(d, "%s_%s.md" % (prefix, cid))
+            limit = int(cfg.get("max_bytes", 1048576))
+            data = line.encode("utf-8")
+            with ARCH_LOCK:
+                if os.path.exists(path) and os.path.getsize(path) + len(data) > limit:
+                    n = 1
+                    while os.path.exists(os.path.join(d, "%s_%s_%d.md" % (prefix, cid, n))):
+                        n += 1
+                    os.rename(path, os.path.join(d, "%s_%s_%d.md" % (prefix, cid, n)))
+                if not os.path.exists(path):
+                    title = "QQ 群消息归档" if prefix == "group" else "QQ 私聊归档"
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("# %s - %s\n\n> 单文件超 %d 字节自动轮转为 _N.md。\n\n"
+                                % (title, cid, limit))
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line)
+        except Exception as e:
+            log("归档写入失败: %s" % e)
+
+    @staticmethod
+    def _msg_kind(evt):
+        """给消息打类型标记（归档结构化用）：图 / 视频 / 语音 / 文件 / 引用 / @我 / 表情。"""
+        segs = evt.get("message") or []
+        types = [s.get("type") for s in segs if isinstance(s, dict)]
+        for t, name in (("image", "图"), ("video", "视频"),
+                        ("record", "语音"), ("file", "文件")):
+            if t in types:
+                return name
+        if "reply" in types:
+            return "引用"
+        has_text = any(t == "text" and ((s.get("data") or {}).get("text") or "").strip()
+                       for s, t in zip(segs, types) if isinstance(s, dict))
+        if "at" in types:
+            return "@我"
+        if not has_text and ("face" in types or "mface" in types):
+            return "表情"
+        return ""
+
+    def archive_incoming(self, evt):
+        conv = self.conv_of(evt)
+        sender = evt.get("sender") or {}
+        nick = sender.get("card") or sender.get("nickname") or str(evt.get("user_id"))
+        text = flatten_message(evt.get("message")).replace("@%s" % self.self_id, "").strip()
+        img = evt.get("_image")
+        if img:
+            # 有真实图片时，去掉 flatten 产生的 [图片] 占位，避免重复
+            text = text.replace("[图片]", "").strip()
+        parts = [text] if text else []
+        if img and img.get("path"):
+            try:
+                rel = os.path.relpath(img["path"], self.archive_dir()).replace("\\", "/")
+            except Exception:
+                rel = os.path.basename(img["path"])
+            size_txt = ("%.1fKB" % (img["size"] / 1024.0)) if img["size"] >= 1024 \
+                else ("%dB" % img["size"])
+            parts.append("【图片】%s (%s)" % (rel, size_txt))
+        elif evt.get("_has_image") and "[图片]" not in text:
+            parts.append("【图片】")
+        body = " ".join(parts) if parts else "（空消息）"
+        kind = self._msg_kind(evt)
+        self.archive_write(conv, "[%s] %s(%s): %s%s\n"
+                            % (self._ts(evt.get("time")), nick, evt.get("user_id"),
+                               body, ("  〔%s〕" % kind) if kind else ""))
+        self.pending[conv] = self.pending.get(conv, 0) + 1
+
+    def archive_outgoing(self, conv, text):
+        self.archive_write(conv, "[%s] 我: %s\n" % (self._ts(), text))
+        self.pending[conv] = self.pending.get(conv, 0) + 1
+
+    def _restore_context(self):
+        """启动时从 qq_messages 里回读最近消息，让重启后仍记得之前的聊天。"""
+        if not self.cfg.get("restore_context", True):
+            return
+        if not (self.cfg.get("archive") or {}).get("enabled", True):
+            return
+        try:
+            d = self.archive_dir()
+        except Exception:
+            return
+        n = int(self.cfg.get("context_messages", 12))
+        files = []
+        for pat, conv_prefix in (("private_*.md", "u"), ("group_*.md", "g")):
+            for p in glob.glob(os.path.join(d, pat)):
+                files.append((p, conv_prefix))
+        total = 0
+        convs = 0
+        for path, conv_prefix in files:
+            base = os.path.basename(path)
+            stem = base[:-3]
+            # private_123 / group_123，排除轮转出来的 _1.md
+            m_ = re.match(r"^(private|group)_(\d+)$", stem)
+            if not m_:
+                continue
+            conv = conv_prefix + m_.group(2)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except Exception:
+                continue
+            items = []
+            for ln in lines[-n:]:
+                mm = re.match(r"^\[([^\]]*)\]\s*(.+?):\s?(.*)$", ln)
+                if not mm:
+                    continue
+                who, text = mm.group(2), mm.group(3)
+                # 剥掉结构化类型标记 〔图〕 之类（老归档没有，kind 就是空）
+                kind = ""
+                km = re.search(r"〔([^〔〕]{1,6})〕\s*$", text)
+                if km:
+                    kind = km.group(1)
+                    text = text[:km.start()].rstrip()
+                uid = None
+                nick = who
+                mu = re.match(r"^(.*)\((\d+)\)$", who)
+                if mu:
+                    nick, uid = mu.group(1), int(mu.group(2))
+                items.append({"mid": None, "nick": nick, "uid": uid,
+                              "text": text, "at_me": False, "kind": kind})
+            if not items:
+                continue
+            dq = deque(maxlen=n)
+            dq.extend(items)
+            self.recent[conv] = dq
+            total += len(items)
+            convs += 1
+        if total:
+            log("已回读上次聊天记录：%d 个会话 / %d 条" % (convs, total))
+
+    # ---------- 长期记忆：滚动摘要 ----------
+    def _summary_path(self, conv):
+        prefix = "group" if conv.startswith("g") else "private"
+        return os.path.join(self.archive_dir(), "%s_%s_summary.md" % (prefix, conv[1:]))
+
+    def _cache_summary(self, conv):
+        """从摘要文件里取 - 开头的要点行，压成一段放进内存。"""
+        cfg = self.cfg.get("summary") or {}
+        try:
+            with open(self._summary_path(conv), encoding="utf-8") as f:
+                lines = [ln.rstrip() for ln in f]
+        except Exception:
+            self.summary.pop(conv, None)
+            return
+        pts = [ln for ln in lines if ln.startswith("- ")]
+        pts = pts[-int(cfg.get("max_points", 12)):]
+        text = "\n".join(pts).strip()
+        limit = int(cfg.get("max_chars", 1000))
+        if len(text) > limit:
+            text = text[:limit] + "…"
+        if text:
+            self.summary[conv] = text
+        else:
+            self.summary.pop(conv, None)
+
+    def _load_summaries(self):
+        try:
+            d = self.archive_dir()
+        except Exception:
+            return
+        for f in os.listdir(d):
+            m = re.match(r"^(?:private|group)_(\d+)_summary\.md$", f)
+            if not m:
+                continue
+            num = m.group(1)
+            # 文件名无法区分私聊/群？靠前缀判断
+            conv = ("u" if f.startswith("private_") else "g") + num
+            self._cache_summary(conv)
+
+    # ---------- 说话风格档案（全局，跨会话）----------
+    def _style_path(self):
+        return os.path.join(self.archive_dir(), "self_style.md")
+
+    def _load_style(self):
+        """启动时读回风格档案。它是全局的，不按会话拆。"""
+        try:
+            with open(self._style_path(), encoding="utf-8") as f:
+                lines = [ln.rstrip() for ln in f
+                         if ln.strip() and not ln.startswith(("#", ">"))]
+        except Exception:
+            self.style = ""
+            return
+        self.style = "\n".join(lines).strip()
+        if self.style:
+            log("已读回说话风格档案：%d 字" % len(self.style))
+
+    def maybe_update_style(self):
+        """用「我自己说过的话」当语料，定期把说话习惯沉淀成一份风格档案。
+
+        跟会话摘要分开存：摘要记的是「跟谁聊过什么」（事实，按会话），
+        风格档案记的是「我怎么说话」（习惯，全局共用）。
+        """
+        cfg = self.cfg.get("style") or {}
+        if not cfg.get("enabled", True):
+            return
+        every = int(cfg.get("every", 40) or 0)
+        if every <= 0 or self.sent_since_style < every:
+            return
+        mine = []
+        for d in self.recent.values():
+            for x in d:
+                if x.get("nick") == "我" and (x.get("text") or "").strip():
+                    mine.append(x["text"].strip())
+        mine = mine[-80:]
+        if len(mine) < 10:
+            return
+        self.sent_since_style = 0
+        log("  正在提炼说话风格（%d 句自己的回复）…" % len(mine))
+        prompt = (
+            "下面是「我」在 QQ 上跟朋友们聊天时说过的话，一行一句。\n"
+            "请归纳出「我」稳定下来的说话风格，输出 8-12 行，每行以「- 」开头：\n"
+            "1) 只写说话方式：常用句式、怎么称呼对方、语气强弱、颜文字/表情包的使用习惯；\n"
+            "2) 遇到夸奖、抱怨、求助、闲聊、被质疑时，分别通常怎么接；\n"
+            "3) 不要写任何事实，不要写别人说了什么，只写「我」的语言习惯；\n"
+            "4) 看不出来的就不写，不要编造。\n\n"
+            + "\n".join(mine)
+        )
+        res = self.llm_fn(prompt)
+        if not res:
+            log("  风格提炼失败，稍后再试")
+            return
+        pts = [ln.strip() for ln in res.splitlines() if ln.strip().startswith("-")]
+        if not pts:
+            log("  风格提炼结果为空，跳过")
+            return
+        text = "\n".join(pts)
+        limit = int(cfg.get("max_chars", 600) or 0)
+        if limit and len(text) > limit:
+            text = text[:limit] + "…"
+        try:
+            with open(self._style_path(), "w", encoding="utf-8") as f:
+                f.write("# 说话风格档案\n\n"
+                        "> 由我自己说过的回复定期提炼而成，重启后仍然记得。\n\n"
+                        + text + "\n")
+        except Exception as e:
+            log("  风格档案写入失败: %s" % e)
+            return
+        self.style = text
+        log("  说话风格已更新：%d 字" % len(text))
+
+    # ---------- 中期记忆：阶段回顾 ----------
+    def _stage_path(self, conv):
+        prefix = "group" if conv.startswith("g") else "private"
+        return os.path.join(self.archive_dir(), "%s_%s_stage.md" % (prefix, conv[1:]))
+
+    def _load_stages(self):
+        try:
+            d = self.archive_dir()
+        except Exception:
+            return
+        for f in os.listdir(d):
+            m = re.match(r"^(?:private|group)_(\d+)_stage\.md$", f)
+            if not m:
+                continue
+            conv = ("u" if f.startswith("private_") else "g") + m.group(1)
+            try:
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    txt = fh.read()
+            except Exception:
+                continue
+            # 保留 "## 日期" 作为时间锚点；剔掉文件标题（"# "）、说明（">"）和游标（<!-- -->）
+            pm = re.search(r"<!--\s*pos:(\d+)\s*-->", txt)
+            if pm:
+                self.stage_pos[conv] = int(pm.group(1))
+            body = [ln.rstrip() for ln in txt.splitlines()
+                    if ln.strip() and not ln.startswith("# ")
+                    and not ln.startswith(">") and not ln.startswith("<!--")]
+            if body:
+                self.stages[conv] = "\n".join(body).strip()
+        if self.stages:
+            n = sum(1 for t in self.stages.values()
+                    for ln in t.splitlines() if ln.startswith("## "))
+            log("已加载阶段回顾：%d 个会话 / 共 %d 段（全部保留）"
+                % (len(self.stages), n))
+
+    def _archive_lines(self, conv):
+        prefix = "group" if conv.startswith("g") else "private"
+        doc = os.path.join(self.archive_dir(), "%s_%s.md" % (prefix, conv[1:]))
+        try:
+            with open(doc, encoding="utf-8") as f:
+                return [ln.rstrip() for ln in f if ln.startswith("[")]
+        except Exception:
+            return []
+
+    def _append_stage(self, conv, chunk, new_pos):
+        """把一段记录压成阶段回顾，追加进阶段文件并写下进度游标。"""
+        cfg = self.cfg.get("memory") or {}
+        every = int(cfg.get("stage_every", 200) or 0)
+        keep = int(cfg.get("stage_max", 0) or 0)   # 0 = 全部保留
+        log("  正在生成阶段回顾（%s，%d 条）…" % (conv, len(chunk)))
+        prompt = (
+            "下面是一段较早的聊天记录（「我:」是我代替主人说的话）。\n"
+            "请用 4-6 行概括这一阶段发生过什么，每行以「- 」开头：\n"
+            "只写值得记住的进展、决定、约定和转折；寒暄和重复内容不要写；不要编造。\n\n"
+            + "\n".join(chunk)
+        )
+        res = self.llm_fn(prompt)
+        if not res:
+            log("  阶段回顾生成失败，稍后再试")
+            return False
+        pts = [ln.strip() for ln in res.splitlines() if ln.strip().startswith("-")]
+        if not pts:
+            return False
+        head = "## %s" % time.strftime("%Y-%m-%d %H:%M")
+        old = ""
+        try:
+            with open(self._stage_path(conv), encoding="utf-8") as f:
+                old = f.read()
+        except Exception:
+            pass
+        # 按 "## 日期" 切块；第一块是文件的标题+说明，要剔除（否则会被当成正文写回去）
+        # 另外把可能残留在正文里的游标标记清掉，避免文件里出现多个 pos 标记
+        blocks = [re.sub(r"<!--.*?-->", "", b).strip()
+                  for b in old.split("\n## ")
+                  if b.strip() and not b.lstrip().startswith("# ")]
+        blocks = [b for b in blocks if b]
+        if keep > 0:
+            blocks = blocks[-(keep - 1):] if keep > 1 else []
+        try:
+            with open(self._stage_path(conv), "w", encoding="utf-8") as f:
+                f.write("# 阶段回顾 - %s\n\n> 每 %d 条压缩一段；%s。\n\n"
+                        % (conv[1:], every,
+                           ("最多保留 %d 段" % keep) if keep > 0 else "全部保留，不丢弃"))
+                # 游标必须写在头部：放末尾会被当成上一块的内容重新写回，导致出现多个标记
+                f.write("<!-- pos:%d -->\n\n" % new_pos)
+                for b in blocks:
+                    if not b.startswith("## "):
+                        b = "## " + b
+                    f.write(b.rstrip() + "\n\n")
+                f.write(head + "\n" + "\n".join(pts) + "\n")
+        except Exception as e:
+            log("  阶段回顾写入失败: %s" % e)
+            return False
+        return True
+
+    def maybe_update_stage(self, conv):
+        """按「已压缩到第几行」推进：新消息到了会压，启动时的历史积压也会补。
+
+        短期=最近 N 条原文；中期=这里；长期=风格档案。三层加起来才不会聊久了失忆。
+        返回 True 表示这一轮真的压了一段（调用方据此继续压下一段）。
+        """
+        cfg = self.cfg.get("memory") or {}
+        if not cfg.get("stage_enabled", True):
+            return False
+        every = int(cfg.get("stage_every", 200) or 0)
+        if every <= 0:
+            return False
+        lines = self._archive_lines(conv)
+        pos = self.stage_pos.get(conv, 0)
+        if pos > len(lines):          # 归档被轮转/清空过，游标作废
+            pos = 0
+        if len(lines) - pos < every:
+            return False
+        chunk = lines[pos:pos + every]
+        if len(chunk) < 10:
+            return False
+        if not self._append_stage(conv, chunk, pos + len(chunk)):
+            return False
+        self.stage_pos[conv] = pos + len(chunk)
+        self._load_stages()
+        return True
+
+    def _backlog_stages(self):
+        """启动时把积压的历史补压成阶段回顾（后台线程跑，不挡着收消息）。"""
+        cfg = self.cfg.get("memory") or {}
+        if not cfg.get("stage_enabled", True):
+            return
+        cap = int(cfg.get("backlog_per_run", 0) or 0)   # 0 = 不限
+        convs = []
+        for pat, pre in (("private_*.md", "u"), ("group_*.md", "g")):
+            for p in glob.glob(os.path.join(self.archive_dir(), pat)):
+                m = re.match(r"^(private|group)_(\d+)$", os.path.basename(p)[:-3])
+                if m:
+                    convs.append(pre + m.group(2))
+        done = 0
+        for conv in convs:
+            n = 0
+            while self.maybe_update_stage(conv):
+                n += 1
+                done += 1
+                if cap and done >= cap:
+                    log("  本轮已补 %d 段，剩下的下次启动继续" % done)
+                    return
+            if n:
+                log("  历史补压：%s 新增 %d 段阶段回顾" % (conv, n))
+        if done:
+            log("历史补压完成：本次共 %d 段" % done)
+
+    # ---------- 关系档案 ----------
+    def _profile_path(self, key):
+        # key 三种形态："u123" 私聊 | "g123" 群级 | "g123|u456" 群内个人
+        if "|" in key:
+            g, u = key.split("|", 1)
+            return os.path.join(self.archive_dir(),
+                                "group_%s_%s_profile.md" % (g[1:], u))
+        prefix = "group" if key.startswith("g") else "private"
+        return os.path.join(self.archive_dir(), "%s_%s_profile.md" % (prefix, key[1:]))
+
+    def _load_profiles(self):
+        try:
+            d = self.archive_dir()
+        except Exception:
+            return
+        for f in os.listdir(d):
+            m = re.match(r"^(?:private|group)_(\d+)_profile\.md$", f)
+            if m:
+                conv = ("u" if f.startswith("private_") else "g") + m.group(1)
+                target, key = self.profile, conv
+            else:
+                # 群内个人档案：group_<gid>_u<uid>_profile.md
+                m = re.match(r"^group_(\d+)_u(\d+)_profile\.md$", f)
+                if not m:
+                    continue
+                key = "g%s|u%s" % (m.group(1), m.group(2))
+                target = self.user_profile
+            try:
+                with open(os.path.join(d, f), encoding="utf-8") as fh:
+                    body = [ln.rstrip() for ln in fh if ln.strip()
+                            and not ln.startswith(("#", ">"))]
+            except Exception:
+                continue
+            if body:
+                target[key] = "\n".join(body).strip()
+
+    def _write_profile(self, key, text):
+        if not text:
+            return
+        if "|" in key:
+            g, u = key.split("|", 1)
+            title = "群%s 内的 %s" % (g[1:], u[1:])
+        else:
+            title = key[1:]
+        try:
+            with open(self._profile_path(key), "w", encoding="utf-8") as f:
+                f.write("# 关系档案 - %s\n\n> 称呼 / 亲密度 / 禁忌话题 / 该记住的事。\n\n"
+                        % title + text + "\n")
+        except Exception as e:
+            log("  关系档案写入失败: %s" % e)
+            return
+        (self.user_profile if "|" in key else self.profile)[key] = text
+        log("  关系档案已更新：%s（%d 字）" % (key, len(text)))
+
+    def _merge_profile(self, key, new_text):
+        """自动生成的关系要点与已有档案合并，不清盘。
+
+        手写 seed（人物特点）在前，自动行去重后追加；超上限时从最旧的自动行开始截，
+        手写内容只要不手动删就永久保留。
+        """
+        store = self.user_profile if "|" in key else self.profile
+        old_lines = [ln.strip() for ln in (store.get(key) or "").splitlines()
+                     if ln.strip()]
+        new_lines = [ln.strip() for ln in (new_text or "").splitlines() if ln.strip()]
+        seen = set(old_lines)
+        merged = list(old_lines)
+        for ln in new_lines:
+            if ln not in seen:
+                seen.add(ln)
+                merged.append(ln)
+        if len(merged) > 24:                  # 防止无限增长，截最旧的自动行
+            merged = merged[-24:]
+        self._write_profile(key, "\n".join(merged).strip())
+
+    def _apply_rel(self, conv, rel_lines):
+        """把「## 关系」段落的要点按人分流：群里每人一份 + 群级一份。
+
+        LLM 输出两种行：
+          - 【QQ号】……    → 并入 group_<gid>_u<qq>_profile.md（群内个人档案）
+          - 【群】……      → 并入 group_<gid>_profile.md（群级档案）
+        没带标记的行（私聊场景、或 LLM 没按格式写）并入会话档案，行为与从前一致。
+        """
+        per_user, group_lv, plain = {}, [], []
+        for ln in rel_lines:
+            s = ln.strip()
+            if not s:
+                continue
+            m = re.match(r"^-\s*【(\d+)】\s*(.*)$", s)
+            if m and conv.startswith("g"):
+                per_user.setdefault(m.group(1), []).append(
+                    "- " + m.group(2).strip())
+                continue
+            if conv.startswith("g") and re.match(r"^-\s*【群】", s):
+                group_lv.append(re.sub(r"^-\s*【群】\s*", "- ", s))
+                continue
+            plain.append(s)
+        for uid, lines_ in per_user.items():
+            if lines_:
+                self._merge_profile("%s|u%s" % (conv, uid),
+                                    "\n".join(lines_).strip())
+        if conv.startswith("g"):
+            # 群级档案 = 带【群】标记的行 + 没带标记的行
+            self._merge_profile(conv, "\n".join(group_lv + plain).strip())
+        else:
+            self._merge_profile(conv, "\n".join(plain).strip())
+
+    # ---------- 情绪轨迹 ----------
+    def _note_mood(self, conv, text):
+        """按关键词粗判对方情绪，存最近几条形成轨迹（不额外消耗额度）。"""
+        cfg = self.cfg.get("memory") or {}
+        if not cfg.get("mood_enabled", True):
+            return
+        t = text or ""
+        low = t.lower()
+        if any(k in t for k in ("哈哈", "233", "笑死", "开心", "太好了", "厉害",
+                                "牛", "谢谢", "感谢", "喜欢", "爱你", "棒")):
+            m = "愉快"
+        elif any(k in t for k in ("生气", "气死", "滚", "讨厌", "烦死", "有病",
+                                  "毛病", "傻逼", "sb", "闭嘴")):
+            m = "不耐烦"
+        elif any(k in t for k in ("难过", "伤心", "哭", "emo", "累", "无聊",
+                                  "孤独", "抑郁", "不想", "烦", "崩")):
+            m = "低落"
+        elif any(k in low for k in ("?", "？", "为什么", "怎么", "吗", "求", "帮")):
+            m = "求助"
+        else:
+            m = "平静"
+        d = self.mood.get(conv)
+        if d is None:
+            d = deque(maxlen=6)
+            self.mood[conv] = d
+        d.append(m)
+
+    def mood_line(self, conv):
+        d = self.mood.get(conv)
+        if not d:
+            return ""
+        seq = list(d)
+        tail = "、".join(seq[-4:])
+        # 最近几条里出现最多的那个，算总体倾向。
+        # 平局取最先出现的情绪（Counter 保插入序）——旧实现用 max(set(...))，
+        # set 迭代顺序随进程哈希种子漂移，平局时"整体偏什么"每次重启都乱变。
+        dom = Counter(seq).most_common(1)[0][0]
+        return "最近几条的情绪：%s → 整体偏%s" % (tail, dom)
+
+    # ---------- Few-shot 风格样本 ----------
+    def _load_samples(self):
+        """手挑的样本优先（self_samples.md），没有就用下面动态挑选的。"""
+        try:
+            with open(os.path.join(self.archive_dir(), "self_samples.md"),
+                      encoding="utf-8") as f:
+                lines = [ln.rstrip() for ln in f
+                         if ln.strip() and not ln.startswith(("#", ">"))]
+        except Exception:
+            self.samples = []
+            return
+        self.samples = [ln[2:].strip() if ln.startswith("- ") else ln
+                        for ln in lines]
+
+    def style_samples(self, conv, n=3):
+        """挑几条「我」说得好的原话当样本，比抽象描述更能把风格钉住。
+
+        偏好：长度适中、自然口语的句子（不刻意堆语气词/颜文字）。
+        """
+        from qq_autoreply import extract_kaomoji  # noqa: E402 避免循环导入
+        cfg = self.cfg.get("memory") or {}
+        n = int(cfg.get("samples", 3) or 0)
+        if n <= 0:
+            return []
+        if self.samples:
+            return self.samples[:n]
+        pool = []
+        for c, d in self.recent.items():
+            for x in d:
+                if x.get("nick") != "我":
+                    continue
+                t = (x.get("text") or "").strip()
+                if not t or "【图片】" in t:
+                    continue
+                score = 0
+                if 8 <= len(t) <= 70:
+                    score += 2
+                if extract_kaomoji(t):
+                    score += 2
+                if any(k in t for k in ("才", "哼", "诶", "嘛", "呀")):
+                    score += 1
+                pool.append((score + (2 if c == conv else 0), t))
+        if not pool:
+            return []
+        pool.sort(key=lambda x: -x[0])
+        out, seen = [], set()
+        for _, t in pool:
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+            if len(out) >= n:
+                break
+        return out
+
+    def maybe_summarize(self, conv):
+        cfg = self.cfg.get("summary") or {}
+        if not cfg.get("enabled", True):
+            return
+        every = int(cfg.get("every", 50))
+        cnt = self.pending.get(conv, 0)
+        if cnt < every:
+            return
+
+        prefix = "group" if conv.startswith("g") else "private"
+        doc = os.path.join(self.archive_dir(), "%s_%s.md" % (prefix, conv[1:]))
+        try:
+            with open(doc, encoding="utf-8") as f:
+                lines = [ln.rstrip() for ln in f if ln.startswith("[")]
+        except Exception:
+            return
+        chunk = lines[-every:]
+        if not chunk:
+            return
+
+        # 一次调用同时产出「事实摘要」和「关系档案」，省额度
+        if conv.startswith("g"):
+            head = "下面是群里的聊天记录（其中“我:”是我代替主人说的话）。\n"
+            fact_prompt = (
+                "## 事实\n"
+                "不超过 8 行要点，每行以「- 」开头：只写群级事实——聊过什么、有什么约定、"
+                "群内发生的事、共同话题、还没做完的事；"
+                "群友的个人爱好、身份、计划一律不写（那些属于下面每个人自己的行）；"
+                "不要编造，拿不准就不写。\n\n"
+            )
+            rel_prompt = (
+                "## 关系\n"
+                "分两类输出，每行以「- 【标记】」开头：\n"
+                "1) 群里的每个人单独一行，标记写对方的 QQ 号（消息前面括号里那串数字），"
+                "只写这个人：怎么称呼我、亲密度如何、有什么禁忌或明确不喜欢的事。"
+                "例如：- 【对方的QQ号】爱撒娇，管主人叫屁屁，吃醋的时候要哄\n"
+                "2) 群整体另起一行，标记写「群」：只写群级内容——群规、群梗、"
+                "共同话题、群内事件、群体习惯、固定称呼/外号。"
+                "例如：- 【群】梗群，气氛欢乐，主人被叫群友庚\n"
+                "注意：【群】行严禁写入任何群友的个人爱好、身份、计划——"
+                "那些只属于上面每个人自己的行；看不出来就不写，不要编造。\n\n"
+            )
+        else:
+            head = "下面是主人和对方的聊天记录（其中“我:”是我代替主人说的话）。\n"
+            fact_prompt = (
+                "## 事实\n"
+                "不超过 8 行要点，每行以「- 」开头：只写事实——聊过什么、有什么约定、"
+                "对方的偏好、还没做完的事；不要编造，拿不准就不写。\n\n"
+            )
+            rel_prompt = (
+                "## 关系\n"
+                "不超过 5 行要点，每行以「- 」开头：只写关系——他怎么称呼我、我怎么称呼他、"
+                "亲密度如何、有什么禁忌话题或他明确不喜欢的事；看不出来就不写。\n\n"
+            )
+        prompt = (
+            head
+            + "请分两部分输出，中间用单独一行「## 关系」隔开：\n\n"
+            + fact_prompt
+            + rel_prompt
+            + "\n".join(chunk)
+        )
+        log("  正在生成长期记忆摘要（%s，%d 条）…" % (conv, len(chunk)))
+        res = self.llm_fn(prompt)
+        if not res:
+            log("  摘要生成失败，稍后重试")
+            return
+
+        fact_lines, rel_lines, cur = [], [], "fact"
+        for ln in res.splitlines():
+            s = ln.strip()
+            if re.match(r"^#{1,6}\s*关系", s):
+                cur = "rel"
+                continue
+            if s.startswith("- "):
+                (fact_lines if cur == "fact" else rel_lines).append(s)
+        self._apply_rel(conv, rel_lines)      # 群里按人分流：个人档案 + 群级档案
+        pts = fact_lines
+        if not pts:
+            log("  摘要内容为空，跳过")
+            return
+        all_pts = []
+        try:
+            with open(self._summary_path(conv), encoding="utf-8") as f:
+                all_pts = [ln.rstrip() for ln in f if ln.startswith("- ")]
+        except Exception:
+            pass
+        all_pts = (all_pts + pts)[-int(cfg.get("max_points", 12)):]
+        try:
+            with open(self._summary_path(conv), "w", encoding="utf-8") as f:
+                f.write("# 长期记忆摘要 - %s\n\n> 自动生成，最多保留 %d 行要点。\n\n"
+                        % (conv[1:], int(cfg.get("max_points", 12))))
+                f.write("\n".join(all_pts) + "\n")
+        except Exception as e:
+            log("  摘要写入失败: %s" % e)
+            return
+        self.pending[conv] = 0
+        self._cache_summary(conv)
+        log("  长期记忆已更新：%d 条要点" % len(all_pts))
+
+    def context_lines(self, conv, exclude_mid=None, excludes=None):
+        d = self.recent.get(conv)
+        if not d:
+            return []
+        items = list(d)
+        if exclude_mid is not None:
+            items = [x for x in items if x.get("mid") != exclude_mid]
+        if excludes:
+            ex = set(excludes)
+            items = [x for x in items if x.get("mid") not in ex]
+        out = []
+        for x in items[-int(self.cfg.get("context_messages", 12)):]:
+            tag = ""
+            if x.get("kind"):
+                tag = "（%s）" % x["kind"]
+            elif x.get("at_me"):
+                tag = "（@了你）"
+            out.append("%s: %s%s" % (x.get("nick"), x.get("text"), tag))
+        return out
+

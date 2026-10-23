@@ -492,6 +492,7 @@ class BotMemory:
         self._wq_keys = set()
         self._wq_lock = threading.Lock()
         self._writer_on = False
+        self._archive_dir_cache = None   # 归档目录建过一次就别再 makedirs
 
     # ---------- 初始化（主程序 run() 里调用） ----------
     def load_all(self):
@@ -576,7 +577,11 @@ class BotMemory:
     def archive_dir(self):
         cfg = self.cfg.get("archive") or {}
         d = cfg.get("dir") or os.path.join(BASE, "qq_messages")
-        os.makedirs(d, exist_ok=True)
+        # 每条消息都会走到这里好几次（归档 + 各种 _xxx_path），
+        # 而 makedirs 是一次真实系统调用；目录建过一次就够了
+        if d != self._archive_dir_cache:
+            os.makedirs(d, exist_ok=True)
+            self._archive_dir_cache = d
         return d
 
     def archive_write(self, conv, line):
@@ -622,7 +627,14 @@ class BotMemory:
         has_text = any(t == "text" and ((s.get("data") or {}).get("text") or "").strip()
                        for s, t in zip(segs, types) if isinstance(s, dict))
         if "at" in types:
-            return "@我"
+            # 必须看 @ 的是不是我：@ 别人也标成「@我」的话，上下文里会渲染成
+            # 「（@了你）」喂给模型，它会以为自己被点名了
+            for s in segs:
+                if not isinstance(s, dict) or s.get("type") != "at":
+                    continue
+                if str((s.get("data") or {}).get("qq")) == str(self.self_id):
+                    return "@我"
+            return "@"
         if not has_text and ("face" in types or "mface" in types):
             return "表情"
         return ""
@@ -632,7 +644,11 @@ class BotMemory:
         sender = evt.get("sender") or {}
         nick = sender.get("card") or sender.get("nickname") or str(evt.get("user_id"))
         text = flatten_message(evt.get("message")).replace("@%s" % self.self_id, "").strip()
+        # _image 正常是 {"raw","mime","path","size"}；形状不对照样能归档，别让
+        # 一个字段差异把整条消息（连带回复）搞没
         img = evt.get("_image")
+        if not isinstance(img, dict):
+            img = None
         if img:
             # 有真实图片时，去掉 flatten 产生的 [图片] 占位，避免重复
             text = text.replace("[图片]", "").strip()
@@ -642,8 +658,9 @@ class BotMemory:
                 rel = os.path.relpath(img["path"], self.archive_dir()).replace("\\", "/")
             except Exception:
                 rel = os.path.basename(img["path"])
-            size_txt = ("%.1fKB" % (img["size"] / 1024.0)) if img["size"] >= 1024 \
-                else ("%dB" % img["size"])
+            size = int(img.get("size") or 0)
+            size_txt = ("%.1fKB" % (size / 1024.0)) if size >= 1024 \
+                else ("%dB" % size)
             parts.append("【图片】%s (%s)" % (rel, size_txt))
         elif evt.get("_has_image") and "[图片]" not in text:
             parts.append("【图片】")
@@ -1179,7 +1196,9 @@ class BotMemory:
         cfg = self.cfg.get("summary") or {}
         if not cfg.get("enabled", True):
             return
-        every = int(cfg.get("every", 50))
+        # 注意别写成 int(cfg.get("every", 50))：every=0 时 lines[-0:] 等于全文，
+        # 会把整个归档塞进摘要 prompt
+        every = int(cfg.get("every", 50) or 50)
         cnt = self.pending.get(conv, 0)
         if cnt < every:
             return
@@ -1239,7 +1258,11 @@ class BotMemory:
         log("  正在生成长期记忆摘要（%s，%d 条）…" % (conv, len(chunk)))
         res = self.llm_fn(prompt)
         if not res:
-            log("  摘要生成失败，稍后重试")
+            # 失败时必须把计数退回去：否则 writer 每 60 秒扫一次、每次都看见
+            # 计数够阈值就重新入队，模型 429 期间会变成「每分钟重试一次」的
+            # 永久重试风暴。退回去后要再攒够 every 条才会再试，等于天然退避
+            self.pending[conv] = max(0, cnt - every)
+            log("  摘要生成失败，要再攒 %d 条才重试" % every)
             return
 
         fact_lines, rel_lines, cur = [], [], "fact"
@@ -1288,7 +1311,8 @@ class BotMemory:
             ex = set(excludes)
             items = [x for x in items if x.get("mid") not in ex]
         out = []
-        for x in items[-int(self.cfg.get("context_messages", 12)):]:
+        # 别漏了 `or 12`：slice[-0:] 等于全文，配置填 0 会把整个缓冲塞进 prompt
+        for x in items[-int(self.cfg.get("context_messages", 12) or 12):]:
             tag = ""
             if x.get("kind"):
                 tag = "（%s）" % x["kind"]
@@ -1298,6 +1322,21 @@ class BotMemory:
         return out
 
     # ================= 两钩子（主程序唯一入口） =================
+    @staticmethod
+    def _clip_stage(text, limit=1200):
+        """阶段回顾按段（## 开头）倒着截到上限，只留最近的段，砍掉的不留痕。"""
+        if not text or len(text) <= limit:
+            return text
+        blocks = re.split(r"(?m)^(?=## )", text)
+        kept = []
+        total = 0
+        for b in reversed(blocks):
+            if total + len(b) > limit and kept:
+                break
+            kept.append(b)
+            total += len(b)
+        return "".join(reversed(kept)).strip()
+
     def recall(self, conv, uid=None, text="", mid=None, excludes=None):
         """收消息时调用：一次拿齐全部记忆，返回拼 prompt 用的 dict。
 
@@ -1310,7 +1349,9 @@ class BotMemory:
             "summary": self.summary.get(conv) or "",
             "profile": self.profile.get(conv) or "",
             "user_profile": "",
-            "stages": self.stages.get(conv) or "",
+            # 摘要/档案/风格都有上限，唯独阶段回顾默认「永不丢弃」无限累积；
+            # 磁盘上照旧全留，只在注入时截断，别让 prompt 越长越大
+            "stages": self._clip_stage(self.stages.get(conv) or ""),
             "style": self.style,
             "samples": self.style_samples(conv),
             "mood": self.mood_line(conv),

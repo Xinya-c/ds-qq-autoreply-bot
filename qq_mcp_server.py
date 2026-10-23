@@ -440,6 +440,10 @@ class OneBotWS:
         self.token = token
         self._pending = {}
         self._pending_lock = threading.Lock()
+        # 发送锁：多个会话线程会同时往这一个 socket 写。不带锁的话，
+        # 大帧（带图回复的 base64 常见上百 KB）sendall 必然分片，
+        # 分片之间被别的线程插进来就会把两帧的字节交错，对端收到非法帧
+        self._send_lock = threading.Lock()
         self._on_event = None
         self._stop = False
 
@@ -495,8 +499,10 @@ class OneBotWS:
             header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", length)
         else:
             header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack(">Q", length)
-        masked = bytes(payload[i] ^ mask[i % 4] for i in range(length))
-        self.sock.sendall(header + mask + masked)
+        # （掩码 + 发送必须连着做：见上面 _send_lock 的说明）
+        with self._send_lock:
+            masked = bytes(payload[i] ^ mask[i % 4] for i in range(length))
+            self.sock.sendall(header + mask + masked)
 
     # ---- 接收循环 ----
     def _recv_loop(self):
@@ -577,10 +583,14 @@ class OneBotWS:
             self._pending[echo] = fut
         self._send_frame(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         if fut["event"].wait(timeout):
-            resp = fut["result"]
+            resp = fut["result"] or {}
             if resp.get("status") == "failed" or "data" not in resp:
                 return {"ok": False, "raw": resp}
             return {"ok": True, "data": resp.get("data")}
+        # 超时时必须摘掉：否则对端卡住期间每次调用都在 _pending 里留一个，
+        # 单条连接生命周期内无界增长
+        with self._pending_lock:
+            self._pending.pop(echo, None)
         return {"ok": False, "error": "timeout"}
 
     def set_event_handler(self, cb):

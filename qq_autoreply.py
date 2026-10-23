@@ -200,16 +200,29 @@ def log(msg):
 
 
 KAOMOJI_RE = re.compile(r"[（(\[]([^（()）\[\]\n]{1,14})[)）\]]")
-KAOMOJI_SYM = set("•̀́ㅂω＼￣▽≧≦╥︿´｀・∀°﹏ಥ╯╰ﾉᵕ꒳^_> <oO0*´`")
+# 判定「括号里的是颜文字」的特征字符。这里漏字符 = 整类颜文字永远认不出来，
+# 避让清单会是空的（比如 ∠ 」 曾是缺失的，_(:3」∠)_ 一直没被记进历史）
+KAOMOJI_SYM = set("•̀́ㅂω＼￣▽≧≦╥︿´｀・∀°﹏ಥ╯╰ﾉᵕ꒳^_> <oO0*´`"
+                  "∠」皿εзДﾟヮ益ーｰ∇σΘθ")
+# 括号外面那对「手臂」：_(:3」∠)_ 少了首尾的下划线就不成样子，
+# 存进避让清单时得连着一起存，否则提示词里给模型看的是个残废。
+# 注意别把句子标点算进来——否则「…_(:3」∠)_，去睡了」会把逗号一起吞掉
+KAOMOJI_ARM = set("_^=∵∴～~*")
 
 
 def extract_kaomoji(text):
-    """粗略挑出回复里的颜文字（括号包住、且以符号为主）。"""
+    """粗略挑出回复里的颜文字（括号包住、且以符号为主，含首尾手臂）。"""
     out = []
     for m in KAOMOJI_RE.finditer(text or ""):
         inner = m.group(1)
-        if any(ch in KAOMOJI_SYM for ch in inner):
-            out.append(m.group(0))
+        if not any(ch in KAOMOJI_SYM for ch in inner):
+            continue
+        s, e = m.start(), m.end()
+        while s > 0 and text[s - 1] in KAOMOJI_ARM:
+            s -= 1
+        while e < len(text) and text[e] in KAOMOJI_ARM:
+            e += 1
+        out.append(text[s:e])
     return out
 
 
@@ -236,6 +249,10 @@ def sanitize_reply(text, max_len=800):
         return ""
     t = str(text).strip()
     t = re.sub(r"```[\s\S]*?```", " ", t)
+    # 模型的内部独白：有些模型会吐 <think>...</think>，只剥标签会把思考内容
+    # 原样留在要发出去的那句话里——整块连内容一起扔掉
+    t = re.sub(r"<\s*(think|reasoning|reflection|internal|analysis)\s*>"
+               r"[\s\S]*?<\s*/\s*\1\s*>", " ", t, flags=re.I)
     t = re.sub(r"`{1,3}", "", t)
     t = re.sub(r"\*\*|__", "", t)                    # markdown 粗体
     t = re.sub(r"(?m)^\s*#{1,6}\s*", "", t)          # 行首标题号
@@ -349,6 +366,7 @@ class AutoReply:
         self._swept = set()               # 启动补回已入队的 key（防重复补）
         self.seen_set = set()
         # 群聊主动搭话：计数从「本次上线」开始，不翻旧账
+        self._img_cache = {}              # 表情包目录 -> (缓存时间, 清单)：目录是静态的
         self.pmsg = {}                    # conv_key -> 已攒的群内他人消息条数
         self.ptarget = {}                 # conv_key -> 本轮随机出的目标条数
         self.plast = {}                   # conv_key -> 上次主动发言的时间戳
@@ -362,11 +380,12 @@ class AutoReply:
             return True
         self.seen.append(mid)
         self.seen_set.add(mid)
+        # deque 淘汰左端时 seen_set 不会跟着删；这里必须同步淘汰，
+        # 否则 seen_set 无界增长（每条消息一个键，几周就是几十万个）
         if len(self.seen) >= self.seen.maxlen:
-            old = self.seen[0]
             for _ in range(50):
                 if self.seen:
-                    self.seen_set.discard(self.seen[0])
+                    self.seen_set.discard(self.seen.popleft())
         return False
 
     def _rate_ok(self, key):
@@ -686,8 +705,10 @@ class AutoReply:
             name = d.get("name") or d.get("file") or "文件"
             ext = os.path.splitext(name)[1].lower()
             if ext not in exts:
+                # 用 continue 而不是 return：一条消息带多个文件时，
+                # 第一个不在白名单不该把后面合格的那些也一起放弃
                 log("  文件类型不在白名单: %s" % name)
-                return ""
+                continue
             grabbed = self._grab_file(evt)
             if not grabbed:
                 return ""
@@ -709,11 +730,18 @@ class AutoReply:
         return cfg.get("dir") or os.path.join(BASE, "assets", "replies")
 
     def _list_reply_images(self):
-        """返回可直接拼进提示词的列表项：文件名（使用场景）。"""
+        """返回可直接拼进提示词的列表项：文件名（使用场景）。
+
+        表情包目录基本是静态的，却在「每条回复」都要列举一次目录 + 解析一遍
+        stickers.json；缓存起来，只有目录内容变了才重扫（用清单本身做指纹）。
+        """
         cfg = self.cfg.get("reply_images") or {}
         if not cfg.get("enabled", True):
             return []
         d = self._reply_img_dir()
+        cached = self._img_cache.get(d)
+        if cached and time.time() - cached[0] < 30:
+            return cached[1]
         try:
             names = sorted(f for f in os.listdir(d)
                            if os.path.splitext(f)[1].lower() in
@@ -731,6 +759,7 @@ class AutoReply:
             m = meta.get(n) or {}
             label = (m.get("场景") or m.get("含义") or "").strip()
             out.append("%s（%s）" % (n, label) if label else n)
+        self._img_cache[d] = (time.time(), out)
         return out
 
     def _build_segments(self, body, imgs):
@@ -1049,6 +1078,12 @@ class AutoReply:
         except subprocess.TimeoutExpired:
             log("CodeBuddy CLI 超时（>%ss）" % cb["timeout"])
             return None
+        except Exception as e:
+            # 路径写错、权限、以及 prompt 过长触发的 [WinError 206] 都会走这里。
+            # 必须吞掉并 return None：穿透出去的话 llm_reply 的 `if text:`
+            # 判断根本到不了，API 兜底和占位话术就全废了（变成彻底不回）。
+            log("CodeBuddy CLI 调用失败（%s: %s）" % (type(e).__name__, e))
+            return None
 
         out = p.stdout or ""
         i = out.find("[")
@@ -1258,21 +1293,35 @@ class AutoReply:
                 evt["_stale"] = age
                 log("  这是不在线期间发来的消息（%.0f 分钟前），照常回复和记忆"
                     % (age / 60.0))
-            self.mem.remember_incoming(evt)      # 先入上下文缓冲（含没 @ 我的群消息）
-            # 白名单会话：顺带把图片存盘 + 写归档（不阻塞回复流程之外的东西）
+            # 下面每一块都自己吞异常：这是唯一能保证「走到 _schedule」的办法。
+            # 之前整段共用一个 try，记忆/归档/计数里任何一个小错都会让
+            # _schedule 根本不执行——消息直接消失，不回、不重试、补回也扫不到
+            # （补回只扫已归档的，而这条连归档都没有）。
+            try:
+                self.mem.remember_incoming(evt)  # 上下文缓冲（含没 @ 我的群消息）
+            except Exception as e:
+                log("  上下文缓冲失败（不影响回复）: %s" % e)
+            # 白名单会话：顺带把图片存盘 + 写归档（涉及下载和磁盘，最容易出状况）
             if self.mem.allowed(evt):
-                segs = evt.get("message") or []
-                evt["_has_image"] = any(
-                    isinstance(s, dict) and s.get("type") == "image" for s in segs)
-                if evt["_has_image"]:
-                    img = self._extract_image(segs, self.mem.conv_of(evt))
-                    if img:
-                        evt["_image"] = img
-                self.mem.archive_incoming(evt)
+                try:
+                    segs = evt.get("message") or []
+                    evt["_has_image"] = any(
+                        isinstance(s, dict) and s.get("type") == "image"
+                        for s in segs)
+                    if evt["_has_image"]:
+                        img = self._extract_image(segs, self.mem.conv_of(evt))
+                        if img:
+                            evt["_image"] = img
+                    self.mem.archive_incoming(evt)
+                except Exception as e:
+                    log("  存图/归档失败（不影响回复）: %s" % e)
             # 群聊主动搭话：攒「本次上线以来」的群内他人消息（补回的旧消息不翻旧账）
             if evt.get("message_type") == "group" and not evt.get("_replay") \
                     and self.mem.allowed(evt):
-                self._proactive_note(self.mem.conv_of(evt))
+                try:
+                    self._proactive_note(self.mem.conv_of(evt))
+                except Exception as e:
+                    log("  主动搭话计数失败（不影响回复）: %s" % e)
             self._schedule(evt)
         except Exception as e:
             log("事件处理异常: %s" % e)
@@ -1325,9 +1374,19 @@ class AutoReply:
         # 合并的连发里只要有一条是离线的，整组按离线处理
         if any(e.get("_stale") for e in evts):
             merged["_stale"] = max(e.get("_stale") or 0 for e in evts)
+        # 「先发图、再补一句『看看这个』」是最常见的连发形态，而上面只从
+        # evts[-1] 浅拷贝——不做这步的话图会连同 _has_image 一起丢掉，
+        # 模型只拿到个 [图片] 占位符，看不到真图
+        for e in evts:
+            if e.get("_has_image"):
+                merged["_has_image"] = True
+            if e.get("_image"):
+                merged["_image"] = e["_image"]      # 多图取最后一张
         return merged
 
     def _enqueue(self, conv, evt):
+        # put 必须在锁内：否则 worker 可能在拿到锁判定「队列空→退出」之后、
+        # 我们 put 之前把 conv 摘掉，这条消息就落在没人消费的队列里永久滞留
         with self._q_lock:
             q = self.q_conv.get(conv)
             if q is None:
@@ -1335,7 +1394,7 @@ class AutoReply:
                 self.q_conv[conv] = q
                 threading.Thread(target=self._conv_worker, args=(conv, q),
                                  daemon=True).start()
-        q.put(evt)
+            q.put(evt)
 
     def _conv_worker(self, conv, q):
         """每个会话一条线程：同会话串行，不同会话并行。"""
@@ -1822,6 +1881,10 @@ class AutoReply:
             parts = self._split_parts(body)
             nick = evt.get("sender", {}).get("nickname")
             sent = False
+            # 模型只输出 [[img:xxx]] 时正文是空的，别让图片跟着一起被丢掉
+            # （否则图不发、话也不说，还白占一次限流额度）
+            if not parts and imgs:
+                parts = [""]
             for i, part in enumerate(parts):
                 last = (i == len(parts) - 1)
                 segs = self._build_segments(part, imgs if last else [])
@@ -1889,6 +1952,9 @@ class AutoReply:
             parts = self._split_parts(body)
             nick = evt.get("sender", {}).get("nickname")
             sent = False
+            # 同私聊：只发表情包时正文是空的，别连图一起丢
+            if not parts and imgs:
+                parts = [""]
             for i, part in enumerate(parts):
                 last = (i == len(parts) - 1)
                 msg = []
@@ -1897,7 +1963,9 @@ class AutoReply:
                     msg.append({"type": "at", "data": {"qq": str(uid)}})
                 segs = self._build_segments(part, imgs if last else [])
                 if segs:
-                    if msg:
+                    # 只在首段是「文字」时才补空格。只回一张表情包的话首段是
+                    # 图片段，取 data.text 会 KeyError，整条回复就没了
+                    if msg and segs[0].get("type") == "text":
                         segs[0]["data"]["text"] = " " + segs[0]["data"]["text"]
                     msg.extend(segs)
                 if not msg:
@@ -1970,6 +2038,15 @@ class AutoReply:
                 return
             except Exception as e:
                 log("连接异常，5 秒后重连: %s" % e)
+                # 换连接前必须关旧的：连接若是半开（系统睡眠唤醒、NapCat 被强杀，
+                # 没有 FIN/RST），旧对象的 recv 线程会永远卡在 recv 上，
+                # 旧 socket + 旧线程一起永久泄漏；在途的发送也会写进死连接
+                try:
+                    if self.ob:
+                        self.ob.close()
+                except Exception:
+                    pass
+                self.ob = None
                 time.sleep(5)
 
 
@@ -2003,7 +2080,12 @@ def acquire_lock():
         kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
         handle = kernel32.CreateMutexW(None, False, "Global\\QQAutoReplyDaemon")
         if not handle:
-            return True                      # 创建失败就不拦，避免完全跑不起来
+            # 没有 SeCreateGlobalPrivilege（受限令牌/服务上下文）时会拿不到。
+            # 兜底放行是对的（总比完全跑不起来好），但必须留痕——否则双实例
+            # 同时抢 OneBot 时只会看到一堆莫名其妙的重连，看不出真正原因
+            log("互斥量创建失败（错误码 %s）：单实例保护未生效，如果还有另一个"
+                "实例在跑，两者会互相抢连接" % ctypes.get_last_error())
+            return True
         if ctypes.get_last_error() == 183:   # ERROR_ALREADY_EXISTS
             return False
         _lock_fh = handle                    # 句柄保活到进程结束
@@ -2031,9 +2113,14 @@ def main():
         AutoReply(cfg).run()
     finally:
         global _lock_fh
-        try:
-            if _lock_fh:
+        # CreateMutexW 实际返回的是 int 句柄，没有 close()——写在一起的话
+        # 这一抛就把下面的 PID 清理整个带走了（PID 文件永远删不掉）
+        if hasattr(_lock_fh, "close"):
+            try:
                 _lock_fh.close()
+            except Exception:
+                pass
+        try:
             os.remove(PID_FILE)
         except Exception:
             pass

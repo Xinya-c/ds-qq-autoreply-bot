@@ -34,6 +34,13 @@ try:                                       # 搬迁后记忆模块有自己的 l
     _mem_mod.log = lambda *a, **k: None
 except Exception:
     pass
+# Golden 只测 Prompt 拼装本身；向量检索层（会按语义命中改 Prompt 内容）
+# 由 _smoke 专项覆盖，这里显式关掉避免异步构建的竞态
+try:
+    import memory as _mem_mod2             # noqa: E402
+    _mem_mod2._mv = None
+except Exception:
+    pass
 
 # ---------------------------------------------------------------- 合成语料
 # 全部是编造内容，不含任何真实聊天数据，可安全进公开仓库。
@@ -136,6 +143,12 @@ def scenarios(bot):
                                         uid=111)[0]))
     out.append(("私聊-上下文排除", bot._prompt("u111", "在吗", mid=102,
                                               excludes={103}, uid=111)[0]))
+    # 离线 / 启动补回：prompt 里带「距今多久」，让模型自己判断口吻
+    out.append(("私聊-离线30分钟", bot._prompt("u111", "在吗", uid=111,
+                                            stale=30 * 60)[0]))
+    out.append(("私聊-补回2天前", bot._prompt("u111", "在吗", uid=111,
+                                            stale=2 * 86400 + 3600,
+                                            replay=True)[0]))
     return out
 
 
@@ -147,7 +160,20 @@ EXPECTED = {
     "私聊-裸@": "dec13d48bf218125",
     "私聊-带图": "e19ef5c6bb5ef70c",
     "私聊-上下文排除": "27360fcfa660fe25",
+    "私聊-离线30分钟": "f76a2a98d1bb06dc",
+    "私聊-补回2天前": "c83fa07005f353aa",
 }
+
+# human_age 的用例（秒 -> 期望文案），顺手钉住时间颗粒度
+AGE_CASES = [
+    (30, "不到 1 分钟"),
+    (60, "1 分钟"),
+    (25 * 60, "25 分钟"),
+    (2 * 3600 + 15 * 60, "2 小时 15 分钟"),
+    (9 * 3600, "9 小时"),
+    (26 * 3600, "1 天 2 小时"),
+    (5 * 86400, "5 天"),
+]
 
 
 def main():
@@ -178,8 +204,15 @@ def main():
             ok = False
         print("%-14s %s  %s" % (name, h, mark))
     print("=" * 60)
+    for sec, want in AGE_CASES:
+        got = qa.human_age(sec)
+        mark = "OK  " if got == want else "DIFF"
+        if got != want:
+            ok = False
+        print("human_age(%-8d) %-14s %s" % (sec, got, mark))
+    print("=" * 60)
     if args.print:
-        print("把上面六个哈希填进 EXPECTED 即可作为回归基线")
+        print("把上面的哈希填进 EXPECTED 即可作为回归基线")
         return 0
     if ok:
         print("golden 全过：Prompt 拼装行为未变")

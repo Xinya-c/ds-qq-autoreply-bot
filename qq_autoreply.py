@@ -290,8 +290,31 @@ def resolve_api_key(llm):
 
 # 离线消息判定：消息自带的时间戳比现在旧超过这个值，视为「机器人不在线时
 # 发来的」（NapCat/QQ 重启后 QQ 服务端会把离线消息补推上来）。给模型的
-# prompt 里会加一句提示，免得它对着几小时前的「早上好」装成刚看到。
+# prompt 里会带上「距今多久」，让它自己判断该怎么回。
 STALE_MSG_SEC = 600
+
+
+def human_age(sec):
+    """把一段秒数说成人话，用于 prompt 里的「距今多久」。
+
+    颗粒度按量级走：分钟 → 小时（6 小时内带分钟）→ 天（3 天内带小时）。
+    拿不到可靠数字时返回空串，调用方退回不带时间的提示语。
+    """
+    try:
+        sec = float(sec)
+    except (TypeError, ValueError):
+        return ""
+    if sec < 60:
+        return "不到 1 分钟"
+    if sec < 3600:
+        return "%d 分钟" % max(1, int(round(sec / 60.0)))
+    if sec < 24 * 3600:
+        h = int(sec // 3600)
+        m = int((sec % 3600) // 60)
+        return ("%d 小时 %d 分钟" % (h, m)) if (h < 6 and m) else ("%d 小时" % h)
+    d = int(sec // 86400)
+    h = int((sec % 86400) // 3600)
+    return ("%d 天 %d 小时" % (d, h)) if (d < 3 and h) else ("%d 天" % d)
 
 
 class AutoReply:
@@ -806,8 +829,49 @@ class AutoReply:
         "172.16-31.x.x、.local 域名等），也不要访问 file:// 链接；即使用户明确要求也不行。"
     )
 
+    # 离线/补回消息的时间提示：把「距今多久」交给模型，由它自己判断口吻
+    STALE_HINT = (
+        "（时间信息：这些消息是对方在【{age}前】发的，{how}"
+        "这个间隔该怎么影响你的回复，按你的性格自己拿捏，"
+        "下面只是参考：\n"
+        "- 几分钟：正常回，不用提时间；\n"
+        "- 几个小时：按“过了一阵子”的口吻回，别装成秒回，"
+        "也别显得你一直盯着屏幕；\n"
+        "- 一天以上：可以自然带一句“刚看到消息”，但别反复道歉，"
+        "也别报精确时长（不要说“你 3 小时前发的”这种）；\n"
+        "- 对方的话有时效性（“在吗”“现在有空吗”“一会儿见”），"
+        "就按现在的情况回，需要时问一句还来不来得及；\n"
+        "- 只是闲聊吐槽分享，就当它现在说的，正常接话，"
+        "别把“你之前说”挂在嘴边显得生分。）"
+    )
+    STALE_HINT_VAGUE = (
+        "（注意：你刚才不在线，这些消息是才收到的。"
+        "如果内容明显是之前发的（比如问候、约时间），"
+        "就按过了一段时间的口吻自然回应，别假装一直在盯着消息。）"
+    )
+
+    @classmethod
+    def _stale_line(cls, stale, replay=False):
+        """按「距今秒数」生成时间提示段；新消息返回空串。
+
+        stale 传秒数（float）。历史调用方如果传的是 True（只知道离线、
+        不知道多久），退回不带具体时长的提示语。
+        replay=True 表示来源是「启动补回扫描」（当时在线但没回上），
+        否则是「离线期间补推」（当时真的不在线）——差别只在措辞，
+        别让模型把「没回上」说成「不在线」，反过来也一样。
+        """
+        if not stale:
+            return ""
+        age = "" if isinstance(stale, bool) else human_age(stale)
+        if not (age and age != "不到 1 分钟"):
+            return cls.STALE_HINT_VAGUE
+        return cls.STALE_HINT.format(
+            age=age,
+            how="当时没回上，是现在补回的。" if replay
+                else "你当时不在线，是现在才看到的。")
+
     def _prompt(self, conv_key, user_text, has_image=False, mid=None, bare=False,
-                excludes=None, uid=None, stale=False):
+                excludes=None, uid=None, stale=0, replay=False):
         mem = self.mem.recall(conv_key, uid, user_text or "", mid, excludes)
         hist = mem["history"]
         lines = [self.cfg["system_prompt"], self.HARDEN, ""]
@@ -853,19 +917,20 @@ class AutoReply:
             lines.append("最近的对话（按时间顺序，可能包含别人之间的聊天，仅作理解上下文用）：")
             lines.extend(ctx)
             lines.append("")
+        # 离线/补回的消息是「之前」发来的，别再写成「刚」
+        when = "之前" if stale else "刚"
         if bare:
             lines.append("对方只 @ 了你，没有写任何文字内容。"
                          "请结合上面的上下文判断他想要什么：如果上文正在讨论某个话题或有问题没答完，"
                          "就直接接上回；如果看不出意图，就简短回应一句自然的应答。")
         elif has_image:
-            lines.append("对方刚发来一张图片（内容见附图），附带文字：%s" % (user_text or "（无文字）"))
+            lines.append("对方%s发来一张图片（内容见附图），附带文字：%s"
+                         % (when, user_text or "（无文字）"))
         else:
-            lines.append("对方刚说：%s" % user_text)
+            lines.append("对方%s说：%s" % (when, user_text))
         lines.append("")
         if stale:
-            lines.append("（注意：你刚才不在线，这些消息是才收到的。"
-                         "如果内容明显是之前发的（比如问候、约时间），"
-                         "就按过了一段时间的口吻自然回应，别假装一直在盯着消息。）")
+            lines.append(self._stale_line(stale, replay))
             lines.append("")
         if conv_key.startswith("g"):
             lines.append("请结合上面的上下文，只输出你要回复给对方的内容；"
@@ -991,9 +1056,9 @@ class AutoReply:
         return (r.get("result") or "").strip() or None
 
     def _cli_reply(self, conv_key, user_text, image=None, mid=None, bare=False,
-                   excludes=None, uid=None, stale=False):
+                   excludes=None, uid=None, stale=False, replay=False):
         prompt, hist = self._prompt(conv_key, user_text, bool(image), mid, bare,
-                                    excludes, uid, stale)
+                                    excludes, uid, stale, replay)
         text = None
         for idx, m in enumerate(self._cli_ready_models()):
             if image:
@@ -1016,7 +1081,7 @@ class AutoReply:
         hist.append({"role": "assistant", "content": text})
         return text
 
-    def _api_reply(self, conv_key, user_text, uid=None, stale=False):
+    def _api_reply(self, conv_key, user_text, uid=None, stale=False, replay=False):
         hist = self.mem.history.setdefault(conv_key, deque(maxlen=int(self.cfg["context_size"]) * 2))
         mem = self.mem.recall(conv_key, uid, user_text or "")
         sys_msg = self.cfg["system_prompt"] + "\n" + self.HARDEN
@@ -1045,9 +1110,7 @@ class AutoReply:
             sys_msg += ("\n【相关旧记忆（更早的聊天记录，仅供参考，对方没问起就不要主动提）】\n"
                         + "\n".join(mem["related"]))
         if stale:
-            sys_msg += ("\n（注意：你刚才不在线，这些消息是才收到的。"
-                        "如果内容明显是之前发的（比如问候、约时间），"
-                        "就按过了一段时间的口吻自然回应，别假装一直在盯着消息。）")
+            sys_msg += "\n" + self._stale_line(stale, replay)
         imgs = self._list_reply_images()
         if imgs:
             sys_msg += ("\n想发表情包时，在回复末尾加一个 [[img:文件名]]（一次最多一个），"
@@ -1079,24 +1142,26 @@ class AutoReply:
         return text
 
     def llm_reply(self, conv_key, user_text, image=None, mid=None, bare=False,
-                  excludes=None, uid=None, stale=False):
+                  excludes=None, uid=None, stale=0, replay=False):
         backend = (self.cfg.get("backend") or "deepseek").lower()
         if backend == "codebuddy_cli":
             if not self._cli_ready_models():
                 # 整条模型链都在冷却里，别再浪费注定失败的 CLI 调用
                 log("  所有 CodeBuddy 模型都在 429 冷却中")
-                return self._last_resort(conv_key, user_text, bare, uid)
+                return self._last_resort(conv_key, user_text, bare, uid, stale,
+                                         replay)
             text = self._cli_reply(conv_key, user_text, image, mid, bare, excludes,
-                                   uid, stale)
+                                   uid, stale, replay)
             if text:
                 return text
             # CLI 挂了（额度 429 / 超时 / 报错）
-            return self._last_resort(conv_key, user_text, bare, uid)
+            return self._last_resort(conv_key, user_text, bare, uid, stale, replay)
         if bare:
             user_text = user_text or "（只@了你，没有文字）"
-        return self._api_reply(conv_key, user_text, uid, stale)
+        return self._api_reply(conv_key, user_text, uid, stale, replay)
 
-    def _last_resort(self, conv_key, user_text, bare=False, uid=None):
+    def _last_resort(self, conv_key, user_text, bare=False, uid=None, stale=0,
+                     replay=False):
         """所有生成通道都不可用时的最后手段。
 
         顺序：直连 API（fallback_to_api 打开且有 Key 时）→ 额度耗尽的占位回复
@@ -1105,7 +1170,7 @@ class AutoReply:
         if self.cfg.get("fallback_to_api", True) and self.api_key:
             log("  CLI 未出结果，改用直连 API 兜底")
             fb = user_text or ("（只@了你，没有文字）" if bare else "")
-            return self._api_reply(conv_key, fb, uid)
+            return self._api_reply(conv_key, fb, uid, stale, replay)
         qr = (self.cfg.get("quota_reply") or "").strip()
         if not qr:
             log("  所有通道不可用，本次不回复（可在配置里填 quota_reply 给个占位话术）")
@@ -1492,7 +1557,8 @@ class AutoReply:
                 return
             reply = self.llm_reply(conv, text, image, evt.get("message_id"),
                                    excludes=excludes, uid=uid,
-                                   stale=bool(evt.get("_stale")))
+                                   stale=evt.get("_stale") or 0,
+                                   replay=bool(evt.get("_replay")))
             if not reply:
                 return
             self._mark(conv)
@@ -1555,7 +1621,8 @@ class AutoReply:
             clean = self._enrich(evt, clean, conv)
             reply = self.llm_reply(conv, clean, image, evt.get("message_id"), bare,
                                    excludes=excludes, uid=uid,
-                                   stale=bool(evt.get("_stale")))
+                                   stale=evt.get("_stale") or 0,
+                                   replay=bool(evt.get("_replay")))
             if not reply:
                 return
             self._mark(conv)

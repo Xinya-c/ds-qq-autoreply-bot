@@ -10,6 +10,12 @@
   - 短期：最近 N 条原文（`context_messages`）
   - 中期：每 200 条压一段「阶段回顾」
   - 长期：每 50 条一次「事实摘要 + 关系档案」；全局一份「说话风格档案」
+- **旧事检索**：拿当前消息去归档找相关旧记忆——装了可选依赖走**语义向量**
+  （bge-small-zh 本地模型，容忍换说法），没装走关键词（二元组+DF 过滤）；
+  两种都过「四路噪音过滤」，取不到就安静不注入；「前天说的那个」按日期直接筛
+- **启动补回**：开机扫每个私聊对象的归档，把「对方发过、我们没回上」的消息
+  （守护进程宕了/模型挂了/发送失败了）走正常流程补回，prompt 会提示
+  「你刚才不在线」；超 24 小时的不补（`sweep.max_age_hours` 可调）
 - **多媒体**：图片存盘后交给模型看内容；语音转写；文件提取文字
 - **表情包**：`assets/replies/` 图库 + `stickers.json` 场景标注，模型自行决定何时配图
 - **模型链**：主力模型 429（日额度耗尽）时自动顺位切备选；CLI 挂了可降级直连 API
@@ -18,9 +24,19 @@
 
 ## 环境要求
 
-- Python 3.10+（纯标准库，零第三方依赖）
+- Python 3.10+（核心纯标准库；可选依赖见下）
 - [NapCat](https://github.com/NapNeko/NapCatQQ)：登录 QQ 后开启 OneBot v11，WebSocket 服务器监听 `127.0.0.1:3001`
 - 可选 Node.js：仅 `backend: codebuddy_cli` 需要（走本机 CodeBuddy CLI）；用 `deepseek` 直连 API 则不需要
+
+**可选依赖（本地向量检索，不装也能跑）**：
+
+```bash
+pip install onnxruntime tokenizers numpy
+```
+
+装了的收益：归档检索从「关键词匹配」升级为「语义匹配」（bge-small-zh-v1.5，
+约 23MB，首次启动自动从 hf-mirror 下载，之后零联网、不调云端 API）。
+**不装则自动降级为关键词检索**，其他功能完全不受影响。
 
 ## 快速开始
 
@@ -59,12 +75,16 @@ Windows 下也可以直接双击 `一键启动.bat`（会先拉起 NapCat 再启
 | `apply_onebot.py` | 自动给 NapCat 写入 OneBot v11 配置 |
 | `qq_autoreply_config.json` | 本地配置（**已被 .gitignore 排除，不会上传**） |
 | `qq_autoreply_config.example.json` | 配置模板 |
+| `memory.py` | 记忆模块：三层记忆/关系档案/检索/writer 线程（主程序只经 recall/remember 两个钩子访问） |
+| `memory_vector.py` | 本地向量检索（可选）：bge-small-zh ONNX，模型自动下载，缺依赖自动降级 |
+| `tools/` | 回放标定与黄金回归测试（检索阈值标定、Prompt 拼装冻结） |
 | `assets/replies/` | 表情包图库 + 场景标注 |
 | `docs/` | 项目总结文档 |
 
 ## 隐私说明
 
-- 聊天记录归档（`qq_messages/`）、登录数据、本地记忆一律**不入库**，已在 `.gitignore` 中排除
+- 聊天记录归档（`qq_messages/`）、登录数据、本地记忆、向量模型与缓存
+  （`qq_messages/models/`、`vectors.npy`）一律**不入库**，已在 `.gitignore` 中排除
 - 部署时请把仓库设为 **Private**，或至少确认配置文件里没有你不想公开的 QQ 号
 - 记忆文件（摘要/档案）里会累积聊天内容，注意不要连带分享
 
@@ -73,3 +93,7 @@ Windows 下也可以直接双击 `一键启动.bat`（会先拉起 NapCat 再启
 - 群归档是 append-only 的混合日志，无法按人删除单条记录
 - 语音转写依赖 NapCat 的 `fetch_ptt_text`
 - 表情包发送有冷却间隔（默认每 5–10 条回复才允许一张），防止刷屏
+- **启动补回补不回「守护进程不在线时到达」的消息**——那些消息根本没进归档
+  （NapCat 的 OneBot WS 不缓存离线事件）；它覆盖的是「到过守护进程但没回上」的
+  （进程宕了/模型挂了/发送失败）。要救前者得让 QQ 本身重登录触发服务端同步，
+  且守护进程已连上（详见 NapCat 行为，实测过）

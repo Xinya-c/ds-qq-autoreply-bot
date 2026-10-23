@@ -114,5 +114,10 @@
   "fallback_to_api": false,
   "cli_cooldown_sec": 600,
   "quota_reply": "我脑子有点转不动了，缓一会儿再陪你聊",
-  "quota_reply_cooldown_sec": 1800
+  "quota_reply_cooldown_sec": 1800,
+  "sweep": {
+    "enabled": true,
+    "max_age_hours": 24,
+    "delay_sec": 20
+  }
 }

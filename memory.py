@@ -36,6 +36,12 @@ LOG_PATH = os.path.join(BASE, "qq_autoreply.log")
 
 from qq_mcp_server import flatten_message  # noqa: E402
 
+# 向量检索（可选增强）：依赖/模型缺失时全部降级回关键词检索
+try:
+    import memory_vector as _mv
+except Exception:
+    _mv = None
+
 _log_lock = threading.Lock()
 ARCH_LOCK = threading.Lock()
 
@@ -70,6 +76,16 @@ SEARCH_TOPK = 3
 SEARCH_HARD_ARM = 2           # query 硬特征 ≥2 才开硬切（单个会误杀）
 SEARCH_PREVIEW_MAX = 90       # 行文超过则围绕命中词截取
 SEARCH_INDEX_PER_CONV = 2000  # 每会话索引最近这么多条
+# 向量通道阈值（2026-10-24 用真实归档 5166 条标定：无关配对 p50=0.41 /
+# p90=0.54；查询对 6/6 命中且去前缀后 0.52~0.84）。语义照搬关键词侧的四路。
+VEC_FLOOR = 0.52              # ① 绝对底线
+VEC_RATIO = 0.88              # ③ 相对长尾比例
+VEC_GAP = 0.08                # ③ 绝对差门槛 / ④ 平局跨度共用
+VEC_FAR = 0.75                # ③ 远尾：低于 top1×它直接砍
+VEC_SPREAD = 0.05             # ④ 平局跨度
+VEC_FLAT_KEEP = 3             # ④ 平局时保留条数
+VEC_CAND_K = 4                # 召回候选倍数（去重+过滤后再截 top-k）
+VEC_FLUSH_EVERY = 100         # 增量编码多少条落盘一次
 FACT_PENDING_MAX = 100        # 候选事实观察区上限（按会话）
 FACT_DONE_MAX = 200           # 已提升事实名单上限（按会话，防重复写入）
 FACT_MIN_LEN = 8              # 短于 8 字的事实不够格
@@ -244,6 +260,25 @@ def filter_noise(rows, query_toks, recs):
     return kept
 
 
+def filter_noise_vec(rows):
+    """向量通道的四路过滤（阈值用余弦标定值，见 VEC_* 常量）。"""
+    if not rows:
+        return []
+    top1 = rows[0][0]
+    if top1 < VEC_FLOOR:
+        return []
+    kept = []
+    for sc, _m, i in rows:
+        if sc < top1 * VEC_FAR:
+            continue
+        if sc < top1 * VEC_RATIO and top1 - sc > VEC_GAP:
+            continue
+        kept.append((sc, _m, i))
+    if len(kept) >= 4 and kept[3][0] >= top1 * (1 - VEC_SPREAD):
+        kept = kept[:VEC_FLAT_KEEP]
+    return kept
+
+
 class _SearchIndex:
     """归档倒排索引。record = (conv, ts, nick, body)。
 
@@ -257,6 +292,11 @@ class _SearchIndex:
         self.toks = []
         self.post = {}          # token -> set(record_idx)
         self.df = {}            # token -> 文档频率
+        # 向量通道（可选）：embedder/vec 就绪且与 recs 对齐才启用
+        self.vec = None
+        self.embedder = None
+        self._vec_building = False
+        self._vec_dirty = 0
 
     def add(self, conv, ts, nick, body):
         with self.lock:
@@ -267,6 +307,17 @@ class _SearchIndex:
             for t in s:
                 self.post.setdefault(t, set()).add(i)
                 self.df[t] = self.df.get(t, 0) + 1
+        # 向量增量（锁外编码；构建期间跳过，由构建循环统一收尾）
+        if self.embedder is not None and self.vec is not None \
+                and not self._vec_building:
+            try:
+                self.vec.extend(self.embedder.encode([body]))
+                self._vec_dirty += 1
+                if self._vec_dirty >= VEC_FLUSH_EVERY:
+                    self.vec.flush()
+                    self._vec_dirty = 0
+            except Exception:
+                pass
 
     def build(self, records):
         with self.lock:
@@ -281,12 +332,25 @@ class _SearchIndex:
                     self.df[t] = self.df.get(t, 0) + 1
 
     def search(self, conv, query, k=SEARCH_TOPK):
-        """返回 [(score, rec_idx)]，已过四路过滤；无命中返回 []。"""
+        """返回 [(score, rec_idx)]，已过四路过滤；无命中返回 []。
+
+        通道顺序：向量（就绪时）→ 关键词 → 时间通道兜底。
+        时间通道放最后是血的教训：「今天不去了，不想吃饭」这种日常句
+        含日期词，若日期通道优先会把它劫持成"只要今天的记录"，
+        语义匹配整个被跳过。日期通道只服务「前天聊了啥」这类
+        语义找不到内容的纯时间问句。
+        """
         with self.lock:
             n = len(self.recs)
             if n == 0:
                 return []
-        # 时间通道：日期型 query 直接按本地日历日筛，不走关键词
+        if self.vec_ready(n):
+            hits = self._vec_search(conv, query, k)
+            if hits:
+                return hits
+        hits = self._kw_search(conv, query, k, n)
+        if hits:
+            return hits
         days = parse_dates(query)
         if days:
             rows = []
@@ -294,7 +358,12 @@ class _SearchIndex:
                 for i in range(n):
                     if self.recs[i][0] == conv and self.recs[i][1][:10] in days:
                         rows.append(i)
-            return [(99.0, 1, i) for i in rows[-k:]]
+            if rows:
+                return [(99.0, 1, i) for i in rows[-k:]]
+        return []
+
+    def _kw_search(self, conv, query, k, n):
+        """关键词通道（向量不可用时的主力，也是兜底）。"""
         q = list(set(tokenize(query)))
         with self.lock:
             df_max = max(2, int(n * SEARCH_DF_MAX_RATIO))
@@ -326,6 +395,74 @@ class _SearchIndex:
                 scored.append((total, matched, i))
         scored.sort(key=lambda x: -x[0])
         return filter_noise(scored, qc, self.recs)[:k]
+
+    # ---------- 向量通道 ----------
+    def vec_ready(self, n=None):
+        if self.vec is None or self.embedder is None:
+            return False
+        if n is None:
+            with self.lock:
+                n = len(self.recs)
+        return self.vec.aligned(n)
+
+    def _vec_search(self, conv, query, k):
+        """余弦 top-k + 四路过滤 + 去重。任何异常返回 None（走关键词）。"""
+        try:
+            qv = self.embedder.encode([query])
+            cands = self.vec.search(qv, k=max(k * VEC_CAND_K, k + 3))
+            rows, seen = [], set()
+            for sc, i in cands:
+                if self.recs[i][0] != conv:
+                    continue
+                body = self.recs[i][3].strip()
+                if not body:
+                    continue
+                key = re.sub(r"\s+", "", body)[:40]     # 去重：同句只留一条
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append((sc, 1, i))
+            return filter_noise_vec(rows)[:k]
+        except Exception:
+            return None
+
+    def build_vectors(self, embedder, vec):
+        """后台把全部 recs 编码进向量索引（首次约十几秒；增量在 add 里）。"""
+        if self._vec_building:
+            return
+        self._vec_building = True
+        try:
+            self.embedder = embedder
+            self.vec = vec
+            if vec.aligned(len(self.recs)) and len(self.recs) > 0:
+                return                          # 缓存对齐，直接用
+            log("向量索引构建中（%d 条）…" % len(self.recs))
+            i, first, idle = 0, True, 0
+            while idle < 3:
+                n = len(self.recs)
+                if i >= n:
+                    idle += 1
+                    time.sleep(0.5)
+                    continue
+                idle = 0
+                batch = self.recs[i:i + 64]
+                v = embedder.encode([r[3] for r in batch])
+                if first:
+                    vec.set_all(v)
+                    first = False
+                else:
+                    vec.extend(v)
+                i += len(batch)
+                if i % 512 < 64:
+                    vec.flush()
+            vec.flush()
+            log("向量索引就绪：%d 条" % len(vec))
+        except Exception as e:
+            log("向量索引构建失败，回退关键词检索: %s" % e)
+            self.vec = None
+            self.embedder = None
+        finally:
+            self._vec_building = False
 
 
 class BotMemory:
@@ -365,6 +502,7 @@ class BotMemory:
         self._load_style()
         self._load_samples()
         self._build_search_index()
+        threading.Thread(target=self._ensure_vectors, daemon=True).start()
 
     def start_backlog(self):
         """启动时把积压的历史补压成阶段回顾（后台线程，不挡着收消息）。"""
@@ -392,6 +530,8 @@ class BotMemory:
 
     def remember_incoming(self, evt):
         """把所有消息（含没 @ 我的群消息）记入上下文缓冲。"""
+        if evt.get("_replay"):
+            return                      # 补回的事件启动时已回读进 recent，不重复入
         if not self.allowed(evt):
             return
         conv = self.conv_of(evt)
@@ -1267,6 +1407,19 @@ class BotMemory:
                 self._search.add(conv, mm.group(1), mm.group(2), mm.group(3))
         except Exception:
             pass
+
+    def _ensure_vectors(self):
+        """后台构建向量索引。依赖/模型缺失就安静降级（关键词检索照常）。"""
+        if _mv is None or not _mv.deps_ok():
+            return                          # 没装 onnxruntime/tokenizers/numpy
+        try:
+            emb = _mv.Embedder(self.archive_dir())
+            vec = _mv.VectorStore(
+                os.path.join(self.archive_dir(), "vectors.npy"))
+            vec.load()
+            self._search.build_vectors(emb, vec)
+        except Exception as e:
+            log("向量检索初始化失败，回退关键词检索: %s" % e)
 
     def related(self, conv, text, k=SEARCH_TOPK):
         """搜本条会话的归档，返回可直接注入 prompt 的行（无命中返回 []）。"""

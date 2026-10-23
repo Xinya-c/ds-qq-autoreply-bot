@@ -75,6 +75,11 @@ DEFAULTS = {
     "fallback_to_api": True,    # CLI 失败/额度用尽时，自动改用直连 API
     "quota_reply": "",          # 所有通道都不可用时的占位回复（留空=干脆不回）
     "quota_reply_cooldown_sec": 1800,   # 同一会话多久才重复发一次占位回复，防止刷屏
+    "sweep": {                         # 启动补回：扫漏回的私聊消息并补回复
+        "enabled": True,
+        "max_age_hours": 24,           # 超过这个时辰的消息不补（不翻旧账）
+        "delay_sec": 20,               # 连上 OneBot 后等一会儿再扫（等登录/回读稳了）
+    },
     "cli_cooldown_sec": 600,    # 遇到 429 后，多久内不再尝试 CLI（秒）    # CLI 失败/额度用尽时，自动改用直连 API
     "merge_window_sec": 3,      # 同一会话连发消息的合并窗口（0=不合并）
     "max_parallel": 4,          # 最多同时处理几个会话
@@ -310,6 +315,7 @@ class AutoReply:
         self.last_reply_at = {}           # conv_key -> ts
         self.minute_window = deque()      # 最近一分钟的回复时间
         self.seen = deque(maxlen=2000)    # 已处理 message_id
+        self._swept = set()               # 启动补回已入队的 key（防重复补）
         self.seen_set = set()
         self.llm = cfg["llm"]
         self.api_key = resolve_api_key(self.llm)
@@ -1240,6 +1246,100 @@ class AutoReply:
                 frames = " <- ".join(x.strip() for x in tb[-3:])
                 log("回复流程异常: %s\n    位置: %s" % (e, frames or "?"))
 
+    # ---------- 启动补回：漏回的私聊消息 ----------
+    def _sweep_once(self):
+        """连上后延迟一会儿扫一次（给登录/回读留时间）。"""
+        cfg = self.cfg.get("sweep") or {}
+        try:
+            time.sleep(float(cfg.get("delay_sec", 20) or 20))
+        except Exception:
+            time.sleep(20)
+        try:
+            self._sweep_unanswered()
+        except Exception as e:
+            log("启动补回扫描异常: %s" % e)
+
+    def _sweep_unanswered(self):
+        """扫私聊归档里「对方发过、我们没有回」的消息，走正常流程补回。
+
+        判定：每个会话最后一条「我:」之后的对方消息即漏回（更早的要么回过、
+        要么是当时主动跳过的，不翻旧账）。合成事件带 _replay（不重复入
+        recent）和 _stale（prompt 提示「你刚才不在线」），经 _enqueue
+        走完整回复流程（限流/拆分/归档/记忆全不绕过）。
+        注意：只覆盖「到过守护进程但没回上」的；守护进程不在线时到来的
+        消息根本没进归档，补不回来（那需要 QQ 侧历史，见 README）。
+        """
+        cfg = self.cfg.get("sweep") or {}
+        if not cfg.get("enabled", True):
+            return
+        try:
+            max_age = float(cfg.get("max_age_hours", 24) or 24) * 3600
+        except Exception:
+            max_age = 24 * 3600
+        allowed = [int(x) for x in self.cfg.get("allowed_private") or []]
+        if not allowed:
+            return
+        d = self.mem.archive_dir()
+        now = time.time()
+        total = 0
+        for f in sorted(os.listdir(d)):
+            m = re.match(r"^private_(\d+)\.md$", f)
+            if not m:
+                continue
+            uid = int(m.group(1))
+            if uid not in allowed:
+                continue
+            try:
+                with open(os.path.join(d, f), encoding="utf-8",
+                          errors="replace") as fh:
+                    lines = [ln.rstrip("\n") for ln in fh
+                             if ln.startswith("[")]
+            except OSError:
+                continue
+            pend = []
+            for ln in reversed(lines):
+                mm = re.match(r"^\[([^\]]+)\]\s*(.+?):\s?(.*)$", ln)
+                if not mm:
+                    continue
+                if mm.group(2) == "我":
+                    break                   # 这条之后我们都回过，到此为止
+                pend.append((mm.group(1), mm.group(2), mm.group(3)))
+            if not pend:
+                continue
+            pend.reverse()                  # 恢复时间顺序
+            try:
+                newest = max(time.mktime(time.strptime(
+                    t, "%Y-%m-%d %H:%M:%S")) for t, _, _ in pend)
+            except Exception:
+                newest = now
+            if now - newest > max_age:
+                continue
+            text = "\n".join(t.strip() for _, _, t in pend if t.strip())
+            if not text:
+                continue
+            nick = re.sub(r"\(\d+\)$", "", pend[-1][1])
+            key = "sweep-u%d-%d" % (uid, int(newest))
+            if key in self._swept:
+                continue
+            self._swept.add(key)
+            self._enqueue("u%d" % uid, {
+                "post_type": "message",
+                "message_type": "private",
+                "user_id": uid,
+                "group_id": None,
+                "message_id": key,
+                "time": int(newest),
+                "message": [{"type": "text", "data": {"text": text}}],
+                "sender": {"nickname": nick, "card": "", "user_id": uid},
+                "_replay": True,
+                "_stale": now - newest,
+            })
+            total += len(pend)
+            log("启动补回：%s(%d) 有 %d 条漏回消息（最新 %.0f 分钟前），已入队"
+                % (nick, uid, len(pend), (now - newest) / 60.0))
+        if total:
+            log("启动补回合计：%d 条漏回消息进入回复队列" % total)
+
     def _grab_file(self, evt):
         """下载并保存文件（已存过则复用），返回 (name, ext, raw)。"""
         cfg = self.cfg.get("file") or {}
@@ -1527,6 +1627,7 @@ class AutoReply:
                     log("get_login_info 失败: %s" % info)
                 self.ob.set_event_handler(self.on_event)
                 # 阻塞保持：靠接收线程维持，这里只做心跳检查
+                threading.Thread(target=self._sweep_once, daemon=True).start()
                 while True:
                     time.sleep(30)
                     if self.ob._stop:

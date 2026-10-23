@@ -1,0 +1,75 @@
+# QQ 自动回复机器人
+
+基于 [NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot v11）+ 大模型的 QQ 自动回复机器人：私聊白名单自动回，群里被 @ 才回；带人设（system prompt）、三层记忆（滚动摘要 / 阶段回顾 / 说话风格档案）、关系档案、表情包自动配图、图片/语音/文件理解。
+
+## 功能
+
+- **两种触发**：私聊白名单内自动回复；群聊仅在被 @ 时回复（自动加 @ 前缀）
+- **人设可定制**：全部集中在配置的 `system_prompt` 一个字段里，随改随生效
+- **三层记忆**（按会话隔离，全部落盘 `qq_messages/`，重启不丢）：
+  - 短期：最近 N 条原文（`context_messages`）
+  - 中期：每 200 条压一段「阶段回顾」
+  - 长期：每 50 条一次「事实摘要 + 关系档案」；全局一份「说话风格档案」
+- **多媒体**：图片存盘后交给模型看内容；语音转写；文件提取文字
+- **表情包**：`assets/replies/` 图库 + `stickers.json` 场景标注，模型自行决定何时配图
+- **模型链**：主力模型 429（日额度耗尽）时自动顺位切备选；CLI 挂了可降级直连 API
+- **连发合并**：3 秒内的连发合并成一条一起回，回复过长自动拆多条
+- **控制面板**：`qq_panel.py`，深色 HeroUI 风格，覆盖配置/日志/启动停止
+
+## 环境要求
+
+- Python 3.10+（纯标准库，零第三方依赖）
+- [NapCat](https://github.com/NapNeko/NapCatQQ)：登录 QQ 后开启 OneBot v11，WebSocket 服务器监听 `127.0.0.1:3001`
+- 可选 Node.js：仅 `backend: codebuddy_cli` 需要（走本机 CodeBuddy CLI）；用 `deepseek` 直连 API 则不需要
+
+## 快速开始
+
+```bash
+# 1. 复制示例配置并修改
+cp qq_autoreply_config.example.json qq_autoreply_config.json
+```
+
+编辑 `qq_autoreply_config.json`：
+
+| 字段 | 说明 |
+| --- | --- |
+| `allowed_private` | 允许自动回复的 QQ 号列表（私聊） |
+| `allowed_groups` | 允许回复的群号列表（群里被 @ 才回） |
+| `system_prompt` | 机器人设，示例配置里是一份 12 岁小女孩人设，随便改 |
+| `codebuddy.cli` | CodeBuddy CLI 的 `bin/codebuddy` 路径（用 CLI 后端时必填） |
+| `llm.api_key` | 直连 API 时的 Key（`api_key_source` 改成 `literal`） |
+
+```bash
+# 2. 启动守护进程（保持运行）
+python qq_autoreply.py
+
+# 3. 另开一个终端启动控制面板（可选）
+python qq_panel.py
+```
+
+Windows 下也可以直接双击 `一键启动.bat`（会先拉起 NapCat 再启动守护进程）。
+
+## 文件说明
+
+| 文件 | 作用 |
+| --- | --- |
+| `qq_autoreply.py` | 主程序：OneBot 连接、事件调度、回复流程、模型链 |
+| `qq_panel.py` | tkinter 控制面板（配置/日志/启停） |
+| `boot_all.py` | 一键启动：NapCat + 守护进程 |
+| `apply_onebot.py` | 自动给 NapCat 写入 OneBot v11 配置 |
+| `qq_autoreply_config.json` | 本地配置（**已被 .gitignore 排除，不会上传**） |
+| `qq_autoreply_config.example.json` | 配置模板 |
+| `assets/replies/` | 表情包图库 + 场景标注 |
+| `docs/` | 项目总结文档 |
+
+## 隐私说明
+
+- 聊天记录归档（`qq_messages/`）、登录数据、本地记忆一律**不入库**，已在 `.gitignore` 中排除
+- 部署时请把仓库设为 **Private**，或至少确认配置文件里没有你不想公开的 QQ 号
+- 记忆文件（摘要/档案）里会累积聊天内容，注意不要连带分享
+
+## 已知边界
+
+- 群归档是 append-only 的混合日志，无法按人删除单条记录
+- 语音转写依赖 NapCat 的 `fetch_ptt_text`
+- 表情包发送有冷却间隔（默认每 5–10 条回复才允许一张），防止刷屏

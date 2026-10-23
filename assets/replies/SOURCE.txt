@@ -1,0 +1,13 @@
+# 表情包来源与授权
+
+本目录表情包来自开源同人图库，仅用于个人 QQ 聊天（非商业）。
+
+- 项目：梗鲸 · DeepSeek酱语录 / deepseek-chan-meme-pack
+- 仓库：https://github.com/the-beating-light-of-the-nail/deepseek-chan-meme-pack
+- 在线图库：https://ai-meme.cdqyfdbymn.me/
+- 角色原型：上善无形「溟月」（2025-06）
+- 女仆鲸鱼娘二次设计：ZipZipPipe（2026-04-25），依 **CC BY-NC-SA 4.0** 授权
+  （署名 · 非商业性使用 · 相同方式共享）
+- 图片版权归各自创作者所有；如需商用请先联系原作者。
+
+本目录内文件名与 `stickers.json` 中的「含义/台词/场景」为方便机器人选图而整理。

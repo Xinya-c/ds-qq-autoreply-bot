@@ -1,0 +1,38 @@
+# ===== 聊天记录与隐私数据（永不上传）=====
+qq_messages/
+all/
+daochu1/
+qq_inbox.jsonl
+cb_out.json
+qq_accounts.json
+_backup_login_*/
+*.db
+*.db-shm
+*.db-wal
+界面预览.png
+
+# ===== 第三方工具（可重新下载）=====
+NapCat.Shell.Windows.Node/
+NapCat.Shell.Windows.Node.zip
+dist/
+
+# ===== 本地记忆（含从聊天记录分析出的私人信息）=====
+.workbuddy/
+
+# ===== 构建产物 =====
+QQBotPanel.exe
+build/
+__pycache__/
+*.pyc
+
+# ===== 运行时产物 =====
+qq_autoreply.log
+qq_autoreply.pid
+*.bak
+
+# ===== 本地配置（含白名单 QQ 号，不上传）=====
+qq_autoreply_config.json
+
+# ===== 本地脚本/旧版备份（含个人路径，仅本地保留）=====
+login_codebuddy.bat
+qq_panel_旧版备份.py

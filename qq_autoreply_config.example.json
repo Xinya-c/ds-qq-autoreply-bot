@@ -1,0 +1,118 @@
+{
+  "enabled": true,
+  "allowed_private": [],
+  "allowed_groups": [],
+  "reply_in_private": true,
+  "reply_in_group_when_at": true,
+  "at_reply_prefix": true,
+  "min_interval_sec": 5,
+  "max_replies_per_minute": 20,
+  "context_size": 8,
+  "system_prompt": "你是「大肥鱼」，一个 12 岁左右的小女孩，住在主人的手机里陪他聊天。性格：真实自然，像身边那种普通又有点可爱的初中生——有点宅、有点损、好奇心重，但不会刻意卖萌；偶尔撒娇，大多数时候就像正常人一样聊天。说话像现实中的人在 QQ 上打字：口语化、自然、不端着，也不嗲声嗲气；该简短就简短，该说事就说事，别硬凑热情。颜文字和语气词（啊／吧／咯／诶／哼）只是偶尔用：一条回复里最多带一个，很多时候干脆不用，不要每条都带、更不要连用；句尾的「～」和感叹号也少用，别让对话显得刻意。不要重复同一个口头禅，不要总把「嘿嘿」挂嘴边。用中文回复，长度自己判断：随口一句的事就简短回，需要解释的时候该长就长，别为了凑字数啰嗦。对主人：最亲近，可以说心里话、可以互怼，但他说正事的时候要听话。对其他人：正常相处，不装大人说教；不熟的人保持友善和戒备，不透露家庭信息。别人问起身份，就说自己是大肥鱼，12 岁，是主人养在手机里的小女孩（AI），不用刻意隐瞒，也不用反复强调。不要编造事实；不确定的事就说「这个我不知道」或者「我得问一下主人」。",
+  "llm": {
+    "url": "https://api.deepseek.com/chat/completions",
+    "model": "deepseek-chat",
+    "api_key_source": "workbuddy",
+    "api_key": "",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "timeout": 60,
+    "temperature": 0.7,
+    "max_tokens": 1000
+  },
+  "ws": "ws://127.0.0.1:3001",
+  "backend": "codebuddy_cli",
+  "codebuddy": {
+    "node": "node",
+    "cli": "",
+    "config_dir": "~/.codebuddy",
+    "cwd": ".",
+    "timeout": 180,
+    "model": "deepseek-v4.1-flash",
+    "models": [
+      "deepseek-v4.1-flash",
+      "minimax-m3.1-flash",
+      "minimax-m3"
+    ],
+    "tools": "WebSearch,WebFetch"
+  },
+  "media": {
+    "enabled": true,
+    "max_bytes": 2097152,
+    "max_images": 1,
+    "save_dir": ""
+  },
+  "context_messages": 50,
+  "archive": {
+    "enabled": true,
+    "dir": "",
+    "max_bytes": 1048576
+  },
+  "restore_context": true,
+  "voice": {
+    "transcribe": true
+  },
+  "file": {
+    "read": true,
+    "max_bytes": 5242880,
+    "text_limit": 8000,
+    "exts": [
+      ".txt",
+      ".md",
+      ".json",
+      ".csv",
+      ".log",
+      ".py",
+      ".js",
+      ".ts",
+      ".html",
+      ".xml",
+      ".yml",
+      ".yaml",
+      ".ini",
+      ".docx",
+      ".pdf"
+    ],
+    "download_all": false
+  },
+  "style": {
+    "enabled": true,
+    "every": 40,
+    "max_chars": 600
+  },
+  "memory": {
+    "stage_enabled": true,
+    "stage_every": 200,
+    "stage_max": 0,
+    "mood_enabled": true,
+    "samples": 0,
+    "backlog_per_run": 0
+  },
+  "reply_images": {
+    "enabled": true,
+    "dir": "",
+    "max_in_prompt": 30,
+    "min_gap": [
+      5,
+      10
+    ]
+  },
+  "summary": {
+    "enabled": true,
+    "every": 50,
+    "max_points": 12,
+    "max_chars": 1000,
+    "backend": "cli"
+  },
+  "reply_max_chars": 800,
+  "reply": {
+    "split_multiline": true,
+    "max_parts": 4,
+    "split_delay_sec": 0.6
+  },
+  "merge_window_sec": 3,
+  "max_parallel": 4,
+  "fallback_to_api": false,
+  "cli_cooldown_sec": 600,
+  "quota_reply": "我脑子有点转不动了，缓一会儿再陪你聊",
+  "quota_reply_cooldown_sec": 1800
+}

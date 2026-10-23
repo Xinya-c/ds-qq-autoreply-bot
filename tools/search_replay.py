@@ -6,7 +6,9 @@
 纯关键词方案（不引 jieba、不上向量库，保持零依赖）。但阈值不能拍脑袋——
 借鉴 dsh-workspace-recollection 的纪律：**阈值必须用真实回放定**。
 
-本脚本对 qq_messages/ 的真实归档做两类回放：
+本脚本对 qq_messages/ 的真实归档做两类回放（**部署态**：DF/idf 用全局
+语料计算保证分数尺度稳定，候选结果按样本所在会话过滤，与 memory.py
+的「按会话隔离检索」一致）：
 
   正样本（含索引）：query = 某条归档原文的片段，索引里保留该条
       → 量 hit@1/@3、MRR、源记录分数分布（检索体系的天花板）
@@ -189,11 +191,15 @@ class Index:
     def query_content_len(self, query_toks):
         return sum(1 for t, kind in query_toks if self.weight(t, kind) > 0)
 
-    def topk(self, query_text, k=5, exclude_text=None):
+    def topk(self, query_text, k=5, exclude_text=None, conv=None):
+        """检索 top-k。conv 限定候选范围（部署态：按当前会话过滤），
+        exclude_text 排除同文本记录（leave-one-out 用）。"""
         q = list(set(tokenize(query_text)))
         qc = self.query_content_len(q)
         scored = []
         for i in range(len(self.recs)):
+            if conv is not None and self.recs[i]["conv"] != conv:
+                continue
             if exclude_text is not None and \
                     self.recs[i]["text"] == exclude_text:
                 continue
@@ -290,13 +296,16 @@ def eval_config(recs, pos_idx, neg_idx, cfg, floor=None):
 
     floor=None 时按负样本 p95 × FLOOR_MARGIN 自动定；传入则用给定值
     （用于及格线 trade-off 曲线扫描）。
+    部署态：DF/idf 用全局语料算（分数尺度稳定、一条 FLOOR 通吃所有
+    会话），候选结果按各样本所在会话过滤（隔离，不串话）。
     """
     idx = Index(recs, df_max_ratio=cfg["df"])
     # 负样本 top1 分布 → 定绝对底线
     neg_top1 = []
     for i in neg_idx:
         rows, q, qc = idx.topk(recs[i]["text_frag"], k=1,
-                               exclude_text=recs[i]["text"])
+                               exclude_text=recs[i]["text"],
+                               conv=recs[i]["conv"])
         if rows:
             neg_top1.append(rows[0][0])
     neg_top1.sort()
@@ -309,7 +318,8 @@ def eval_config(recs, pos_idx, neg_idx, cfg, floor=None):
     pos_n = 0
     src_scores = []
     for i in pos_idx:
-        rows, q, qc = idx.topk(recs[i]["text_frag"], k=5)
+        rows, q, qc = idx.topk(recs[i]["text_frag"], k=5,
+                               conv=recs[i]["conv"])
         if not rows:
             continue
         pos_n += 1
@@ -324,7 +334,8 @@ def eval_config(recs, pos_idx, neg_idx, cfg, floor=None):
     neg_keep = 0
     for i in neg_idx:
         rows, q, qc = idx.topk(recs[i]["text_frag"], k=5,
-                               exclude_text=recs[i]["text"])
+                               exclude_text=recs[i]["text"],
+                               conv=recs[i]["conv"])
         if not rows:
             continue
         p = dict(params)
@@ -372,11 +383,12 @@ def run(archive_dir, samples, seed):
     print("DF 最高的 15 个 bigram（系统标记+泛词）：%s"
           % " ".join("%s:%d" % (t, d) for t, d in bigram_df[:15]))
 
-    # ---- 无过滤天花板（df=5%, 不加任何判据）----
+    # ---- 无过滤天花板（df=5%, 不加任何判据，部署态）----
     hit1 = hit3 = 0
     mrr = 0.0
     for i in pos_idx:
-        rows, q, qc = idx0.topk(recs[i]["text_frag"], k=3)
+        rows, q, qc = idx0.topk(recs[i]["text_frag"], k=3,
+                                conv=recs[i]["conv"])
         if not rows:
             continue
         rank = next((k + 1 for k, (sc, m, j) in enumerate(rows) if j == i), 0)
@@ -450,6 +462,36 @@ def run(archive_dir, samples, seed):
     print("注意：正样本 query 是答案原文的连续片段，上述数字是**天花板**；")
     print("      真实用户提问更短更泛，保留率会低于此，上线后需用真实")
     print("      对话回归（本脚本 --seed 换种子可复测）。")
+
+    # ---- 部署态说明 + 会话体量 ----
+    # 部署态 = DF/idf 全局算 + 候选按当前会话过滤。好处：
+    #   ① 隔离：不可能把 A 会话的片段注入 B 会话（隐私/串话）；
+    #   ② 分数尺度全局稳定：小会话（几十条）里稀有词 idf 仍然高，
+    #      一条 FLOOR 通吃所有体量的会话（按会话建索引则小会话
+    #      最高分都够不到全局 FLOOR，检索会静默失效）。
+    # 代价：跨会话的「主题级召回」不再可能——但那本来也不该做。
+    conv_n = Counter(r["conv"] for r in recs)
+    sizes = " ".join("%s=%d" % (c, n) for c, n in conv_n.most_common())
+    idx = Index(recs, df_max_ratio=bc["df"])
+    # 小会话体检：最小的会话里，leave-one-out 的 top1 最高分能否到 FLOOR
+    small = [c for c, n in conv_n.most_common() if n <= 100]
+    small_info = []
+    for c in small:
+        ci = [i for i in neg_idx if recs[i]["conv"] == c]
+        if not ci:
+            continue
+        best = 0.0
+        for i in ci[:40]:
+            rows, q, qc = idx.topk(recs[i]["text_frag"], k=1,
+                                   exclude_text=recs[i]["text"], conv=c)
+            if rows:
+                best = max(best, rows[0][0])
+        small_info.append("%s(最高%.1f)" % (c, best))
+    print("-" * 66)
+    print("会话体量：%s" % sizes)
+    print("小会话体检（n≤100，FLOOR=%.1f）：%s"
+          % (br["floor"], " ".join(small_info) or "无"))
+    print("（小会话最高分远超 FLOOR = 全局 idf 保住了分数尺度，检索可用）")
     print("=" * 66)
     return 0
 

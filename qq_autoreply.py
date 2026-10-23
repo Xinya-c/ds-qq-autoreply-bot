@@ -283,6 +283,12 @@ def resolve_api_key(llm):
     return os.environ.get(llm.get("api_key_env") or "", "")
 
 
+# 离线消息判定：消息自带的时间戳比现在旧超过这个值，视为「机器人不在线时
+# 发来的」（NapCat/QQ 重启后 QQ 服务端会把离线消息补推上来）。给模型的
+# prompt 里会加一句提示，免得它对着几小时前的「早上好」装成刚看到。
+STALE_MSG_SEC = 600
+
+
 class AutoReply:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -795,7 +801,7 @@ class AutoReply:
     )
 
     def _prompt(self, conv_key, user_text, has_image=False, mid=None, bare=False,
-                excludes=None, uid=None):
+                excludes=None, uid=None, stale=False):
         mem = self.mem.recall(conv_key, uid, user_text or "", mid, excludes)
         hist = mem["history"]
         lines = [self.cfg["system_prompt"], self.HARDEN, ""]
@@ -850,6 +856,11 @@ class AutoReply:
         else:
             lines.append("对方刚说：%s" % user_text)
         lines.append("")
+        if stale:
+            lines.append("（注意：你刚才不在线，这些消息是才收到的。"
+                         "如果内容明显是之前发的（比如问候、约时间），"
+                         "就按过了一段时间的口吻自然回应，别假装一直在盯着消息。）")
+            lines.append("")
         if conv_key.startswith("g"):
             lines.append("请结合上面的上下文，只输出你要回复给对方的内容；"
                          "如果上文有没回答完的问题，可以一并回应。不要任何前缀、解释或引号。")
@@ -974,9 +985,9 @@ class AutoReply:
         return (r.get("result") or "").strip() or None
 
     def _cli_reply(self, conv_key, user_text, image=None, mid=None, bare=False,
-                   excludes=None, uid=None):
+                   excludes=None, uid=None, stale=False):
         prompt, hist = self._prompt(conv_key, user_text, bool(image), mid, bare,
-                                    excludes, uid)
+                                    excludes, uid, stale)
         text = None
         for idx, m in enumerate(self._cli_ready_models()):
             if image:
@@ -999,7 +1010,7 @@ class AutoReply:
         hist.append({"role": "assistant", "content": text})
         return text
 
-    def _api_reply(self, conv_key, user_text, uid=None):
+    def _api_reply(self, conv_key, user_text, uid=None, stale=False):
         hist = self.mem.history.setdefault(conv_key, deque(maxlen=int(self.cfg["context_size"]) * 2))
         mem = self.mem.recall(conv_key, uid, user_text or "")
         sys_msg = self.cfg["system_prompt"] + "\n" + self.HARDEN
@@ -1027,6 +1038,10 @@ class AutoReply:
         if mem["related"]:
             sys_msg += ("\n【相关旧记忆（更早的聊天记录，仅供参考，对方没问起就不要主动提）】\n"
                         + "\n".join(mem["related"]))
+        if stale:
+            sys_msg += ("\n（注意：你刚才不在线，这些消息是才收到的。"
+                        "如果内容明显是之前发的（比如问候、约时间），"
+                        "就按过了一段时间的口吻自然回应，别假装一直在盯着消息。）")
         imgs = self._list_reply_images()
         if imgs:
             sys_msg += ("\n想发表情包时，在回复末尾加一个 [[img:文件名]]（一次最多一个），"
@@ -1058,21 +1073,22 @@ class AutoReply:
         return text
 
     def llm_reply(self, conv_key, user_text, image=None, mid=None, bare=False,
-                  excludes=None, uid=None):
+                  excludes=None, uid=None, stale=False):
         backend = (self.cfg.get("backend") or "deepseek").lower()
         if backend == "codebuddy_cli":
             if not self._cli_ready_models():
                 # 整条模型链都在冷却里，别再浪费注定失败的 CLI 调用
                 log("  所有 CodeBuddy 模型都在 429 冷却中")
                 return self._last_resort(conv_key, user_text, bare, uid)
-            text = self._cli_reply(conv_key, user_text, image, mid, bare, excludes, uid)
+            text = self._cli_reply(conv_key, user_text, image, mid, bare, excludes,
+                                   uid, stale)
             if text:
                 return text
             # CLI 挂了（额度 429 / 超时 / 报错）
             return self._last_resort(conv_key, user_text, bare, uid)
         if bare:
             user_text = user_text or "（只@了你，没有文字）"
-        return self._api_reply(conv_key, user_text, uid)
+        return self._api_reply(conv_key, user_text, uid, stale)
 
     def _last_resort(self, conv_key, user_text, bare=False, uid=None):
         """所有生成通道都不可用时的最后手段。
@@ -1118,6 +1134,17 @@ class AutoReply:
             if self._seen(evt.get("message_id")):
                 log("  跳过：重复消息")
                 return
+            # 离线消息探测：QQ 重启后补推的消息带原始发送时间，旧得多的标记出来
+            # （没有 time 字段或解析失败的一律当新消息，别误判）
+            try:
+                t = evt.get("time")
+                age = time.time() - float(t) if t else 0.0
+            except (TypeError, ValueError):
+                age = 0.0
+            if age > STALE_MSG_SEC:
+                evt["_stale"] = age
+                log("  这是不在线期间发来的消息（%.0f 分钟前），照常回复和记忆"
+                    % (age / 60.0))
             self.mem.remember_incoming(evt)      # 先入上下文缓冲（含没 @ 我的群消息）
             # 白名单会话：顺带把图片存盘 + 写归档（不阻塞回复流程之外的东西）
             if self.mem.allowed(evt):
@@ -1178,6 +1205,9 @@ class AutoReply:
         merged["message"] = segs
         merged["_merged_mids"] = mids
         merged["_merged_count"] = len(evts)
+        # 合并的连发里只要有一条是离线的，整组按离线处理
+        if any(e.get("_stale") for e in evts):
+            merged["_stale"] = max(e.get("_stale") or 0 for e in evts)
         return merged
 
     def _enqueue(self, conv, evt):
@@ -1347,7 +1377,8 @@ class AutoReply:
             if not text and not image:
                 return
             reply = self.llm_reply(conv, text, image, evt.get("message_id"),
-                                   excludes=excludes, uid=uid)
+                                   excludes=excludes, uid=uid,
+                                   stale=bool(evt.get("_stale")))
             if not reply:
                 return
             self._mark(conv)
@@ -1409,7 +1440,8 @@ class AutoReply:
                 return
             clean = self._enrich(evt, clean, conv)
             reply = self.llm_reply(conv, clean, image, evt.get("message_id"), bare,
-                                   excludes=excludes, uid=uid)
+                                   excludes=excludes, uid=uid,
+                                   stale=bool(evt.get("_stale")))
             if not reply:
                 return
             self._mark(conv)

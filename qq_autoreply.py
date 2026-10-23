@@ -80,6 +80,14 @@ DEFAULTS = {
         "max_age_hours": 24,           # 超过这个时辰的消息不补（不翻旧账）
         "delay_sec": 20,               # 连上 OneBot 后等一会儿再扫（等登录/回读稳了）
     },
+    "proactive": {                     # 群聊主动搭话：没人 @ 它也偶尔插一句
+        "enabled": True,
+        "min_msgs": 10,                # 群里攒够多少条别人的消息，开始考虑主动接话
+        "max_msgs": 15,                # 区间上限；每次随机抽一个目标，间隔不固定
+        "cooldown_sec": 600,           # 同一个群两次主动发言之间至少隔这么久
+        "max_per_hour": 3,             # 同一个群每小时最多主动发言几次（硬闸）
+        "context_msgs": 12,            # 给模型的群内最近消息条数（含我自己说的）
+    },
     "cli_cooldown_sec": 600,    # 遇到 429 后，多久内不再尝试 CLI（秒）    # CLI 失败/额度用尽时，自动改用直连 API
     "merge_window_sec": 3,      # 同一会话连发消息的合并窗口（0=不合并）
     "max_parallel": 4,          # 最多同时处理几个会话
@@ -340,6 +348,11 @@ class AutoReply:
         self.seen = deque(maxlen=2000)    # 已处理 message_id
         self._swept = set()               # 启动补回已入队的 key（防重复补）
         self.seen_set = set()
+        # 群聊主动搭话：计数从「本次上线」开始，不翻旧账
+        self.pmsg = {}                    # conv_key -> 已攒的群内他人消息条数
+        self.ptarget = {}                 # conv_key -> 本轮随机出的目标条数
+        self.plast = {}                   # conv_key -> 上次主动发言的时间戳
+        self.phour = {}                   # conv_key -> deque 最近一小时的主动发言时间
         self.llm = cfg["llm"]
         self.api_key = resolve_api_key(self.llm)
 
@@ -871,7 +884,17 @@ class AutoReply:
                 else "你当时不在线，是现在才看到的。")
 
     def _prompt(self, conv_key, user_text, has_image=False, mid=None, bare=False,
-                excludes=None, uid=None, stale=0, replay=False):
+                excludes=None, uid=None, stale=0, replay=False, proactive=False):
+        if proactive:
+            # 主动接话是另一套拼法：系统段 + 「群里最近聊了啥」+ 接话指令，
+            # 没有「对方刚说：X」，别让模型以为有人在跟它说话
+            n = int((self.cfg.get("proactive") or {}).get("context_msgs", 12) or 12)
+            lines = self._p_lines(conv_key, n)
+            last = lines[-1].split(": ", 1)[-1] if lines else ""
+            sys_part = self._proactive_sys(conv_key, last)
+            hist = self.mem.history.setdefault(
+                conv_key, deque(maxlen=int(self.cfg["context_size"]) * 2))
+            return sys_part + "\n\n" + user_text + "\n\n" + self.PROACTIVE_TASK, hist
         mem = self.mem.recall(conv_key, uid, user_text or "", mid, excludes)
         hist = mem["history"]
         lines = [self.cfg["system_prompt"], self.HARDEN, ""]
@@ -1056,9 +1079,10 @@ class AutoReply:
         return (r.get("result") or "").strip() or None
 
     def _cli_reply(self, conv_key, user_text, image=None, mid=None, bare=False,
-                   excludes=None, uid=None, stale=False, replay=False):
+                   excludes=None, uid=None, stale=False, replay=False,
+                   proactive=False):
         prompt, hist = self._prompt(conv_key, user_text, bool(image), mid, bare,
-                                    excludes, uid, stale, replay)
+                                    excludes, uid, stale, replay, proactive)
         text = None
         for idx, m in enumerate(self._cli_ready_models()):
             if image:
@@ -1081,8 +1105,21 @@ class AutoReply:
         hist.append({"role": "assistant", "content": text})
         return text
 
-    def _api_reply(self, conv_key, user_text, uid=None, stale=False, replay=False):
+    def _api_reply(self, conv_key, user_text, uid=None, stale=False, replay=False,
+                   proactive=False):
         hist = self.mem.history.setdefault(conv_key, deque(maxlen=int(self.cfg["context_size"]) * 2))
+        if proactive:
+            # 直连 API 后端不走 _prompt，这里得自己拼主动接话那套
+            # （否则模型收到群聊记录却不知道自己要干什么，也没有「跳过」这个选项）
+            n = int((self.cfg.get("proactive") or {}).get("context_msgs", 12) or 12)
+            plines = self._p_lines(conv_key, n)
+            last = plines[-1].split(": ", 1)[-1] if plines else ""
+            sys_msg = self._proactive_sys(conv_key, last)
+            user_text = user_text + "\n\n" + self.PROACTIVE_TASK
+            msgs = [{"role": "system", "content": sys_msg}]
+            msgs.extend(list(hist))
+            msgs.append({"role": "user", "content": user_text})
+            return self._api_post(msgs, conv_key, user_text, hist)
         mem = self.mem.recall(conv_key, uid, user_text or "")
         sys_msg = self.cfg["system_prompt"] + "\n" + self.HARDEN
         recent_kao = list(self.kaomoji_hist.get(conv_key) or [])
@@ -1119,6 +1156,10 @@ class AutoReply:
         msgs = [{"role": "system", "content": sys_msg}]
         msgs.extend(list(hist))
         msgs.append({"role": "user", "content": user_text})
+        return self._api_post(msgs, conv_key, user_text, hist)
+
+    def _api_post(self, msgs, conv_key, user_text, hist):
+        """直连 API 的公共发送 + 历史回写。"""
         body = json.dumps({
             "model": self.llm["model"],
             "messages": msgs,
@@ -1142,26 +1183,27 @@ class AutoReply:
         return text
 
     def llm_reply(self, conv_key, user_text, image=None, mid=None, bare=False,
-                  excludes=None, uid=None, stale=0, replay=False):
+                  excludes=None, uid=None, stale=0, replay=False, proactive=False):
         backend = (self.cfg.get("backend") or "deepseek").lower()
         if backend == "codebuddy_cli":
             if not self._cli_ready_models():
                 # 整条模型链都在冷却里，别再浪费注定失败的 CLI 调用
                 log("  所有 CodeBuddy 模型都在 429 冷却中")
                 return self._last_resort(conv_key, user_text, bare, uid, stale,
-                                         replay)
+                                         replay, proactive)
             text = self._cli_reply(conv_key, user_text, image, mid, bare, excludes,
-                                   uid, stale, replay)
+                                   uid, stale, replay, proactive)
             if text:
                 return text
             # CLI 挂了（额度 429 / 超时 / 报错）
-            return self._last_resort(conv_key, user_text, bare, uid, stale, replay)
+            return self._last_resort(conv_key, user_text, bare, uid, stale, replay,
+                                     proactive)
         if bare:
             user_text = user_text or "（只@了你，没有文字）"
-        return self._api_reply(conv_key, user_text, uid, stale, replay)
+        return self._api_reply(conv_key, user_text, uid, stale, replay, proactive)
 
     def _last_resort(self, conv_key, user_text, bare=False, uid=None, stale=0,
-                     replay=False):
+                     replay=False, proactive=False):
         """所有生成通道都不可用时的最后手段。
 
         顺序：直连 API（fallback_to_api 打开且有 Key 时）→ 额度耗尽的占位回复
@@ -1170,7 +1212,7 @@ class AutoReply:
         if self.cfg.get("fallback_to_api", True) and self.api_key:
             log("  CLI 未出结果，改用直连 API 兜底")
             fb = user_text or ("（只@了你，没有文字）" if bare else "")
-            return self._api_reply(conv_key, fb, uid, stale, replay)
+            return self._api_reply(conv_key, fb, uid, stale, replay, proactive)
         qr = (self.cfg.get("quota_reply") or "").strip()
         if not qr:
             log("  所有通道不可用，本次不回复（可在配置里填 quota_reply 给个占位话术）")
@@ -1227,6 +1269,10 @@ class AutoReply:
                     if img:
                         evt["_image"] = img
                 self.mem.archive_incoming(evt)
+            # 群聊主动搭话：攒「本次上线以来」的群内他人消息（补回的旧消息不翻旧账）
+            if evt.get("message_type") == "group" and not evt.get("_replay") \
+                    and self.mem.allowed(evt):
+                self._proactive_note(self.mem.conv_of(evt))
             self._schedule(evt)
         except Exception as e:
             log("事件处理异常: %s" % e)
@@ -1417,7 +1463,208 @@ class AutoReply:
             log("启动补回扫描完成：无漏回消息（%d 个会话都回过）" % checked)
         if stale:
             log("启动补回：%d 个会话有未回复消息但已超过 %.0f 小时，未补回"
-                "（想补就改配置 sweep.max_age_hours）" % (stale, max_age / 3600.0))
+            "（想补就改配置 sweep.max_age_hours）" % (stale, max_age / 3600.0))
+
+    # ---------- 群聊主动搭话 ----------
+    # 思路：只负责「数条数 + 报上下文」，说不说、怎么说由模型自己判断
+    # （它可以选择输出「跳过」安静待着）。计数从本次上线开始，不翻旧账。
+    PROACTIVE_TASK = (
+        "【任务】上面是这个群最近的聊天记录。你是群里的一个普通成员，"
+        "现在没人在跟你说话，你自己判断要不要插一句：\n"
+        "- 有你能自然接上的话：就用平时的口吻说一句，像群里的人那样接话。"
+        "别总结、别复读别人刚说的话、别用「大家好」式开场，也别 @ 任何人；\n"
+        "- 话题你不懂、插不上嘴，或者群里在说正事／吵架／煽情、不适合你捣乱："
+        "只输出「跳过」两个字，别的什么都不要输出。"
+    )
+    PROACTIVE_SKIP = ("跳过", "不说话", "沉默", "不接话", "不发言")
+
+    def _p_new_target(self):
+        """本轮目标条数：区间内随机，达到后重新抽，避免节奏太规律。"""
+        cfg = self.cfg.get("proactive") or {}
+        lo = int(cfg.get("min_msgs", 10) or 10)
+        hi = int(cfg.get("max_msgs", 15) or 15)
+        if hi < lo:
+            lo, hi = hi, lo
+        return random.randint(max(1, lo), max(1, hi))
+
+    def _p_target(self, conv):
+        t = self.ptarget.get(conv)
+        if not t:
+            t = self.ptarget[conv] = self._p_new_target()
+        return t
+
+    def _p_allowed(self, conv, now):
+        """冷却 + 每小时硬闸，两关都过才让说话。"""
+        cfg = self.cfg.get("proactive") or {}
+        cd = float(cfg.get("cooldown_sec", 600) or 0)
+        if now - self.plast.get(conv, 0.0) < cd:
+            return False
+        win = self.phour.setdefault(conv, deque())
+        while win and now - win[0] > 3600:
+            win.popleft()
+        cap = int(cfg.get("max_per_hour", 3) or 0)
+        return len(win) < cap
+
+    def _p_reset(self, conv, spoken=False):
+        """说过话就清零重新攒。
+
+        spoken=True 是「我真的开口了」（主动接话成功），要计入每小时上限；
+        被动回复只重置计数和冷却，不占主动发言的配额——不然热闹群里
+        光回 @ 就把主动搭话的额度耗光了。
+        """
+        now = time.time()
+        self.pmsg[conv] = 0
+        self.ptarget[conv] = self._p_new_target()
+        self.plast[conv] = now
+        if spoken:
+            self.phour.setdefault(conv, deque()).append(now)
+
+    def _proactive_note(self, conv):
+        """群里每来一条他人消息调一次；攒满本轮目标就安排一次主动接话。"""
+        cfg = self.cfg.get("proactive") or {}
+        if not cfg.get("enabled", True):
+            return
+        if not self.cfg.get("reply_in_group_when_at", True):
+            return
+        now = time.time()
+        n = self.pmsg.get(conv, 0) + 1
+        target = self._p_target(conv)
+        if n < target:
+            self.pmsg[conv] = n
+            return
+        # 攒满了：先清零重抽（没过闸的话下次攒满再试），再看让不让我说
+        self.pmsg[conv] = 0
+        self.ptarget[conv] = self._p_new_target()
+        if not self._p_allowed(conv, now):
+            log("群%s 攒够 %d 条群消息，但还在冷却或已达每小时上限，本次不主动接话"
+                % (conv, target))
+            return
+        log("群%s 已攒 %d 条群消息，安排一次主动接话" % (conv, target))
+        # 入队就按下冷却计时：模型再慢也不会连着安排第二次（防排队连发）
+        self.plast[conv] = now
+        self._enqueue(conv, {
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": int(conv[1:]),
+            "user_id": None,
+            "message_id": "proactive-%s-%d" % (conv, int(now)),
+            "time": int(now),
+            "message": [],
+            "sender": {},
+            "_proactive": True,
+        })
+
+    def _p_lines(self, conv, n):
+        """群里最近 n 条消息（含我自己说的），一行一条。"""
+        out = []
+        for m in list(self.mem.recent.get(conv) or [])[-max(1, n):]:
+            who = "我" if m.get("nick") == "我" else (m.get("nick") or "?")
+            t = re.sub(r"\s+", " ", str(m.get("text") or "")).strip()
+            if t:
+                out.append("%s: %s" % (who, t))
+        return out
+
+    def _proactive_sys(self, conv, last_text):
+        """主动接话的系统段：人设 + 群记忆 + 风格 + 相关旧记忆（不含群聊记录）。"""
+        mem = self.mem
+        out = [self.cfg["system_prompt"], self.HARDEN, ""]
+        kao = list(self.kaomoji_hist.get(conv) or [])
+        if kao:
+            out.append("最近用过的颜文字（这几个别再用了，换新的）：" + "、".join(kao))
+            out.append("")
+        if mem.summary.get(conv):
+            out.append("【长期记忆（较早的聊天要点）】")
+            out.append(mem.summary[conv])
+            out.append("")
+        if mem.profile.get(conv):
+            out.append("【这个群的整体情况和氛围】")
+            out.append(mem.profile[conv])
+            out.append("")
+        if mem.stages.get(conv):
+            out.append("【更早的阶段回顾（较早发生的事）】")
+            out.append(mem.stages[conv])
+            out.append("")
+        if mem.style:
+            out.append("【我自己的说话习惯（长期养成的，照着说，别每次重新发明）】")
+            out.append(mem.style)
+            out.append("")
+        # 拿群里最后一句当检索词，把可能相关的旧记忆带进来（可选，取不到就安静不带）
+        rel = []
+        if last_text:
+            try:
+                rel = mem.related(conv, last_text)
+            except Exception:
+                rel = []
+        if rel:
+            out.append("【相关旧记忆（更早的聊天记录，仅供参考，没人问起就不要主动提）】")
+            out.extend(rel)
+            out.append("")
+        imgs = self._list_reply_images()
+        if imgs:
+            out.append("想发表情包时，在回复末尾加一个 [[img:文件名]]（一次最多一个）。"
+                       "按群里的气氛和你自己的情绪挑最贴切的那张；没有合适的就别发，"
+                       "别每次都发。括号里是该图适合的场景。")
+            out.append("可用表情包：" + "；".join(imgs))
+        return "\n".join(out)
+
+    def _is_skip(self, text):
+        """模型判断「这次不插话」时的暗号。"""
+        t = re.sub(r"[\s，。！~、!?？.\-—…（）()【】\[\]「」\"']+", "",
+                   str(text or "")).lower()
+        return (not t) or (t in self.PROACTIVE_SKIP)
+
+    def _proactive_send(self, evt, conv):
+        """真正发起一次群聊主动发言（没人 @ 我，我自己想插一句）。"""
+        gid = int(conv[1:])
+        cfg = self.cfg.get("proactive") or {}
+        n = int(cfg.get("context_msgs", 12) or 12)
+        lines = self._p_lines(conv, n)
+        if not lines:
+            log("  主动接话放弃：群%s 没有可用的群聊上下文" % conv)
+            return
+        ptext = "\n".join(lines)
+        reply = self.llm_reply(conv, ptext, proactive=True)
+        if not reply:
+            log("  主动接话失败：没拿到回复（不计入发言次数，下次攒满再试）")
+            return
+        body, imgs = self._split_images(reply)
+        if self._is_skip(body):
+            log("群%s 主动接话：判断插不上嘴，本次不发言" % conv)
+            self._p_reset(conv, spoken=True)   # 确有一次「想过」，计入每小时上限
+            return
+        self._p_reset(conv, spoken=True)
+        self._mark(conv)
+        self._remember_kaomoji(conv, body)
+        self._mark_reply(conv)
+        if imgs and not self._img_allowed(conv):
+            log("  本次不发表情包（距上次表情包不足 %d 次回复）"
+                % self._required_gap(conv))
+            imgs = []
+        if imgs:
+            self._mark_img(conv)
+        self.mem.remember_bot(conv, body)
+        parts = self._split_parts(body)
+        sent = False
+        for i, part in enumerate(parts):
+            last = (i == len(parts) - 1)
+            segs = self._build_segments(part, imgs if last else [])
+            r = self.ob.call("send_group_msg",
+                             {"group_id": gid, "message": segs or part})
+            log("群%s 主动发言 -> %s%s%s | %s" % (
+                conv, part[:40],
+                " [+图片]" if (imgs and last) else "",
+                "（%d/%d）" % (i + 1, len(parts)) if len(parts) > 1 else "",
+                "ok" if r.get("ok") else r))
+            if r.get("ok"):
+                sent = True
+                self.mem.archive_outgoing(
+                    conv, (part + (" 【图片】" + os.path.basename(imgs[0])
+                                   if (imgs and last) else "")).strip())
+            if not last:
+                time.sleep(self._split_delay())
+        if sent:
+            # 让风格提炼和摘要也吃到这次接话（q 用群里最后一句充数）
+            self.mem.remember(conv, None, lines[-1], body)
 
     def _grab_file(self, evt):
         """下载并保存文件（已存过则复用），返回 (name, ext, raw)。"""
@@ -1602,6 +1849,10 @@ class AutoReply:
             gid = evt.get("group_id")
             if int(gid) not in [int(x) for x in self.cfg.get("allowed_groups") or []]:
                 return
+            conv = "g%d" % gid
+            # 主动接话：没人在 @ 我，是我自己看群里聊得差不多了想插一句
+            if evt.get("_proactive"):
+                return self._proactive_send(evt, conv)
             # 必须 @我
             at_me = False
             for seg in (evt.get("message") or []):
@@ -1615,7 +1866,6 @@ class AutoReply:
             bare = (not clean and not image)   # 只 @ 了我、没写内容
             if bare:
                 log("  只 @ 了我，没有文字内容 —— 按上下文接话")
-            conv = "g%d" % gid
             if not self._rate_ok(conv):
                 return
             clean = self._enrich(evt, clean, conv)
@@ -1667,6 +1917,8 @@ class AutoReply:
                     time.sleep(self._split_delay())
             if sent:
                 self.mem.remember(conv, uid, clean, body)  # 重活进后台 writer
+                # 刚在群里说过话，主动搭话的计数从头攒
+                self._p_reset(conv)
 
     # ---------- 主循环 ----------
     def run(self):

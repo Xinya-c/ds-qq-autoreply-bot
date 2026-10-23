@@ -119,5 +119,13 @@
     "enabled": true,
     "max_age_hours": 24,
     "delay_sec": 20
+  },
+  "proactive": {
+    "enabled": true,
+    "min_msgs": 10,
+    "max_msgs": 15,
+    "cooldown_sec": 600,
+    "max_per_hour": 3,
+    "context_msgs": 12
   }
 }

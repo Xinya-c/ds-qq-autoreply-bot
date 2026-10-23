@@ -80,6 +80,7 @@ def procs_matching(keyword):
              "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | "
              "ConvertTo-Json -Compress"],
             capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",   # 中文命令行会是 GBK 字节，别崩
             creationflags=NO_WINDOW).stdout.strip()
         data = json.loads(out) if out else []
     except Exception:
@@ -91,21 +92,15 @@ def procs_matching(keyword):
 
 
 def napcat_pids():
-    try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
-             "Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress"],
-            capture_output=True, text=True, timeout=30,
-            creationflags=NO_WINDOW).stdout.strip()
-        data = json.loads(out) if out else []
-    except Exception:
-        return []
-    if isinstance(data, dict):
-        data = [data]
-    target = os.path.normcase(os.path.join(PKG, "node.exe"))
-    return [p["ProcessId"] for p in data
-            if p.get("ExecutablePath") and os.path.normcase(p["ExecutablePath"]) == target]
+    """NapCat 相关进程的 PID 列表（按命令行匹配）。
+
+    ⚠️ 教训（2026-10-23 实测踩雷）：原先按 Win32_Process.ExecutablePath
+    精确匹配 PKG/node.exe，但该字段经常读不到（返回 null）——正在运行的
+    NapCat 会被认成「没在运行」，一键启动于是拉出第二个实例，两个实例
+    打架把 3001 监听搞掉，守护进程无限重连。
+    CommandLine 可靠得多，用包目录名匹配（napcat.bat 的 cmd 外壳也能认到）。
+    """
+    return procs_matching(os.path.basename(PKG))
 
 
 def choose_account():
@@ -171,12 +166,26 @@ def main():
     log("=" * 52)
 
     # ---------- NapCat ----------
-    # 双重判断：进程存在 或 端口在听，都算“已在运行”。
-    # 只按端口判断会误判（未登录时 3001 还没起），进而重复启动两个实例互相搞挂。
+    # 双重判断：端口在听 = 肯定在运行；端口没听但进程在 = 多半还在登录/扫码
+    # （也可能卡死）。两种情况都**不能**再拉一个实例——双实例打架会把 3001
+    # 搞掉（2026-10-23 实测：老实例 WS 已死但进程被漏认，一键启动拉了第二个，
+    # 两个实例互杀，3001 彻底没监听，守护进程无限重连）。
     napcat_started = False
     running_pids = napcat_pids()
-    if running_pids or port_open(3001):
-        log("NapCat 已在运行（PID %s），跳过启动" % (", ".join(map(str, running_pids)) or "未知"))
+    if port_open(3001):
+        log("NapCat 已在运行（3001 已监听），跳过启动")
+    elif running_pids:
+        log("NapCat 进程已在（PID %s）但 3001 未监听——等待登录/扫码…"
+            % ", ".join(map(str, running_pids)))
+        for i in range(60):
+            if port_open(3001):
+                log("NapCat 已就绪")
+                break
+            time.sleep(1)
+        if not port_open(3001):
+            log("60 秒后 3001 仍未监听。请检查 NapCat 窗口是否正常；")
+            log("若确认卡死：结束那几个 node 进程，再重跑本脚本。")
+            log("（仍然继续启动自动回复——NapCat 恢复后它会自动连上）")
     else:
         napcat_started = True
         uin = choose_account()

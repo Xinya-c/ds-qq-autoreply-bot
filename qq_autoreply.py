@@ -796,49 +796,47 @@ class AutoReply:
 
     def _prompt(self, conv_key, user_text, has_image=False, mid=None, bare=False,
                 excludes=None, uid=None):
-        hist = self.mem.history.setdefault(conv_key, deque(maxlen=int(self.cfg["context_size"]) * 2))
+        mem = self.mem.recall(conv_key, uid, user_text or "", mid, excludes)
+        hist = mem["history"]
         lines = [self.cfg["system_prompt"], self.HARDEN, ""]
         recent_kao = list(self.kaomoji_hist.get(conv_key) or [])
         if recent_kao:
             lines.append("最近用过的颜文字（这几个别再用了，换新的）：" + "、".join(recent_kao))
             lines.append("")
-        mem = self.mem.summary.get(conv_key)
-        if mem:
+        if mem["summary"]:
             lines.append("【长期记忆（较早的聊天要点）】")
-            lines.append(mem)
+            lines.append(mem["summary"])
             lines.append("")
         # 群聊：对方的「群内个人档案」和「群级档案」两块一起注入
-        if uid is not None and conv_key.startswith("g"):
-            uprof = self.mem.user_profile.get("%s|u%s" % (conv_key, uid))
-            if uprof:
-                lines.append("【对方（QQ %s）在这个群里的特点】" % uid)
-                lines.append(uprof)
-                lines.append("")
-        prof = self.mem.profile.get(conv_key)
-        if prof:
+        if mem["user_profile"]:
+            lines.append("【对方（QQ %s）在这个群里的特点】" % uid)
+            lines.append(mem["user_profile"])
+            lines.append("")
+        if mem["profile"]:
             lines.append("【这个群的整体情况和氛围】" if conv_key.startswith("g")
                          else "【跟这个人的关系】")
-            lines.append(prof)
+            lines.append(mem["profile"])
             lines.append("")
-        stage = self.mem.stages.get(conv_key)
-        if stage:
+        if mem["stages"]:
             lines.append("【更早的阶段回顾（较早发生的事）】")
-            lines.append(stage)
+            lines.append(mem["stages"])
             lines.append("")
-        if self.mem.style:
+        if mem["style"]:
             lines.append("【我自己的说话习惯（长期养成的，照着说，别每次重新发明）】")
-            lines.append(self.mem.style)
+            lines.append(mem["style"])
             lines.append("")
-        samples = self.mem.style_samples(conv_key)
-        if samples:
+        if mem["samples"]:
             lines.append("【我说话的样子（照这个口气说，别模仿内容）】")
-            lines.extend(samples)
+            lines.extend(mem["samples"])
             lines.append("")
-        mood = self.mem.mood_line(conv_key)
-        if mood:
-            lines.append("【对方现在的状态】" + mood)
+        if mem["mood"]:
+            lines.append("【对方现在的状态】" + mem["mood"])
             lines.append("")
-        ctx = self.mem.context_lines(conv_key, mid, excludes)
+        if mem["related"]:
+            lines.append("【相关旧记忆（更早的聊天记录，仅供参考，对方没问起就不要主动提）】")
+            lines.extend(mem["related"])
+            lines.append("")
+        ctx = mem["context"]
         if ctx:
             lines.append("最近的对话（按时间顺序，可能包含别人之间的聊天，仅作理解上下文用）：")
             lines.extend(ctx)
@@ -1003,32 +1001,32 @@ class AutoReply:
 
     def _api_reply(self, conv_key, user_text, uid=None):
         hist = self.mem.history.setdefault(conv_key, deque(maxlen=int(self.cfg["context_size"]) * 2))
+        mem = self.mem.recall(conv_key, uid, user_text or "")
         sys_msg = self.cfg["system_prompt"] + "\n" + self.HARDEN
         recent_kao = list(self.kaomoji_hist.get(conv_key) or [])
         if recent_kao:
             sys_msg += "\n最近用过的颜文字（别再重复）：" + "、".join(recent_kao)
-        mem = self.mem.summary.get(conv_key)
-        if mem:
-            sys_msg += "\n【长期记忆（较早的聊天要点）】\n" + mem
-        if uid is not None and conv_key.startswith("g"):
-            uprof = self.mem.user_profile.get("%s|u%s" % (conv_key, uid))
-            if uprof:
-                sys_msg += ("\n【对方（QQ %s）在这个群里的特点】\n" % uid + uprof)
-        if self.mem.profile.get(conv_key):
+        if mem["summary"]:
+            sys_msg += "\n【长期记忆（较早的聊天要点）】\n" + mem["summary"]
+        if mem["user_profile"]:
+            sys_msg += ("\n【对方（QQ %s）在这个群里的特点】\n" % uid
+                        + mem["user_profile"])
+        if mem["profile"]:
             title = "【这个群的整体情况和氛围】" if conv_key.startswith("g") \
                 else "【跟这个人的关系】"
-            sys_msg += "\n" + title + "\n" + self.mem.profile[conv_key]
-        if self.mem.stages.get(conv_key):
-            sys_msg += "\n【更早的阶段回顾】\n" + self.mem.stages[conv_key]
-        if self.mem.style:
+            sys_msg += "\n" + title + "\n" + mem["profile"]
+        if mem["stages"]:
+            sys_msg += "\n【更早的阶段回顾】\n" + mem["stages"]
+        if mem["style"]:
             sys_msg += ("\n【我自己的说话习惯（长期养成的，照着说，别每次重新发明）】\n"
-                        + self.mem.style)
-        samples = self.mem.style_samples(conv_key)
-        if samples:
-            sys_msg += "\n【我说话的样子（照这个口气说）】\n" + "\n".join(samples)
-        mood = self.mem.mood_line(conv_key)
-        if mood:
-            sys_msg += "\n【对方现在的状态】" + mood
+                        + mem["style"])
+        if mem["samples"]:
+            sys_msg += "\n【我说话的样子（照这个口气说）】\n" + "\n".join(mem["samples"])
+        if mem["mood"]:
+            sys_msg += "\n【对方现在的状态】" + mem["mood"]
+        if mem["related"]:
+            sys_msg += ("\n【相关旧记忆（更早的聊天记录，仅供参考，对方没问起就不要主动提）】\n"
+                        + "\n".join(mem["related"]))
         imgs = self._list_reply_images()
         if imgs:
             sys_msg += ("\n想发表情包时，在回复末尾加一个 [[img:文件名]]（一次最多一个），"
@@ -1384,9 +1382,7 @@ class AutoReply:
                 if not last:
                     time.sleep(self._split_delay())
             if sent:
-                self.mem.maybe_summarize(conv)     # 事实摘要 + 关系档案
-                self.mem.maybe_update_stage(conv)  # 中期记忆
-                self.mem.maybe_update_style()      # 长期：说话风格
+                self.mem.remember(conv, uid, text, body)   # 重活进后台 writer
             return
 
         if mtype == "group":
@@ -1457,9 +1453,7 @@ class AutoReply:
                 if not last:
                     time.sleep(self._split_delay())
             if sent:
-                self.mem.maybe_summarize(conv)     # 事实摘要 + 关系档案
-                self.mem.maybe_update_stage(conv)  # 中期记忆
-                self.mem.maybe_update_style()      # 长期：说话风格
+                self.mem.remember(conv, uid, clean, body)  # 重活进后台 writer
 
     # ---------- 主循环 ----------
     def run(self):
@@ -1485,6 +1479,7 @@ class AutoReply:
         self.mem.load_all()
         # 历史积压补压：后台线程慢慢跑，不挡着连 OneBot
         self.mem.start_backlog()
+        self.mem.start_writer()
 
 
         while True:

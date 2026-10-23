@@ -22,10 +22,13 @@ self.mem 访问这里的一切；LLM 调用经构造时注入的 llm_fn（内含
 """
 
 import glob
+import math
 import os
+import queue
 import re
 import threading
 import time
+import datetime
 from collections import Counter, deque
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +54,280 @@ def log(msg):
             pass
 
 
+# ================= 检索层：归档关键词搜索 =================
+# 方案与阈值由 tools/search_replay.py 在真实归档上回放标定（2026-10-23，
+# N=5161）：df_max=2% / FLOOR=28.7 / RATIO=0.88 / GAP=0.15 / SPREAD=0.10
+#   → 真查询保留 69%、最坏情况（leave-one-out）误注 3~4%。
+# 部署形态：DF/idf 用全局语料算（分数尺度稳定，一条 FLOOR 通吃所有会话），
+# 候选按当前会话过滤（隔离，不串话）。语料量级变化后重跑回放脚本复测。
+SEARCH_DF_MAX_RATIO = 0.02
+SEARCH_FLOOR = 28.7
+SEARCH_RATIO = 0.88
+SEARCH_GAP = 0.15
+SEARCH_SPREAD = 0.10
+SEARCH_MIN_MATCHED = 2
+SEARCH_TOPK = 3
+SEARCH_HARD_ARM = 2           # query 硬特征 ≥2 才开硬切（单个会误杀）
+SEARCH_PREVIEW_MAX = 90       # 行文超过则围绕命中词截取
+SEARCH_INDEX_PER_CONV = 2000  # 每会话索引最近这么多条
+FACT_PENDING_MAX = 100        # 候选事实观察区上限（按会话）
+FACT_DONE_MAX = 200           # 已提升事实名单上限（按会话，防重复写入）
+FACT_MIN_LEN = 8              # 短于 8 字的事实不够格
+FACT_SIM = 0.6                # 候选比对的二元组相似度阈值
+EXACT_CHARS = set("_-./\\:")
+ASCII_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_\-./\\:]*")
+EMOJI_RE = re.compile(
+    "[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F]")
+CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+ARCH_LINE_RE = re.compile(r"^\[([^\]]+)\]\s*(.+?):\s?(.*)$")
+CN_NUM = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+          "七": 7, "八": 8, "九": 9, "十": 10}
+
+
+def bigrams_of(text):
+    """连续 CJK 串切二元组，非 CJK 字符是天然边界。"""
+    out, run = [], []
+    for ch in text:
+        if CJK_RE.match(ch):
+            run.append(ch)
+        else:
+            out.extend(run[i] + run[i + 1] for i in range(len(run) - 1))
+            run = []
+    out.extend(run[i] + run[i + 1] for i in range(len(run) - 1))
+    return out
+
+
+def ascii_tokens_of(text):
+    """ASCII 词元：路径 / 命令 / 常量名 / 中英混排里的英文词。"""
+    out = []
+    for m in ASCII_TOKEN_RE.finditer(text):
+        raw = m.group(0).strip("._-:/\\")
+        if len(raw) >= 2:
+            out.append(raw)
+    return out
+
+
+def emojis_of(text):
+    return [e for e in EMOJI_RE.findall(text) if e.strip()]
+
+
+def is_exact(token):
+    """含路径/命令类字符的词命中率极高，加权。"""
+    return any(c in EXACT_CHARS for c in token)
+
+
+def tokenize(text):
+    """[(token, kind)]，kind ∈ bigram / ascii / emoji。"""
+    toks = [(t, "bigram") for t in bigrams_of(text)]
+    toks += [(t, "ascii") for t in ascii_tokens_of(text)]
+    toks += [(t, "emoji") for t in emojis_of(text)]
+    return toks
+
+
+def hard_tokens_of(query_toks):
+    """query 里的硬特征：ASCII 词 + emoji（纯中文泛指词不算）。"""
+    return [t for t, kind in query_toks if kind in ("ascii", "emoji")]
+
+
+def dice(a, b):
+    """二元组 Dice 相似度（候选事实比对与检索同一把尺子）。"""
+    if a == b:
+        return 1.0
+    A, B = set(bigrams_of(a)), set(bigrams_of(b))
+    if not A or not B:
+        return 0.0
+    return 2.0 * len(A & B) / (len(A) + len(B))
+
+
+def _cn_int(s):
+    if s.isdigit():
+        return int(s)
+    if s in CN_NUM:
+        return CN_NUM[s]
+    m = re.fullmatch(r"([一二三])?十([一二三四五六七八九])?", s)
+    if m and (m.group(1) or m.group(2)):
+        tens = CN_NUM.get(m.group(1), 1) * 10 if m.group(1) else 10
+        return tens + CN_NUM.get(m.group(2), 0)
+    return 0
+
+
+def parse_dates(text, today=None):
+    """识别 query 里的日期意图，返回 {YYYY-MM-DD}；无日期表达返回 None。
+
+    认得：2026-10-06 / 2026年10月6日 / 10月6日(号)（晚于今天算去年）/
+    今天·昨天·前天·大前天 / N天前（阿拉伯与中文数字，含十天前）。
+    """
+    if today is None:
+        today = datetime.date.today()
+    out = set()
+
+    def ok(y, m, d):
+        try:
+            return datetime.date(int(y), int(m), int(d)).isoformat()
+        except (ValueError, TypeError):
+            return None
+
+    for y, m, d in re.findall(r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", text):
+        s = ok(y, m, d)
+        if s:
+            out.add(s)
+    for m, d in re.findall(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[号日]", text):
+        s = ok(today.year, m, d)
+        if s and s > today.isoformat():
+            s = ok(today.year - 1, m, d)
+        if s:
+            out.add(s)
+    for kw, delta in (("大前天", 3), ("前天", 2), ("昨天", 1), ("今天", 0)):
+        if kw in text:
+            out.add((today - datetime.timedelta(days=delta)).isoformat())
+    for s in re.findall(r"([0-9]+|[一二两三四五六七八九十]+)\s*天前", text):
+        n = _cn_int(s)
+        if n:
+            out.add((today - datetime.timedelta(days=n)).isoformat())
+    return out or None
+
+
+def preview_around(body, query_toks, before=36, after=76):
+    """长行围绕最先出现的命中词截取（固定截开头会让模型误判"词碰上内容没对"）。"""
+    if len(body) <= SEARCH_PREVIEW_MAX:
+        return body
+    pos = len(body)
+    for t, _kind in query_toks:
+        p = body.find(t)
+        if p >= 0:
+            pos = min(pos, p)
+    if pos >= len(body):
+        return body[:SEARCH_PREVIEW_MAX] + "…"
+    start = max(0, pos - before)
+    end = min(len(body), pos + after)
+    return ("…" if start > 0 else "") + body[start:end] + \
+           ("…" if end < len(body) else "")
+
+
+def filter_noise(rows, query_toks, recs):
+    """四路噪音过滤（语义照搬回放脚本，已按部署态简化）。
+
+    rows: [(score, matched, rec_idx)] 已按分数降序。
+    ① 绝对底线：top1 < FLOOR → 一条不留（宁可不注入，不可错注入）
+    ② 硬特征：query 的 ASCII/emoji 词在记录文本里一个都不中 → 砍
+       （≥2 个硬特征才启用；命中者豁免长尾）
+    ③ 长尾：低于 top1×(1-GAP)，或低于 top1×RATIO 且绝对差够大 → 砍
+    ④ 平局：前四条挤在 top1×(1-SPREAD) 内 → 只留前 3
+    """
+    if not rows:
+        return []
+    top1 = rows[0][0]
+    if top1 < SEARCH_FLOOR:
+        return []
+    hard = hard_tokens_of(query_toks)
+    armed = len(hard) >= SEARCH_HARD_ARM
+    kept = []
+    for sc, m, i in rows:
+        if m < SEARCH_MIN_MATCHED:
+            continue
+        hits = 0
+        if hard:
+            hay = recs[i][3]
+            hits = sum(1 for t in hard if t in hay)
+        if armed and hits == 0:
+            continue
+        if sc < top1 * (1 - SEARCH_GAP):
+            continue
+        if hits > 0:
+            kept.append((sc, m, i))
+            continue
+        if sc < top1 * SEARCH_RATIO and top1 - sc > top1 * SEARCH_GAP:
+            continue
+        kept.append((sc, m, i))
+    if len(kept) >= 4 and kept[3][0] >= top1 * (1 - SEARCH_SPREAD):
+        kept = kept[:3]
+    return kept
+
+
+class _SearchIndex:
+    """归档倒排索引。record = (conv, ts, nick, body)。
+
+    线程模型：写入持 ARCH_LOCK 追加；检索先取长度快照，再按下标读
+    （append-only + GIL 下安全），df 走 dict.get（GIL 原子）。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.recs = []
+        self.toks = []
+        self.post = {}          # token -> set(record_idx)
+        self.df = {}            # token -> 文档频率
+
+    def add(self, conv, ts, nick, body):
+        with self.lock:
+            i = len(self.recs)
+            self.recs.append((conv, ts, nick, body))
+            s = set(t for t, _ in tokenize(body))
+            self.toks.append(s)
+            for t in s:
+                self.post.setdefault(t, set()).add(i)
+                self.df[t] = self.df.get(t, 0) + 1
+
+    def build(self, records):
+        with self.lock:
+            self.recs, self.toks, self.post, self.df = [], [], {}, {}
+            for conv, ts, nick, body in records:
+                i = len(self.recs)
+                self.recs.append((conv, ts, nick, body))
+                s = set(t for t, _ in tokenize(body))
+                self.toks.append(s)
+                for t in s:
+                    self.post.setdefault(t, set()).add(i)
+                    self.df[t] = self.df.get(t, 0) + 1
+
+    def search(self, conv, query, k=SEARCH_TOPK):
+        """返回 [(score, rec_idx)]，已过四路过滤；无命中返回 []。"""
+        with self.lock:
+            n = len(self.recs)
+            if n == 0:
+                return []
+        # 时间通道：日期型 query 直接按本地日历日筛，不走关键词
+        days = parse_dates(query)
+        if days:
+            rows = []
+            with self.lock:
+                for i in range(n):
+                    if self.recs[i][0] == conv and self.recs[i][1][:10] in days:
+                        rows.append(i)
+            return [(99.0, 1, i) for i in rows[-k:]]
+        q = list(set(tokenize(query)))
+        with self.lock:
+            df_max = max(2, int(n * SEARCH_DF_MAX_RATIO))
+            qc = [(t, kind) for t, kind in q
+                  if self.df.get(t, 0) <= df_max]
+            if not qc:
+                return []
+            cand = set()
+            for t, _kind in qc:
+                cand.update(self.post.get(t, ()))
+        if not cand:
+            return []
+        scored = []
+        for i in cand:
+            if self.recs[i][0] != conv:
+                continue
+            s = self.toks[i]
+            total, matched = 0.0, 0
+            for t, kind in qc:
+                if t in s:
+                    w = math.log(n / (1.0 + self.df.get(t, 0)))
+                    if kind == "ascii" and is_exact(t):
+                        w *= 2.2
+                    elif kind == "emoji":
+                        w *= 1.5
+                    total += w
+                    matched += 1
+            if total > 0:
+                scored.append((total, matched, i))
+        scored.sort(key=lambda x: -x[0])
+        return filter_noise(scored, qc, self.recs)[:k]
+
+
 class BotMemory:
     """一台机器人的全部记忆。llm_fn(prompt) 由主程序注入。"""
 
@@ -70,6 +347,14 @@ class BotMemory:
         self.samples = []                # 手挑的风格样本（self_samples.md，可选）
         self.style = ""                  # 长期养成的说话风格（全局，跨会话）
         self.sent_since_style = 0        # 距上次提炼风格累计说过多少句
+        # ---- 第二批：事实观察区 / 后台 writer / 检索索引 ----
+        self.fact_pending = {}           # conv -> [归一化候选事实]（两次命中才提升）
+        self.fact_done = {}              # conv -> [已提升的事实]（防重复写入）
+        self._search = _SearchIndex()
+        self._wq = queue.Queue()
+        self._wq_keys = set()
+        self._wq_lock = threading.Lock()
+        self._writer_on = False
 
     # ---------- 初始化（主程序 run() 里调用） ----------
     def load_all(self):
@@ -79,10 +364,18 @@ class BotMemory:
         self._load_profiles()
         self._load_style()
         self._load_samples()
+        self._build_search_index()
 
     def start_backlog(self):
         """启动时把积压的历史补压成阶段回顾（后台线程，不挡着收消息）。"""
         threading.Thread(target=self._backlog_stages, daemon=True).start()
+
+    def start_writer(self):
+        """后台 writer 线程：摘要/阶段/风格提炼都归它（串行=最强的锁）。"""
+        if self._writer_on:
+            return
+        self._writer_on = True
+        threading.Thread(target=self._writer_loop, daemon=True).start()
 
     # ---------- 上下文缓冲 ----------
     def allowed(self, evt):
@@ -172,6 +465,8 @@ class BotMemory:
                     f.write(line)
         except Exception as e:
             log("归档写入失败: %s" % e)
+            return
+        self._index_line(conv, line)      # 增量进检索索引（写入成功才索引）
 
     @staticmethod
     def _msg_kind(evt):
@@ -351,8 +646,8 @@ class BotMemory:
         if every <= 0 or self.sent_since_style < every:
             return
         mine = []
-        for d in self.recent.values():
-            for x in d:
+        for d in list(self.recent.values()):
+            for x in list(d):
                 if x.get("nick") == "我" and (x.get("text") or "").strip():
                     mine.append(x["text"].strip())
         mine = mine[-80:]
@@ -712,8 +1007,8 @@ class BotMemory:
         if self.samples:
             return self.samples[:n]
         pool = []
-        for c, d in self.recent.items():
-            for x in d:
+        for c, d in list(self.recent.items()):
+            for x in list(d):
                 if x.get("nick") != "我":
                     continue
                 t = (x.get("text") or "").strip()
@@ -816,9 +1111,12 @@ class BotMemory:
             if s.startswith("- "):
                 (fact_lines if cur == "fact" else rel_lines).append(s)
         self._apply_rel(conv, rel_lines)      # 群里按人分流：个人档案 + 群级档案
-        pts = fact_lines
+        pts = self._filter_facts(conv, fact_lines)
         if not pts:
-            log("  摘要内容为空，跳过")
+            # 正常结果：本轮事实都没到两次命中，候选已进观察区
+            log("  本轮事实无一达到两次命中，仅入观察区（%s 现有 %d 条候选）"
+                % (conv, len(self.fact_pending.get(conv) or [])))
+            self.pending[conv] = 0
             return
         all_pts = []
         try:
@@ -858,4 +1156,173 @@ class BotMemory:
                 tag = "（@了你）"
             out.append("%s: %s%s" % (x.get("nick"), x.get("text"), tag))
         return out
+
+    # ================= 两钩子（主程序唯一入口） =================
+    def recall(self, conv, uid=None, text="", mid=None, excludes=None):
+        """收消息时调用：一次拿齐全部记忆，返回拼 prompt 用的 dict。
+
+        键：history / summary / profile / user_profile / stages / style /
+            samples / mood / context / related
+        """
+        r = {
+            "history": self.history.setdefault(
+                conv, deque(maxlen=int(self.cfg["context_size"]) * 2)),
+            "summary": self.summary.get(conv) or "",
+            "profile": self.profile.get(conv) or "",
+            "user_profile": "",
+            "stages": self.stages.get(conv) or "",
+            "style": self.style,
+            "samples": self.style_samples(conv),
+            "mood": self.mood_line(conv),
+            "context": self.context_lines(conv, mid, excludes),
+            "related": [],
+        }
+        if uid is not None and conv.startswith("g"):
+            r["user_profile"] = \
+                self.user_profile.get("%s|u%s" % (conv, uid)) or ""
+        try:
+            r["related"] = self.related(conv, text or "")
+        except Exception as e:
+            log("相关记忆检索失败（不影响本次回复）: %s" % e)
+        return r
+
+    def remember(self, conv, uid, q, a):
+        """回复发出后调用：重活扔进后台 writer 队列。
+
+        recent 追加与归档写在发送流程里已同步完成（recall 供数不能等队列）；
+        摘要/阶段/风格在这里入队——按 (kind, conv) 去重，失败或冷却错过
+        由 writer 的周期性 sweep 兜底补触发。q/a 预留（将来做逐轮抽取）。
+        """
+        self._enqueue(("after_reply", conv))
+
+    # ================= 后台 writer 线程 =================
+    def _enqueue(self, key):
+        with self._wq_lock:
+            if key in self._wq_keys:
+                return                      # 同会话同任务已在队列，合并
+            self._wq_keys.add(key)
+        self._wq.put(key)
+
+    def _writer_loop(self):
+        while True:
+            try:
+                key = self._wq.get(timeout=60)
+            except queue.Empty:
+                self._sweep()               # 没人发消息也把攒够的压掉
+                continue
+            try:
+                kind, conv = key
+                if kind == "after_reply":
+                    self.maybe_summarize(conv)      # 事实摘要 + 关系档案
+                    self.maybe_update_stage(conv)   # 中期记忆
+                    self.maybe_update_style()       # 长期：说话风格
+            except Exception as e:
+                log("writer 任务失败(%s): %s" % (key, e))
+            finally:
+                with self._wq_lock:
+                    self._wq_keys.discard(key)
+
+    def _sweep(self):
+        """兜底：攒够条数但没被触发的会话补进队列（失败重试/冷却错过）。"""
+        cfg = self.cfg.get("summary") or {}
+        if not cfg.get("enabled", True):
+            return
+        every = int(cfg.get("every", 50) or 0)
+        for conv, cnt in list(self.pending.items()):
+            if every > 0 and cnt >= every:
+                self._enqueue(("after_reply", conv))
+
+    # ================= 检索：相关旧记忆 =================
+    def _build_search_index(self):
+        """启动时给归档建倒排索引（每会话取最近 N 条，控制内存）。"""
+        d = self.archive_dir()
+        recs = []
+        for pat, pre in (("private_*.md", "u"), ("group_*.md", "g")):
+            for p in glob.glob(os.path.join(d, pat)):
+                m = re.match(r"^(private|group)_(\d+)\.md$",
+                             os.path.basename(p))
+                if not m:
+                    continue
+                conv = pre + m.group(2)
+                try:
+                    with open(p, encoding="utf-8", errors="replace") as fh:
+                        lines = [ln.rstrip("\n") for ln in fh
+                                 if ln.startswith("[")]
+                except OSError:
+                    continue
+                for ln in lines[-SEARCH_INDEX_PER_CONV:]:
+                    mm = ARCH_LINE_RE.match(ln)
+                    if mm:
+                        recs.append((conv, mm.group(1), mm.group(2),
+                                     mm.group(3)))
+        self._search.build(recs)
+        log("检索索引已建立：%d 条 / %d 个会话"
+            % (len(recs), len(set(r[0] for r in recs))))
+
+    def _index_line(self, conv, line):
+        """归档写入后增量进索引。"""
+        try:
+            mm = ARCH_LINE_RE.match(line)
+            if mm:
+                self._search.add(conv, mm.group(1), mm.group(2), mm.group(3))
+        except Exception:
+            pass
+
+    def related(self, conv, text, k=SEARCH_TOPK):
+        """搜本条会话的归档，返回可直接注入 prompt 的行（无命中返回 []）。"""
+        t = (text or "").strip()
+        if not t:
+            return []
+        qtoks = tokenize(t)
+        hits = self._search.search(conv, t, k)
+        out = []
+        for _sc, _m, i in hits:
+            _c, ts, nick, body = self._search.recs[i]
+            if body.strip() == t:
+                continue                      # 当前消息自己，跳过
+            out.append("[%s] %s: %s"
+                       % (ts[:10], nick, preview_around(body, qtoks)))
+        return out
+
+    # ================= 事实过滤：两次命中才提升 =================
+    @staticmethod
+    def _norm_fact(s):
+        return re.sub(
+            r"[\s，。！？、~…,.!?;:：；'\"「」『』（）()\[\]【】\-—_*#>`|]+",
+            "", s).lower()
+
+    def _filter_facts(self, conv, facts):
+        """候选事实两次命中才提升为正式记忆。
+
+        首次见到 → 进观察区（按会话，上限 FACT_PENDING_MAX，重启丢无所谓，
+        它只是过滤器不是数据）；与观察区某条归一化相等或二元组相似度
+        ≥FACT_SIM → 提升，并记入已提升名单（防重复写入摘要）；
+        短于 FACT_MIN_LEN 字的不够格（"好的""在吗"）。
+        返回提升列表（写进摘要的）。
+        """
+        pend = self.fact_pending.setdefault(conv, [])
+        done = self.fact_done.setdefault(conv, [])
+        promoted = []
+        for f in facts:
+            n = self._norm_fact(f)
+            if len(n) < FACT_MIN_LEN:
+                continue
+            if any(n == d or dice(n, d) >= FACT_SIM for d in done):
+                continue                      # 档案里已有，跳过
+            idx = None
+            for i, p in enumerate(pend):
+                if n == p or dice(n, p) >= FACT_SIM:
+                    idx = i
+                    break
+            if idx is not None:
+                pend.pop(idx)
+                done.append(n)
+                if len(done) > FACT_DONE_MAX:
+                    del done[:len(done) - FACT_DONE_MAX]
+                promoted.append(f)
+            else:
+                pend.append(n)
+        if len(pend) > FACT_PENDING_MAX:
+            del pend[:len(pend) - FACT_PENDING_MAX]
+        return promoted
 

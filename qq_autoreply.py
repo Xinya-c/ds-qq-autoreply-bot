@@ -1282,6 +1282,10 @@ class AutoReply:
         d = self.mem.archive_dir()
         now = time.time()
         total = 0
+        stale = 0            # 有漏回但太老、按规则不补的会话数
+        checked = 0
+        log("启动补回扫描：检查 %d 个私聊会话（时限 %.0f 小时）…"
+            % (len(allowed), max_age / 3600.0))
         for f in sorted(os.listdir(d)):
             m = re.match(r"^private_(\d+)\.md$", f)
             if not m:
@@ -1305,6 +1309,7 @@ class AutoReply:
                     break                   # 这条之后我们都回过，到此为止
                 pend.append((mm.group(1), mm.group(2), mm.group(3)))
             if not pend:
+                checked += 1
                 continue
             pend.reverse()                  # 恢复时间顺序
             try:
@@ -1313,6 +1318,10 @@ class AutoReply:
             except Exception:
                 newest = now
             if now - newest > max_age:
+                stale += 1
+                log("  跳过 %s(%d)：%d 条漏回消息最新在 %.1f 小时前，超过 %.0f 小时时限"
+                    % (re.sub(r"\(\d+\)$", "", pend[-1][1]), uid, len(pend),
+                       (now - newest) / 3600.0, max_age / 3600.0))
                 continue
             text = "\n".join(t.strip() for _, _, t in pend if t.strip())
             if not text:
@@ -1339,6 +1348,11 @@ class AutoReply:
                 % (nick, uid, len(pend), (now - newest) / 60.0))
         if total:
             log("启动补回合计：%d 条漏回消息进入回复队列" % total)
+        else:
+            log("启动补回扫描完成：无漏回消息（%d 个会话都回过）" % checked)
+        if stale:
+            log("启动补回：%d 个会话有未回复消息但已超过 %.0f 小时，未补回"
+                "（想补就改配置 sweep.max_age_hours）" % (stale, max_age / 3600.0))
 
     def _grab_file(self, evt):
         """下载并保存文件（已存过则复用），返回 (name, ext, raw)。"""

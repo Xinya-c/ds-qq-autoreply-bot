@@ -181,17 +181,17 @@ def scenarios(bot):
 
 # 基线哈希（2026-10-23 搬迁前冻结；改动 Prompt 拼装必须有意识地更新这里）
 EXPECTED = {
-    "私聊+画像": "f280b5bbc11a96e5",
-    "群+个人档案+群档案": "4cf8292bd1df1040",
-    "群-无uid": "7d58f06d9ee6a943",
-    "私聊-裸@": "2f2a0677f28c97e5",
-    "私聊-带图": "9fd8a6201b046f8f",
-    "私聊-上下文排除": "bcaad43478e0a155",
-    "私聊-离线30分钟": "86a2c3df2a9f2a08",
-    "私聊-补回2天前": "d7e93a65d70742c5",
-    "群-旧消息带时间标记": "5abe84b98b49b86f",
-    "群-现场与背景分层": "53502607429e14c9",
-    "私聊-主人段": "96bfbe8c6bd769ff",
+    "私聊+画像": "51efa1116be89390",
+    "群+个人档案+群档案": "97ecd86e4b201501",
+    "群-无uid": "eebfc844e5a72a2e",
+    "私聊-裸@": "b11669a88f4f296b",
+    "私聊-带图": "1f045809444fb6e2",
+    "私聊-上下文排除": "fb89a3eb6f80df73",
+    "私聊-离线30分钟": "2a765fe76467b5c4",
+    "私聊-补回2天前": "cae1de9c35d8a6c7",
+    "群-旧消息带时间标记": "878b56b8a02f9f0f",
+    "群-现场与背景分层": "0516348f15d5bfba",
+    "私聊-主人段": "0e06c4e2f52dba11",
 }
 
 # human_age 的用例（秒 -> 期望文案），顺手钉住时间颗粒度
@@ -209,6 +209,10 @@ AGE_CASES = [
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--print", action="store_true", help="只打印当前哈希")
+    ap.add_argument("--dump", nargs="?", const="", default=None,
+                    metavar="场景名",
+                    help="打印某个场景真正送进模型的完整 prompt；"
+                         "不给名字则列出所有场景名")
     args = ap.parse_args()
     tmp = tempfile.mkdtemp(prefix="qqgolden_")
     try:
@@ -216,6 +220,27 @@ def main():
         rows = scenarios(bot)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # 调人格时最有用：直接看模型到底收到了什么
+    # （改了 system_prompt 之后 golden 只会告诉你「哈希不一样」，
+    #   想知道实际长什么样、哪一段挤在一起了，用这个看全文）
+    if args.dump is not None:
+        names = [n for n, _ in rows]
+        if not args.dump:
+            print("可用场景（用法：--dump \"场景名\"）：")
+            for n, t in rows:
+                print("  %-14s %5d 字" % (n, len(t)))
+            return
+        hit = dict(rows).get(args.dump)
+        if hit is None:
+            print("没有这个场景：%s" % args.dump)
+            print("可用：%s" % "、".join(names))
+            return
+        print("=" * 60)
+        print("%s（%d 字）" % (args.dump, len(hit)))
+        print("=" * 60)
+        print(hit)
+        return
 
     ok = True
     print("=" * 60)

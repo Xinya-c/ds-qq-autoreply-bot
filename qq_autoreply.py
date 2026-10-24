@@ -500,6 +500,8 @@ class AutoReply:
         self.seen_set = set()
         # 群聊主动搭话：计数从「本次上线」开始，不翻旧账
         self._img_cache = {}              # 表情包目录 -> (缓存时间, 清单)：目录是静态的
+        # CodeBuddy CLI 同一时刻只跑一个子进程（共享登录态，并发容易互相踩）
+        self._cli_sem = threading.Semaphore(1)
         self.pmsg = {}                    # conv_key -> 已攒的群内他人消息条数
         self.ptarget = {}                 # conv_key -> 本轮随机出的目标条数
         self.plast = {}                   # conv_key -> 上次主动发言的时间戳
@@ -1348,7 +1350,8 @@ class AutoReply:
                 text=True, encoding="utf-8", errors="replace",
                 timeout=float(cb["timeout"]))
         except subprocess.TimeoutExpired:
-            log("CodeBuddy CLI 超时（>%ss）" % cb["timeout"])
+            log("CodeBuddy CLI 超时（>%ss，prompt %d 字）"
+                % (cb["timeout"], len(prompt)))
             return None
         except Exception as e:
             # 路径写错、权限、以及 prompt 过长触发的 [WinError 206] 都会走这里。
@@ -1390,6 +1393,23 @@ class AutoReply:
                    proactive=False):
         prompt, hist = self._prompt(conv_key, user_text, bool(image), mid, bare,
                                     excludes, uid, stale, replay, proactive)
+        # CodeBuddy CLI 共享同一份登录态和缓存目录，两个子进程并发跑容易互相
+        # 踩（实测出现过「主动接话」和「普通回复」撞在一起，其中一个卡满
+        # 180 秒超时）。所以同一时刻只跑一个 CLI：
+        # - 正常回复：排队等（回复是用户等着的事，不能丢）
+        # - 主动接话：拿不到锁就直接跳过（它是可选的，错过这回下次再说）
+        wait = not proactive
+        got = self._cli_sem.acquire(timeout=300 if wait else 0)
+        if not got:
+            log("  CLI 正忙（另一个会话在调模型），%s本次跳过"
+                % ("主动接话" if proactive else "回复"))
+            return None
+        try:
+            return self._cli_reply_locked(prompt, hist, image, user_text)
+        finally:
+            self._cli_sem.release()
+
+    def _cli_reply_locked(self, prompt, hist, image, user_text):
         text = None
         for idx, m in enumerate(self._cli_ready_models()):
             if image:

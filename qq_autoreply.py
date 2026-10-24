@@ -116,7 +116,9 @@ DEFAULTS = {
     "reply": {
         # 小女孩聊天也常把一句话拆成好几条连发，所以按标点切开分条发更自然
         "split_multiline": True,
-        "max_parts": 12,            # 最多拆成几条，超出的并回最后一条
+        # 6 而不是 12：真人连发很少超过五六条。设 12 时实测出现「（1/8）…（8/8）」
+        # 连发 8 条，读起来像机灵嘴碎的客服。这是「话痨感」的直接来源。
+        "max_parts": 6,             # 最多拆成几条，超出的并回最后一条
         "seg_max_chars": 30,        # 每条最多多少字（算标点）
         "seg_min_chars": 6,         # 太短的碎片跟相邻段合并的门槛
         "split_delay_sec": 0.6,     # 两条之间的间隔（再加 0~0.4s 随机）
@@ -423,11 +425,61 @@ def _pid_alive(pid):
         return True
 
 
+# AI 套话的尾巴/开头。这里**只删不加**——往 AI 文本里补口语会变成
+# 「哎，这可真是个问题呢」，比原来更假。
+#
+# 为什么只删句首的「总之/综上」：如果模型说「总之我不去了」，整句删掉
+# 就把信息丢了。所以限定「后接逗号」这种纯总结句式，且只看开头。
+AI_TAIL_PATTERNS = [
+    # 关键：必须「独立成句」才删——前面是开头或句末标点。
+    # 否则会削掉正文（踩过：「我希望这件事对你有帮助吗」被削成「我吗」）。
+    r"(?:^|(?<=[。！？\n]))[，,]?\s*希望[^。！？\n]{0,20}?(帮到你|有帮助|有所帮助|用得上|对你有用)[。！？]?",
+    r"(?:^|(?<=[。！？\n]))[，,]?\s*如需(更多|进一步|其他)[^。！？\n]{0,20}[。！？]?",
+    r"[，,]?\s*(以上|就这些)[。！？]?$",
+    r"(?:^|(?<=[。！？\n]))[，,]?\s*(有什么|如果还有)(其他)?(问题|需要)[^。！？\n]{0,20}[。！？]?",
+]
+AI_HEAD_PATTERNS = [
+    r"^\s*(首先|其次|再次|最后|另外|此外|值得注意的是|需要指出的是|换句话说|总而言之)\s*[，,：:]",
+    # 只吃「总之，……总结性收束」：后面必须带逗号，避免误删「总之我不去」
+    r"^\s*(总之|综上)\s*[，,]",
+]
+# 「（取决于你的需求）」这类英文式附加说明，整块删
+AI_PAREN_PATTERNS = [
+    r"[（(][^）)\n]{0,30}(取决于|视情况|具体而言|因人而异)[^）)\n]{0,30}[）)]",
+]
+
+
+def strip_ai_boilerplate(text):
+    """去掉模型爱加的套话外壳。
+
+    只做删除，不添加内容。目标是「AI 味」而不是「关键词」——
+    所以宁可漏删，也不误删正文（踩过：全局把「——」换成「，」，
+    把「他这么说——自己跟自己打架」这种语气停顿也抹平了，读起来更平）。
+    """
+    if not text:
+        return text
+    t = text
+    for pat in AI_TAIL_PATTERNS:
+        t = re.sub(pat, "", t)
+    for pat in AI_HEAD_PATTERNS:
+        t = re.sub(pat, "", t)
+    for pat in AI_PAREN_PATTERNS:
+        t = re.sub(pat, "", t)
+    # 行首的列表符号（1. / - / • ）——真人不会打字带项目符号
+    t = re.sub(r"(?m)^\s*(\d+[\.、)]|[-*•])\s+", "", t)
+    # 删干净后可能留下连续标点/空白
+    t = re.sub(r"[，,]{2,}", "，", t)
+    t = re.sub(r"^[，,。\s]+", "", t)
+    t = re.sub(r"\s{2,}", " ", t)
+    return t.strip()
+
+
 def sanitize_reply(text, max_len=800):
     """净化模型输出：去代码块/伪标签/markdown 记号、压空格、按句截断。"""
     if not text:
         return ""
     t = str(text).strip()
+    t = strip_ai_boilerplate(t)
     t = re.sub(r"```[\s\S]*?```", " ", t)
     # 模型的内部独白：有些模型会吐 <think>...</think>，只剥标签会把思考内容
     # 原样留在要发出去的那句话里——整块连内容一起扔掉
@@ -1268,7 +1320,7 @@ class AutoReply:
         parts = split_short(text, limit, int(cfg.get("seg_min_chars", 6) or 6))
         if not parts:
             return [text] if text else []
-        mp = max_parts if max_parts is not None else int(cfg.get("max_parts", 12) or 12)
+        mp = max_parts if max_parts is not None else int(cfg.get("max_parts", 6) or 6)
         if mp > 0 and len(parts) > mp:
             parts = parts[:mp - 1] + ["\n".join(parts[mp - 1:])]
         return parts

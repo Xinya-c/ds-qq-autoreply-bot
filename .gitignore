@@ -42,3 +42,6 @@ qq_autoreply_config.json
 # ===== 本地脚本/旧版备份（含个人路径，仅本地保留）=====
 login_codebuddy.bat
 qq_panel_旧版备份.py
+
+# 盲测产物（含真实聊天内容，不提交）
+盲测_*.txt

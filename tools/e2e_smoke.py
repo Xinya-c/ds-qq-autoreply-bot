@@ -1825,6 +1825,34 @@ def test_tools_fallback():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_ai_boilerplate():
+    """AI 套话清洗：只删外壳，不碰正文。
+
+    原则是「宁可漏删，也不误删」——往 AI 文本里补口语会变成
+    「哎，这可真是个问题呢」，比原来更假；但把正文削掉更糟。
+    """
+    cases = [
+        ("假的呗。希望这个回答对你有帮助。", "假的呗。"),
+        ("假的。希望这能帮到你", "假的。"),
+        ("在吗？如需进一步了解请告诉我。", "在吗？"),
+        ("总之，这题就是悖论。", "这题就是悖论。"),
+        ("首先，你得先看这个。", "你得先看这个。"),
+        ("建议你换个思路（取决于你的需求）。", "建议你换个思路。"),
+        ("1. 先这样\n2. 再那样", "先这样\n再那样"),
+        ("我觉得挺好的。以上。", "我觉得挺好的。"),
+        # ↓ 正文保护：这几条一个字都不能动
+        ("我希望你别这样", "我希望你别这样"),
+        ("我希望这件事对你有帮助吗", "我希望这件事对你有帮助吗"),
+        ("总之我不去了", "总之我不去了"),
+        ("他这么说——自己跟自己打架", "他这么说——自己跟自己打架"),
+        ("嗯", "嗯"),
+        ("？", "？"),
+    ]
+    for src, exp in cases:
+        got = qa.sanitize_reply(src)
+        check("套话清洗 %r → %r" % (src[:14], exp[:14]), got == exp, repr(got))
+
+
 # ------------------------------------------------------------ 37. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
@@ -1864,7 +1892,7 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_tools_fallback,
+               test_tools_fallback, test_ai_boilerplate,
                test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_cli_parallel, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()

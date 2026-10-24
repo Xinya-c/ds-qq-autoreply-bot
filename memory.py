@@ -1486,6 +1486,11 @@ class BotMemory:
     # 判断「这条是接上一条」的窗口。比 THREAD_GAP 短得多：
     # 5 分钟内都算同一段对话太松，90 秒内接话才更像在聊同一个话题。
     REPLY_WINDOW = 90
+    # 线程归属打分：多个弱信号加权，取最高分的那个线程；都低于门槛才新建。
+    # 结构借 Elsner & Charniak (2008) 的分区算法——他们的做法是把新消息加到
+    # 分类器给出最高概率的那个 cluster，全都判否才新建。原来我是「第一个满足
+    # 条件的就归入」，从不比较其他候选，两条线程同时在聊时必错。
+    THREAD_MIN_SCORE = 0.45
 
     def social_map(self):
         """uid -> {peer: {...}}：谁跟谁真的有来往。
@@ -1543,64 +1548,32 @@ class BotMemory:
                 # 过期的线程不再接收新消息（冷场就算结束）
                 active = [a for a in active
                           if t - a["last"] <= self.THREAD_GAP]
-                target = None
-                if ats:
-                    # 有 @：优先并入「sender 已在其中、且被 @ 的人也在」的线程，
-                    # 其次并入「sender 已在其中」的线程——后者就是
-                    # 「@ 完第一次，后面接着聊」的情形
-                    for pool in (lambda a: sender in a["members"]
-                                 and set(ats) & a["members"],
-                                 lambda a: sender in a["members"]):
-                        for a in active:
-                            if pool(a):
-                                target = a
-                                break
-                        if target:
-                            break
-                    if target is None:
-                        seq += 1
-                        target = {"members": set(), "last": t, "counts": {},
-                                  "ats": [], "tid": (gid, seq),
-                                  "speaker": sender}
-                        active.append(target)
-                        threads.append(target)
-                    target["members"] |= {sender} | set(ats)
+                # 统一打分：给每个活跃线程算分，取最高的那个；都不够才新建。
+                # 借 Elsner & Charniak (2008) 的分区算法——他们的做法是把新
+                # 消息加到分类器给出最高概率的 cluster，全都判否才新建。
+                # 原来我是「第一个满足条件就归入」，从不比较候选：群里同时
+                # 两段对话在聊时，必然归错。
+                best, best_s = None, 0.0
+                for a in active:
+                    sc = self._thread_score(a, sender, body, t, ats)
+                    if sc > best_s:
+                        best, best_s = a, sc
+                if best is not None and best_s >= self.THREAD_MIN_SCORE:
+                    target = best
                 else:
-                    # 无 @：很多对话根本不是 @ 起来的——有人抛话题，其他人
-                    # 陆续加入。所以这里要能「接上」，不能像以前那样当成
-                    # 冷场独白丢掉。
-                    for a in active:
-                        if sender in a["members"]:
-                            target = a
-                            break
-                    if target is None:
-                        # 自己不在任何线程：判断是「接了别人刚说的话」还是
-                        # 「自己抛了个新话题」。
-                        # 判据：最近一段线程还在 REPLY_WINDOW 内，
-                        #       且它的最后发言人不是我（交替 = 在对话）。
-                        # 短消息放宽窗口：3 个字以内的回复几乎一定是在接话。
-                        recent = max(active, key=lambda a: a["last"], default=None)
-                        win = self.REPLY_WINDOW
-                        if len(body) <= 6:
-                            win = self.REPLY_WINDOW * 2
-                        if (recent is not None and recent.get("speaker") != sender
-                                and t - recent["last"] <= win):
-                            target = recent
-                        else:
-                            # 自己抛新话题：先开线程，成员暂时只有自己。
-                            # 别人接话时会走上面那条路加进来——这就是
-                            # 「陆续加入」。
-                            seq += 1
-                            target = {"members": {sender}, "last": t, "counts": {},
-                                      "ats": [], "tid": (gid, seq),
-                                      "speaker": sender}
-                            active.append(target)
-                            threads.append(target)
-                    target["members"].add(sender)
-                if target is None:
-                    continue
+                    seq += 1
+                    target = {"members": {sender}, "last": t, "counts": {},
+                              "ats": [], "tid": (gid, seq), "speaker": sender,
+                              "last_text": body,
+                              "last_q": self._is_question(body)}
+                    active.append(target)
+                    threads.append(target)
+                target["members"].add(sender)
+                target["members"] |= set(ats)
                 target["last"] = t
                 target["speaker"] = sender
+                target["last_text"] = body
+                target["last_q"] = self._is_question(body)
                 target["counts"][sender] = target["counts"].get(sender, 0) + 1
                 if ats:
                     target["ats"].append((sender, list(ats)))
@@ -1646,6 +1619,68 @@ class BotMemory:
         self._sm_cache = out
         self._sm_key = key
         return out
+
+    @staticmethod
+    def _is_question(text):
+        t = text or ""
+        return ("？" in t or "?" in t
+                or any(k in t for k in ("吗", "怎么", "为什么", "啥", "什么",
+                                        "哪", "谁", "咋", "多少", "是不是")))
+
+    @staticmethod
+    def _lex_sim(a, b):
+        """两句的字面相似度（bigram Jaccard）。便宜，不用向量模型。
+
+        为什么不直接用 embedder：它对每条消息算一次太贵（2799 条 × 一次前向），
+        而这里只需要「像不像在同一话题」这种粗判断，字面重叠够用。
+        """
+        sa = {t for t, _k in tokenize(a or "")}
+        sb = {t for t, _k in tokenize(b or "")}
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / float(len(sa | sb))
+
+    def _thread_score(self, th, sender, body, t, ats):
+        """一条消息属于这个线程的分数（0~1）。
+
+        信号来自几篇工作（Elsner & Charniak 2008 的 cue 特征、Kummerfeld 2019
+        的特征集、Slack 版的 Q&A 结束标志），共同点是：**单个信号都不可靠，
+        加权组合才稳**。
+        """
+        gap = t - th["last"]
+        body_q = self._is_question(body)
+        prev_q = bool(th.get("last_q"))
+        sim = self._lex_sim(th.get("last_text"), body)
+        s = 0.0
+        # ① 时间：越近越可能在聊同一段。权重刻意压得很低——实测时间+交替
+        #    两个弱信号加起来就能顶过阈值，语义根本没参与决策，结果两段
+        #    同时进行的对话被并成一段。
+        s += max(0.0, 1.0 - gap / (self.REPLY_WINDOW * 2.0)) * 0.12
+        # ② 交替：你一句我一句
+        s += 0.12 if th.get("speaker") != sender else -0.20
+        # ②b 我本来就在这段对话里：真人会接着自己那段聊，而不是插进
+        #     旁边另一段。这条是分开「交错对话」最有效的单一信号。
+        if sender in th["members"]:
+            s += 0.25
+        # ③ @：命中这个线程的人 → 强信号；@ 了线程外的人 → 在叫别人
+        if ats:
+            s += 0.40 if set(ats) & th["members"] else -0.30
+        # ④ 语义：权重最高（Gilbert 的结论是内容信号比结构信号更能说明关系）
+        s += sim * 0.60
+        # ⑤ 追问 vs 各开各的话题
+        #    两个都是问句、又有共同词（"有人打游戏吗" → "打什么游戏"）= 追问，加分
+        #    两个都是问句、毫无共同词                           = 各开各的，扣分
+        #    这条是分开「交错的两段对话」的关键
+        if prev_q and body_q:
+            s += 0.15 if sim >= 0.05 else -0.25
+        elif prev_q and not body_q and sim >= 0.03:
+            # 上一句在问、这句像在答。必须带一点共同词才算——否则任何
+            # 非问句接在问句后面都加分，会把旁边的对话抢过来
+            s += 0.12
+        # ⑥ 短消息：三五个字基本是在接话
+        if len(body) <= 6:
+            s += 0.10
+        return max(0.0, min(1.0, s))
 
     def tie_line(self, viewer, uid):
         """给 prompt 用：viewer 和 uid 之间是什么关系（没交集返回空）。

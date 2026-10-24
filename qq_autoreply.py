@@ -1724,6 +1724,15 @@ class AutoReply:
                 #    避免「小猪佩奇」被认成「小猪」。
                 if _target is None:
                     _hit = self.mem.find_person(user_text)
+                    if not _hit:
+                        # 认不出来 → 可能是备注刚改、或者启动时没扫过好友列表
+                        # （别名只在拿到 get_friend_list 时才记）。刷一次再试，
+                        # 代价是一次本地 API 调用（几十毫秒），只在这条路上花。
+                        try:
+                            self._friend_ids(refresh=True)
+                            _hit = self.mem.find_person(user_text)
+                        except Exception:
+                            _hit = None
                     if _hit and str(_hit[0]) != str(uid):
                         _target, _label = _hit[0], "%s（%s）" % (_hit[1], _hit[0])
                 # ③ 再定能说多少
@@ -2492,6 +2501,27 @@ class AutoReply:
         self._stranger_save()
         return cur
 
+    def _remember_friend_aliases(self, friends):
+        """把好友的备注 / 昵称记进名字索引。
+
+        为什么要单独抽出来：scan_new_friends 自己拉了一次 get_friend_list，
+        以前只更新了 id 缓存、**没记别名**——于是主人问「你还记得姚明希吗」
+        （那是他给的备注）时认不出来，索引里只有昵称「　　　　　」。
+        两处各自写一遍就会再漏一次，所以收成一个方法，谁拿到列表谁调它。
+        """
+        for f in friends or []:
+            try:
+                uid = int(f.get("user_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not uid:
+                continue
+            try:
+                self.mem.add_alias(f.get("remark"), uid)
+                self.mem.add_alias(f.get("nickname"), uid)
+            except Exception:
+                pass
+
     def _friend_ids(self, refresh=False, ttl=600):
         """好友 ID 集合（带缓存）。
 
@@ -2526,13 +2556,9 @@ class AutoReply:
             if not uid:
                 continue
             ids.add(uid)
-            # 顺带记别名：主人问「你还记得康程锦吗」用的是**他给的备注**，
-            # 而对方本人叫「Changin丶Lin」——两个都得认。
-            try:
-                self.mem.add_alias(f.get("remark"), uid)
-                self.mem.add_alias(f.get("nickname"), uid)
-            except Exception:
-                pass
+        # 记别名：主人问「你还记得康程锦吗」用的是**他给的备注**，
+        # 而对方本人叫「Changin丶Lin」——两个都得认。
+        self._remember_friend_aliases(data)
         self._friend_cache = (now, ids)
         return ids
 
@@ -2923,6 +2949,8 @@ class AutoReply:
         if not isinstance(friends, list):
             log("扫好友列表返回格式不对: %s" % str(friends)[:120])
             return 0
+        # 先记别名：这个函数自己拉了列表，不能只更新 id 缓存就完事
+        self._remember_friend_aliases(friends)
         wl = set(int(x) for x in self.cfg.get("allowed_private") or [])
         owners = set(self._owner_uids())
         try:

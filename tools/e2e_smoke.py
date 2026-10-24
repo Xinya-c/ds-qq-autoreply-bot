@@ -2041,6 +2041,11 @@ def test_scan_new_friends():
               any("白名单" in t for t in own), str(own)[:80])
         check("扫新朋友：备注也带给主人了",
               any("加我的是他" in t for t in own), str(own)[:100])
+        # 扫列表时必须把 remark 记进名字索引。原来只更新 id 缓存，
+        # 于是主人用备注问（「你还记得姚明希吗」）时认不出来——索引里只有昵称。
+        hit = bot.mem.find_person("你还记得加我的是他吗")
+        check("扫新朋友：备注进名字索引（能用备注认人）",
+              (hit or (None,))[0] == 444, str(hit))
 
         # 再扫一次：已经登记过的不能重复打招呼
         bot.ob = FriendOB(bot.ob.friends)

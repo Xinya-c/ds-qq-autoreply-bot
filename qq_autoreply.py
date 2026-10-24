@@ -886,6 +886,36 @@ class AutoReply:
             return None
         return raw, mime
 
+    @staticmethod
+    def _pick_best_frame(im, max_frames=40):
+        """在动图里挑「内容最满」的那一帧，并 seek 过去。
+
+        为什么不是取第一帧：很多表情包第一帧是空白的（淡入/开场），
+        取第一帧等于给模型一片白。用缩略图上的不透明像素数当内容量——
+        缩到 48×48 算，几十帧也就几毫秒，对这种场景够用。
+        """
+        try:
+            n = min(int(getattr(im, "n_frames", 1) or 1), max_frames)
+            best_i, best_score = 0, -1
+            for i in range(n):
+                try:
+                    im.seek(i)
+                    small = im.convert("RGBA").resize((48, 48))
+                    alpha = small.getchannel("A")
+                    score = sum(1 for p in alpha.getdata() if p > 32)
+                except Exception:
+                    continue
+                if score > best_score:
+                    best_i, best_score = i, score
+            im.seek(best_i)
+            return best_i
+        except Exception:
+            try:
+                im.seek(0)
+            except Exception:
+                pass
+            return 0
+
     def _fit_for_model(self, raw, mime):
         """把图缩到模型能吃下的尺寸，返回 (raw, mime)。
 
@@ -910,9 +940,14 @@ class AutoReply:
             from PIL import Image
             with Image.open(io.BytesIO(raw)) as im:
                 w, h = im.size
+                # 动图（GIF/WEBP）**不能走小图直通**：多模态 API 对 GIF 的
+                # 支持很不一致——有的只取第一帧、有的直接把整段当无效图。
+                # 而 1.6KB 的表情包看着「够小」，原样送出去后模型可能压根
+                # 没看到内容。所以动图一律解码成一帧静态图再送。
+                animated = getattr(im, "n_frames", 1) > 1
             size_ok = (not max_out) or len(raw) <= max_out
             dim_ok = (not max_edge) or (w <= max_edge and h <= max_edge)
-            if size_ok and dim_ok:
+            if size_ok and dim_ok and not animated:
                 return raw, mime
         except Exception:
             # 认不出尺寸：至少按字节上限判断一下，别让超大图裸奔过去
@@ -925,12 +960,11 @@ class AutoReply:
             return raw, mime
         try:
             with Image.open(io.BytesIO(raw)) as im:
-                # GIF 动图只取第一帧：模型看动图本来也只看一帧
+                # 动图取「最饱满」的一帧，别机械取第一帧。
+                # 很多表情包第一帧是空白的开场，取第一帧模型就看到一片白，
+                # 还以为对方发了个空图。
                 if getattr(im, "n_frames", 1) > 1:
-                    try:
-                        im.seek(0)
-                    except Exception:
-                        pass
+                    self._pick_best_frame(im)
                 # 透明底转白底（PNG/GIF 常见），转 JPEG 才不会黑成一片
                 if im.mode in ("RGBA", "LA", "P"):
                     im = im.convert("RGBA")
@@ -960,6 +994,14 @@ class AutoReply:
                     out = io.BytesIO()
                     im.save(out, format="JPEG", quality=q, optimize=True)
                     data = out.getvalue()
+                # 动图必须转：哪怕转出来的 JPEG 比原 GIF 还大（小表情包
+                # 常见），也得给模型一张 static 图——原 GIF 送过去可能
+                # 直接被当无效图，那才是真的看不见。
+                if animated:
+                    log("  动图取帧送模型：%s %.1fKB → JPEG %.1fKB（%dx%d）"
+                        % ("GIF", len(raw) / 1024.0, len(data) / 1024.0,
+                           im.size[0], im.size[1]))
+                    return data, "image/jpeg"
                 if len(data) < len(raw):
                     log("  图片已压缩：%.1fMB → %.1fMB（%dx%d，JPEG q%d）"
                         % (len(raw) / 1048576.0, len(data) / 1048576.0,
@@ -1051,8 +1093,29 @@ class AutoReply:
             return None
         return path
 
+    @staticmethod
+    def _looks_like_sticker(data):
+        """这个图片段是不是「表情包」，而不是照片/截图。
+
+        为什么要区分：两者的读法完全不同。照片要说'我看到什么'，表情包
+        要看'他想表达什么情绪/在玩什么梗'。不区分的话模型会把表情包当
+        照片描述（「图里有一个人举着牌子上面写着…」），接不住梗。
+
+        NapCat 的图片段会带 summary，这里做宽容判断：拿不准就当普通图，
+        不会比现在更差。
+        """
+        d = data or {}
+        s = str(d.get("summary") or d.get("sub_type") or "")
+        if "表情" in s:
+            return True
+        # sub_type: NapCat 里 1 常表示表情/商城表情，0 是普通图
+        st = str(d.get("sub_type") or "").strip()
+        if st in ("1", "2"):
+            return True
+        return False
+
     def _extract_image(self, message, conv_key):
-        """取第一张图：先校验，再存盘，返回 {raw,mime,path,size}。"""
+        """取第一张图：先校验，再存盘，返回 {raw,mime,path,size,sticker}。"""
         cfg = self.cfg.get("media") or {}
         if not cfg.get("enabled", True) or not isinstance(message, list):
             return None
@@ -1071,17 +1134,21 @@ class AutoReply:
                 continue
             got += 1
             raw, mime = got_img
+            seg_data = seg.get("data") or {}
+            sticker = self._looks_like_sticker(seg_data)
             path = self._save_image(raw, mime, conv_key)
             if path:
                 size_txt = ("%.1f KB" % (len(raw) / 1024.0)) if len(raw) >= 1024 \
                     else ("%d 字节" % len(raw))
-                log("  图片已保存：%s（%s）" % (path, size_txt))
+                log("  图片已保存：%s（%s%s）"
+                    % (path, size_txt, "，表情包" if sticker else ""))
             else:
                 log("  图片保存失败，仅内存使用")
             # 存盘的是原图；给模型的是压缩过的（小图原样，大图缩到能送进去）
             mraw, mmime = self._fit_for_model(raw, mime)
             return {"raw": mraw, "mime": mmime, "path": path, "size": len(raw),
-                    "model_size": len(mraw or b"")}
+                    "model_size": len(mraw or b""), "sticker": sticker,
+                    "animated": (mime or "").lower() in ("image/gif", "image/webp")}
         return None
 
     # ---------- 语音转文字 ----------
@@ -1389,20 +1456,41 @@ class AutoReply:
         d.extend(found)
 
     def _split_images(self, reply):
-        """解析回复里的 [[img:文件名]]，返回 (纯文本, [绝对路径])。"""
+        """解析回复里的 [[img:文件名]]，返回 (纯文本, [绝对路径])。
+
+        模型写标记很随意，实测见过三种：
+            [[img:crowd.png]]   正常
+            [[img:refuse.png]   少一个右括号
+            [[img:cry]]         没有扩展名
+        后两种以前都会失败——图片发不出去，而且标记还留在正文里被发出去
+        （对方看到一句「笑死 [[img:cry]]」）。所以这里三处都做容错：
+        括号可有可无、扩展名可省（按常见后缀补）。
+        """
         if not reply:
             return reply, []
         d = self._reply_img_dir()
         paths = []
+        exts = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 
         def _sub(m):
-            name = os.path.basename(m.group(1).strip())
+            name = os.path.basename(m.group(1).strip().strip("\"'"))
             p = os.path.join(d, name)
-            if os.path.isfile(p) and p not in paths:
-                paths.append(p)
+            if not os.path.isfile(p) and not os.path.splitext(name)[1]:
+                for ext in exts:            # [[img:cry]] → cry.png
+                    cand = os.path.join(d, name + ext)
+                    if os.path.isfile(cand):
+                        p = cand
+                        break
+            if os.path.isfile(p):
+                if p not in paths:
+                    paths.append(p)
+            else:
+                # 别静默：标记被删了但图没发出去，这里不记一笔根本查不出来
+                log("  表情包标记找不到文件：%r" % name)
             return ""
 
-        text = re.sub(r"\[\[\s*img\s*:\s*([^\]]+)\]\]", _sub, reply)
+        # ] 可有可无；文件名允许带空格但不能跨行
+        text = re.sub(r"\[\[\s*img\s*:\s*([^\]\n]{1,80})\]\s*\]?", _sub, reply)
         text = re.sub(r"[ \t]{2,}", " ", text).strip()
         return text, paths
 
@@ -1460,7 +1548,8 @@ class AutoReply:
                 else "你当时不在线，是现在才看到的。")
 
     def _prompt(self, conv_key, user_text, has_image=False, mid=None, bare=False,
-                excludes=None, uid=None, stale=0, replay=False, proactive=False):
+                excludes=None, uid=None, stale=0, replay=False, proactive=False,
+                sticker=False):
         if proactive:
             # 主动接话是另一套拼法：系统段 + 「群里现在在聊啥」+ 接话指令，
             # 没有「对方刚说：X」，别让模型以为有人在跟它说话。
@@ -1572,8 +1661,19 @@ class AutoReply:
                          "注意：如果上下文里最近的话题已经是很久以前的了（看行末的时间标记），"
                          "那多半已经翻篇了，别接着那个旧话题追问，问一句现在想干嘛就行。")
         elif has_image:
-            lines.append("对方%s发来一张图片（内容见附图），附带文字：%s"
-                         % (when, user_text or "（无文字）"))
+            # 表情包和普通照片的读法完全不同：照片是「我看到了什么」，
+            # 表情包是「他想表达什么情绪」。不点明的话模型会把表情包当成
+            # 照片描述（「图里有个人举着牌子写着…」），梗就接不住。
+            if sticker:
+                lines.append(
+                    "对方%s发来一张**表情包**（图在下面），附带文字：%s\n"
+                    "这是表情包不是照片——别逐字描述画面。**先看图上写的字**"
+                    "（表情包的梗八成都在字上），再看画的是什么表情/动作，"
+                    "然后判断对方想表达什么，用你的口气接这个情绪或者吐槽这张图。"
+                    % (when, user_text or "（没配文字）"))
+            else:
+                lines.append("对方%s发来一张图片（内容见附图），附带文字：%s"
+                             % (when, user_text or "（无文字）"))
         else:
             lines.append("对方%s说：%s" % (when, user_text))
         lines.append("")
@@ -1773,7 +1873,8 @@ class AutoReply:
                    excludes=None, uid=None, stale=False, replay=False,
                    proactive=False):
         prompt, hist = self._prompt(conv_key, user_text, bool(image), mid, bare,
-                                    excludes, uid, stale, replay, proactive)
+                                    excludes, uid, stale, replay, proactive,
+                                    sticker=bool((image or {}).get("sticker")))
         # 分池：补捞/主动搭话走后台池，不和实时回复抢槽位。
         # - 实时（私聊、群里 @我）：排队等，最多等满 timeout
         # - 主动接话：它是可选的，槽位满就直接跳过（错过这回等下次）

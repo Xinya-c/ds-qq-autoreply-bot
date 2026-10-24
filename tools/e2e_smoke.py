@@ -1888,6 +1888,69 @@ def test_tools_fallback():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_sticker_understanding():
+    """表情包要能被「看懂」，而不是被当照片描述。
+
+    两件事：
+    ① 动图必须解码成一帧静态图送给模型——原 GIF 直通的话，多模态 API
+       对它支持不一致（有的只取第一帧、有的直接当无效图），1.6KB 的
+       表情包看着「够小」，到模型那边可能是空白。
+    ② 要在提示词里点明「这是表情包，先看字再看表情，别描述画面」。
+       不点明的话模型会写成「图里有个人举着牌子上面写着…」，梗接不住。
+    """
+    bot, tmp = new_bot()
+    try:
+        # ① 动图 → 静态 JPEG
+        from PIL import Image, ImageDraw
+        frames = []
+        for i in range(4):
+            f = Image.new("RGB", (120, 120), (255, 255, 255))
+            if i >= 2:              # 前两帧是空白，模拟「开场留白」的表情包
+                ImageDraw.Draw(f).ellipse([20, 20, 100, 100], fill=(200, 30, 30))
+            frames.append(f)
+        buf = io.BytesIO()
+        frames[0].save(buf, format="GIF", save_all=True,
+                       append_images=frames[1:], duration=120)
+        raw = buf.getvalue()
+        mraw, mmime = bot._fit_for_model(raw, "image/gif")
+        check("表情包：动图被转成静态 JPEG", mmime == "image/jpeg", mmime)
+        check("表情包：转出来的确实是图", bool(mraw) and mraw[:2] == b"\xff\xd8",
+              repr((mraw or b"")[:4]))
+
+        # 普通小图仍原样直通（别为了修动图把静态图也一起压了，白损画质）
+        b2 = io.BytesIO()
+        Image.new("RGB", (80, 80), (10, 20, 30)).save(b2, format="JPEG", quality=90)
+        r2 = b2.getvalue()
+        m2, t2 = bot._fit_for_model(r2, "image/jpeg")
+        check("表情包：静态小图仍然原样直通", m2 == r2 and t2 == "image/jpeg")
+
+        # ② 提示词要区分表情包和照片
+        pr = bot._prompt("p999", "", has_image=True, uid=888, sticker=True)
+        pr = pr[0] if isinstance(pr, tuple) else pr
+        check("表情包：提示词点明这是表情包", "表情包" in pr)
+        check("表情包：提示词要求先看字", "先看图上写的字" in pr)
+        check("表情包：提示词不让逐字描述画面", "别逐字描述画面" in pr)
+        pr2 = bot._prompt("p999", "", has_image=True, uid=888, sticker=False)
+        pr2 = pr2[0] if isinstance(pr2, tuple) else pr2
+        check("普通图：不会被说成表情包", "表情包" not in pr2)
+
+        # ③ 表情包标记的容错（模型写得很随意）
+        cases = [
+            ("笑死 [[img:cry.png]]", "笑死", 1),
+            ("笑死 [[img:cry]", "笑死", 1),          # 少一个右括号
+            ("笑死 [[img:cry]]", "笑死", 1),         # 没有扩展名
+            ("笑死 [[img: cry.png ]]", "笑死", 1),   # 带空格
+            ("笑死 [[img:没有这个.png]]", "笑死", 0),  # 文件不存在：标记仍要删
+        ]
+        for src, exp_t, exp_n in cases:
+            t, ps = bot._split_images(src)
+            check("表情包标记容错 %r" % src[:16],
+                  t == exp_t and len(ps) == exp_n,
+                  "文本%r 图%d张" % (t, len(ps)))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_face_text():
     """QQ 自带表情要带上名字，不能只留个「[表情]」。
 
@@ -1991,7 +2054,8 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_tools_fallback, test_face_text, test_ai_boilerplate,
+               test_tools_fallback, test_sticker_understanding,
+               test_face_text, test_ai_boilerplate,
                test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_cli_parallel, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()

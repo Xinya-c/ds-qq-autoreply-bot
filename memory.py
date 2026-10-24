@@ -298,6 +298,25 @@ def parse_time_range(text, now=None):
     return None
 
 
+def is_placeholder(text):
+    """是不是「（图片）」「[表情]」「【图片】attachments/x.gif」这类没内容的占位。
+
+    带进 prompt 只会分散注意力——尤其 person_brief 里，一句「【图片】
+    attachments/u…gif (3240.1KB)」会被当成「他说过的话」，毫无意义。
+    """
+    t = (text or "").strip()
+    if not t:
+        return True
+    if "attachments/" in t:
+        return True
+    for k in ("[图片]", "[表情]", "[语音]", "[视频", "[文件]", "[JSON", "[合并转发]"):
+        if k in t and len(t) <= len(k) + 24:
+            return True
+    if t[0] in "（(【[" and t[-1] in "）)】]":
+        return True
+    return False
+
+
 def preview_around(body, query_toks, before=36, after=76):
     """长行围绕最先出现的命中词截取（固定截开头会让模型误判"词碰上内容没对"）。"""
     if len(body) <= SEARCH_PREVIEW_MAX:
@@ -577,6 +596,9 @@ class BotMemory:
         self.user_profile = {}           # "g<gid>|u<uid>" -> 群内个人档案（与群级并存）
         self.mood = {}                   # conv -> deque 最近情绪（情绪轨迹）
         self.intimacy = {}                # conv -> {n,pos,neg,neu,first,last} 互动量
+        self._aliases = {}                # 名字 -> uid（好友备注/昵称，扫好友列表时填）
+        self._name_cache = None           # name_index 的缓存
+        self._name_key = None
         self.samples = []                # 手挑的风格样本（self_samples.md，可选）
         self.style = ""                  # 长期养成的说话风格（全局，跨会话）
         self.sent_since_style = 0        # 距上次提炼风格累计说过多少句
@@ -1362,6 +1384,70 @@ class BotMemory:
             out.append("他最近在群里说过：%s" % t[:60])
         return out
 
+    def add_alias(self, name, uid):
+        """记一个「名字 → QQ 号」的别名（好友备注 / 本人昵称）。
+
+        为什么需要：主人问「你还记得康程锦吗」用的是**他给的备注**，
+        而对方本人在 QQ 上叫「Changin丶Lin」——两个都得认，否则主人用
+        自己习惯的称呼问，机器人一脸茫然。
+        """
+        n = (name or "").strip()
+        if not (2 <= len(n) <= 20):
+            return
+        try:
+            self._aliases[n] = int(uid)
+        except (TypeError, ValueError):
+            pass
+
+    def name_index(self):
+        """名字 → QQ 号。好友别名 + 归档里出现过的昵称，合并成一张表。
+
+        归档 recs 的 nick 有两种写法：
+            私聊  "小猪"              （conv 本身带 uid）
+            群聊  "小猪(2970751548)"  （uid 在括号里）
+        两种都要解析，否则群里认识的人在私聊里就认不出来了。
+
+        带缓存：2799 条记录每次都遍历一遍太浪费，用「记录数 + 别名数」当
+        版本号，变了才重建。
+        """
+        key = (len(self._search.recs), len(self._aliases))
+        if self._name_cache is not None and self._name_key == key:
+            return self._name_cache
+        idx = dict(self._aliases)
+        pat = re.compile(r"[(（]\s*(\d{5,12})\s*[)）]\s*$")
+        for conv, _ts, nick, _body in self._search.recs:
+            if not nick or nick == "我":
+                continue
+            name, uid = "", 0
+            m = pat.search(nick)
+            if m:
+                uid = int(m.group(1))
+                name = nick[:m.start()].strip()
+            elif conv.startswith("u"):
+                try:
+                    uid = int(conv[1:])
+                except ValueError:
+                    continue
+                name = nick.strip()
+            if uid and 2 <= len(name) <= 20:
+                idx.setdefault(name, uid)     # 别名的优先级高于从归档猜的
+        self._name_cache = idx
+        self._name_key = key
+        return idx
+
+    def find_person(self, text):
+        """从一句话里认出一个人：返回 (uid, 命中的名字) 或 None。
+
+        按名字长度降序取命中最长的那个——「小猪佩奇」不该被认成「小猪」。
+        """
+        if not text:
+            return None
+        best = None
+        for name, uid in self.name_index().items():
+            if name in text and (best is None or len(name) > len(best[1])):
+                best = (uid, name)
+        return best
+
     def person_brief(self, uid, max_msgs=4):
         """按 QQ 号取一个人的概况：关系档案 + 群档案 + 最近说过的话。
 
@@ -1395,7 +1481,7 @@ class BotMemory:
                 t = (m.get("text") or "").strip()
                 if len(t) < 3:
                     continue
-                if t[0] in "（(【" and t[-1] in "）)】":
+                if is_placeholder(t):
                     continue                  # （图片）（空消息）这类占位
                 said.append(t)
             if said:
@@ -1413,7 +1499,7 @@ class BotMemory:
                 continue                      # 自己的话不算「他说过什么」
             if len(body) < 3 or body in early:
                 continue
-            if body[0] in "（(【" and body[-1] in "）)】":
+            if is_placeholder(body):
                 continue
             early.append(body)
             if len(early) >= 4:

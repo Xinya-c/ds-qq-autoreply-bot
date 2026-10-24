@@ -1711,6 +1711,7 @@ class AutoReply:
             try:
                 _owner = str(self.cfg.get("owner_qq") or "").strip()
                 if _owner and str(uid or "") == _owner:
+                    # ① 先按 QQ 号：最准，「你记得 3207399168 吗」
                     for _num in re.findall(r"\d{5,12}", user_text):
                         if _num in (_owner, str(uid)):
                             continue
@@ -1718,6 +1719,15 @@ class AutoReply:
                         if _brief:
                             _who = (_num, _brief)
                             break
+                    # ② 再按名字/备注：「你记得康程锦吗」——主人平时用的是
+                    #    他给的备注，而对方本人叫「Changin丶Lin」。取命中最长的
+                    #    那个名字，避免「小猪佩奇」被认成「小猪」。
+                    if not _who:
+                        _hit = self.mem.find_person(user_text)
+                        if _hit and str(_hit[0]) != str(uid):
+                            _brief = self.mem.person_brief(_hit[0])
+                            if _brief:
+                                _who = ("%s（%s）" % (_hit[1], _hit[0]), _brief)
             except Exception:
                 pass
         recent_kao = list(self.kaomoji_hist.get(conv_key) or [])
@@ -2490,10 +2500,19 @@ class AutoReply:
         ids = set()
         for f in data:
             try:
-                ids.add(int(f.get("user_id") or 0))
+                uid = int(f.get("user_id") or 0)
             except (TypeError, ValueError):
                 continue
-        ids.discard(0)
+            if not uid:
+                continue
+            ids.add(uid)
+            # 顺带记别名：主人问「你还记得康程锦吗」用的是**他给的备注**，
+            # 而对方本人叫「Changin丶Lin」——两个都得认。
+            try:
+                self.mem.add_alias(f.get("remark"), uid)
+                self.mem.add_alias(f.get("nickname"), uid)
+            except Exception:
+                pass
         self._friend_cache = (now, ids)
         return ids
 

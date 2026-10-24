@@ -2538,6 +2538,21 @@ def test_person_brief():
               "出师表嘛，会背一点" not in joined, joined[:80])
         check("认人：查不存在的人返回空", m.person_brief(99999999) == [])
 
+        # 按名字/备注认人：主人平时用的是「他给的备注」，不是 QQ 号
+        m.add_alias("康程锦", 555)
+        m.add_alias("Changin", 555)
+        check("认人：按备注能找到人",
+              m.find_person("你还记得康程锦吗") == (555, "康程锦"),
+              str(m.find_person("你还记得康程锦吗")))
+        check("认人：本来的昵称也能认",
+              (m.find_person("Changin 那人咋样了") or (None,))[0] == 555,
+              str(m.find_person("Changin 那人咋样了")))
+        m.add_alias("小猪佩奇", 666)
+        m.add_alias("小猪", 777)
+        check("认人：同名取最长的（小猪佩奇不该被认成小猪）",
+              m.find_person("小猪佩奇在吗") == (666, "小猪佩奇"),
+              str(m.find_person("小猪佩奇在吗")))
+
         # 隐私边界：只在主人私聊里认人
         bot.cfg["owner_qq"] = "111"
         bot.cfg["reply_images"]["enabled"] = False

@@ -187,6 +187,10 @@ DEFAULTS = {
     "media": {
         "enabled": True,
         "max_bytes": 10485760,    # 单张图片下载上限 10MB，超过则只当文字处理
+        # 下载**总时长**硬上限（秒）。注意 urlopen 的 timeout 只管单次 socket
+        # 读，慢速持续下载时每次都不超时、整个 read() 能拖几分钟。实测一张
+        # 3.2MB 的 GIF 拖了 6 分 17 秒，期间用户消息全积压（延迟 5 分 42 秒）。
+        "download_timeout_sec": 20,
         "max_images": 1,          # 每条消息最多带 1 张图
         "save_dir": "",           # 空 = qq_messages/attachments
         # 送给模型前先缩一缩：多模态 API 对 base64 图片有硬上限（10MB 原图
@@ -916,8 +920,28 @@ class AutoReply:
         try:
             if url.startswith("http"):
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    raw = r.read(limit + 1)
+                # 单次读 10 秒超时 + **总时长硬上限**。
+                # urllib 的 timeout 只作用于单次 socket 操作，不限制总时长：
+                # 慢速持续下载时每次 recv 都不超时，整个 read() 能拖几分钟。
+                # 2026-10-25 实测：一张 3.2MB 的 GIF 拖了 6 分 17 秒，
+                # 期间用户发的消息全部积压、延迟 5 分 42 秒才处理，
+                # 表现为「NapCat 有消息、机器人完全没反应」。
+                hard = float(cfg.get("download_timeout_sec", 20) or 20)
+                deadline = time.monotonic() + hard
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    buf = []
+                    total = 0
+                    while total <= limit:
+                        chunk = r.read(65536)
+                        if not chunk:
+                            break
+                        buf.append(chunk)
+                        total += len(chunk)
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(
+                                "下载超过 %.0f 秒（已收 %.1fMB），放弃"
+                                % (hard, total / 1048576.0))
+                    raw = b"".join(buf)
             elif f.startswith("base64://"):
                 raw = base64.b64decode(f[len("base64://"):])
             elif f.startswith("data:"):

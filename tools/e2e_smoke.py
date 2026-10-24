@@ -2466,6 +2466,52 @@ def test_ws_event_isolation():
     ob._stop = True
 
 
+def test_download_timeout():
+    """图片下载必须有**总时长**上限，不能只靠 urlopen 的单次读超时。
+
+    2026-10-25 实测的事故：一张 3.2MB 的 GIF 拖了 6 分 17 秒下载完，
+    期间接收线程整条堵死，用户 00:54 发的消息到 00:59:56 才被处理
+    （延迟 5 分 42 秒），表现为「NapCat 有消息、机器人完全没反应」。
+
+    根因：urllib 的 timeout 只作用于单次 socket 操作。慢速持续下载时
+    每次 recv 都不超时，整个 read() 可以无限拖下去。
+    """
+    import http.server
+    import socketserver
+
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(50 * 1024 * 1024))
+            self.end_headers()
+            try:
+                for _ in range(10000):
+                    self.wfile.write(b"x" * 8192)
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except Exception:
+                pass
+
+        def log_message(self, *a):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), Slow)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    bot, tmp = new_bot()
+    try:
+        bot.cfg["media"] = {"enabled": True, "max_bytes": 10485760,
+                            "download_timeout_sec": 1}
+        t0 = time.time()
+        r = bot._download_image({"url": "http://127.0.0.1:%d/a.gif" % port})
+        dt = time.time() - t0
+        check("下载：慢速流会按总时长中断（不拖几分钟）", r is None and dt < 3.0,
+              "%.1fs / %s" % (dt, r))
+    finally:
+        srv.shutdown()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_face_text():
     """QQ 自带表情要带上名字，不能只留个「[表情]」。
 
@@ -2570,7 +2616,7 @@ def main():
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
                test_tools_fallback, test_humanize_batch, test_batch23,
-               test_ws_event_isolation,
+               test_ws_event_isolation, test_download_timeout,
                test_nonfriend_msg,
                test_scan_new_friends,
                test_stranger_flow,

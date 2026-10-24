@@ -48,7 +48,8 @@
     "save_dir": "",
     "max_edge": 1568,
     "max_out_bytes": 1500000,
-    "jpeg_quality": 82
+    "jpeg_quality": 82,
+    "download_timeout_sec": 20
   },
   "context_messages": 50,
   "archive": {

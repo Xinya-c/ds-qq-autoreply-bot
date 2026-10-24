@@ -2599,20 +2599,122 @@ def test_person_brief():
               ("聊过" in m.tie_line(55555, 66666)
                or "喊过" in m.tie_line(55555, 66666)),
               m.tie_line(55555, 66666))
-        # 间隔超过线程窗口（5 分钟）的 @ 不该连成一段对话
-        before = len(m.social_map().get(55555, {}).get(66666, {}).get("threads", ()))
+        # 间隔超过 LINK_MAX_GAP（4 分钟）的 @ 不能连成一段对话。
+        # 新版语义更严格：两条孤零零的 @ 不构成「聊过」，只记「喊过」——
+        # 段数不变、@ 次数 +2。
+        d0 = m.social_map().get(55555, {}).get(66666, {})
+        before, at0 = len(d0.get("threads") or ()), int(d0.get("at") or 0)
         m._search.recs.extend([
             ("g222", "2026-10-22 20:00:00", "小王(55555)", "@66666 在吗"),
             ("g222", "2026-10-22 20:30:00", "小王(55555)", "@66666 在吗在吗"),
         ])
         m._sm_cache = None
-        after = len(m.social_map().get(55555, {}).get(66666, {}).get("threads", ()))
-        check("社交：间隔太久不算一段对话（各算各的）", after > before,
-              "%d → %d" % (before, after))
+        d1 = m.social_map().get(55555, {}).get(66666, {})
+        after, at1 = len(d1.get("threads") or ()), int(d1.get("at") or 0)
+        check("社交：间隔太久不算同一段（只记喊过，不算聊过）",
+              after == before and at1 == at0 + 2,
+              "段 %d→%d，@ %d→%d" % (before, after, at0, at1))
         check("社交：没交集的人没有关系行", m.tie_line(55555, 77777) == "")
         brief = m.person_brief(66666, ["222"], viewer=55555)
         check("社交：认人时带上关系行",
               any("你跟他的关系" in x for x in brief), str(brief)[:100])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_social_v2():
+    """社交图 v2：easy-first 归属 + 行为突变 + 语气信号。
+
+    这一组锁的是三件容易改坏的事：
+      1. 两段交错对话必须分开（旧版会粘成一段）
+      2. 弱信号不能把两段各自成段的对话并起来（灾难性错误）
+      3. 语气只能用来润色关系，不能当熟络的硬证据
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = qa.load_config()
+        cfg["archive"]["dir"] = tmp
+        bot = qa.AutoReply(cfg)
+        m = bot.mem
+        base = time.mktime(time.strptime("2026-10-24 20:00:00",
+                                         "%Y-%m-%d %H:%M:%S"))
+
+        def load(rows, conv="g999"):
+            m._search.recs = [(conv,
+                               time.strftime("%Y-%m-%d %H:%M:%S",
+                                             time.localtime(base + o)), n, b)
+                              for o, n, b in rows]
+            m._sm_cache = None
+            m._sm_key = None
+            return m.social_map()
+
+        # ① 两段交错、全都没有 @
+        load([(0, "甲(11111)", "今天谁去吃饭"), (15, "丙(33333)", "有人打游戏吗"),
+              (40, "乙(22222)", "我去吃饭"), (55, "丁(44444)", "打什么游戏"),
+              (80, "甲(11111)", "那就楼下集合"), (95, "丙(33333)", "打瓦"),
+              (120, "乙(22222)", "几点"), (140, "丁(44444)", "算我一个")])
+        d_ab = m.social_map()[11111][22222]
+        d_cd = m.social_map()[33333][44444]
+        check("社交v2：交错对话能分开（吃饭组各 4 句）",
+              len(d_ab["threads"]) == 1 and d_ab["turns"] == 4,
+              "%d段 %d句" % (len(d_ab["threads"]), d_ab["turns"]))
+        check("社交v2：交错对话能分开（游戏组各 4 句）",
+              len(d_cd["threads"]) == 1 and d_cd["turns"] == 4,
+              "%d段 %d句" % (len(d_cd["threads"]), d_cd["turns"]))
+        check("社交v2：跨组不产生对话关系",
+              not m.social_map()[11111][33333]["threads"],
+              str(m.tie_line(11111, 33333)))
+
+        # ② 弱边不许把两段已成段的对话并起来（LINK_MERGE_SCORE 的护栏）
+        load([(0, "甲(11111)", "今天谁去吃饭"), (20, "乙(22222)", "我去吃饭"),
+              (40, "丙(33333)", "有人打游戏吗"), (60, "丁(44444)", "打什么游戏"),
+              (80, "甲(11111)", "楼下集合"), (100, "乙(22222)", "好")])
+        sm = m.social_map()
+        check("社交v2：两段各自成段后不被弱边粘一起",
+              not sm[11111][33333]["threads"] and not sm[22222][44444]["threads"],
+              "%s | %s" % (m.tie_line(11111, 33333), m.tie_line(22222, 44444)))
+
+        # ③ 二人世界：极短对聊（毫无共同词）也要连上
+        load([(0, "戊(55555)", "在吗"), (20, "己(66666)", "在"),
+              (45, "戊(55555)", "问你个事"), (70, "己(66666)", "说")], "g998")
+        d = m.social_map()[55555][66666]
+        check("社交v2：毫无共同词的极短对聊也算一段",
+              len(d["threads"]) == 1 and d["turns"] == 4,
+              "%d段 %d句" % (len(d["threads"]), d["turns"]))
+
+        # ④ 同人连发不会被外人抢走（自己 3 句 + 对方 1 句 = 一段）
+        load([(0, "庚(77777)", "我想买个键盘"), (15, "辛(88888)", "多钱"),
+              (30, "庚(77777)", "预算五百"), (45, "庚(77777)", "有推荐吗")], "g997")
+        d = m.social_map()[77777][88888]
+        check("社交v2：同人连发归同一段（不裂成两段）",
+              len(d["threads"]) == 1 and d["turns"] == 4,
+              "%d段 %d句" % (len(d["threads"]), d["turns"]))
+
+        # ⑤ 语气：脏话 → 糙；客气 → 客气；只骂一次不算
+        load([(0, "壬(11112)", "累死了"), (30, "癸(22223)", "我也累"),
+              (60, "壬(11112)", "草"), (90, "癸(22223)", "傻逼老板")], "g996")
+        line = m.tie_line(11112, 22223)
+        check("社交v2：脏话多 → 说话糙", "糙" in line, line)
+
+        load([(0, "子(11113)", "谢谢您"), (30, "丑(22224)", "不客气"),
+              (60, "子(11113)", "麻烦你了"), (90, "丑(22224)", "辛苦了"),
+              (120, "子(11113)", "感谢"), (150, "丑(22224)", "应该的")], "g995")
+        line = m.tie_line(11113, 22224)
+        check("社交v2：客气多 → 说话客气", "客气" in line, line)
+
+        load([(0, "甲(33334)", "今天好累"), (30, "乙(44445)", "是啊"),
+              (60, "甲(33334)", "靠"), (90, "乙(44445)", "早点睡")], "g994")
+        line = m.tie_line(33334, 44445)
+        check("社交v2：只骂一次不下「糙」的结论", "糙" not in line, line)
+
+        # ⑥ 自曝不算熟：一堆个人信息但没脏话 → 不能判成「糙」
+        #    （ACL 2012：PII 在弱关系里反而更多，别拿自曝当亲密度）
+        load([(0, "丙(55556)", "我住杭州 今年 24"), (30, "丁(66667)", "哦"),
+              (60, "丙(55556)", "我家三口人 我妈催婚"), (90, "丁(66667)", "正常")],
+             "g993")
+        line = m.tie_line(55556, 66667)
+        check("社交v2：自曝多不等于熟（不判糙、也不判亲）",
+              "糙" not in line and "客气" not in line, line)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2722,6 +2824,7 @@ def main():
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
                test_tools_fallback, test_humanize_batch, test_batch23,
                test_ws_event_isolation, test_download_timeout,
+               test_social_v2,
                test_person_brief,
                test_nonfriend_msg,
                test_scan_new_friends,

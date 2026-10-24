@@ -1482,31 +1482,58 @@ class BotMemory:
         return [gid for gid, s in self.group_members().items()
                 if a in s and b in s]
 
-    THREAD_GAP = 300               # 线程内两条消息最长间隔（秒）
-    # 判断「这条是接上一条」的窗口。比 THREAD_GAP 短得多：
-    # 5 分钟内都算同一段对话太松，90 秒内接话才更像在聊同一个话题。
-    REPLY_WINDOW = 90
-    # 线程归属打分：多个弱信号加权，取最高分的那个线程；都低于门槛才新建。
-    # 结构借 Elsner & Charniak (2008) 的分区算法——他们的做法是把新消息加到
-    # 分类器给出最高概率的那个 cluster，全都判否才新建。原来我是「第一个满足
-    # 条件的就归入」，从不比较其他候选，两条线程同时在聊时必错。
-    THREAD_MIN_SCORE = 0.45
+    # ---------- 社交图参数 ----------
+    # 每条消息最多回看多少条去找「它在回哪条」。限定 12 条是为了控制规模：
+    # 群消息约 2000 条 → 2.4 万次配对，毫秒级；隔太远的不可能是回复。
+    LINK_LOOKBACK = 12
+    # 父消息最多早多久。超过就不可能是「在回它」——群里隔 4 分钟基本已换话题。
+    LINK_MAX_GAP = 240
+    # 候选门槛：低于它的配对根本不进候选（省算力，也防噪音）。
+    LINK_FLOOR = 0.20
+    # 连线门槛分三档。为什么分级：群里最常见的是「两人对聊」——信号弱
+    # （没 @、没共同词，就靠你一句我一句），但它确实是一段对话；而「把两段
+    # 各自聊得正欢的对话粘起来」是灾难。两者不能用同一个门槛。
+    LINK_MIN_SCORE = 0.32      # 两条都还是散句 → 起一段新对话
+    LINK_JOIN_SCORE = 0.38     # 一边已经成段 → 往已有对话里加
+    LINK_MERGE_SCORE = 0.70    # 两边都成段 → 只有高度确定才允许并
+    # 「我自己正在聊的那段」加分：真人会接着自己那段说，不会插进旁边那段。
+    # 这条是分开交错对话最有效的单一信号。
+    LINK_CONT_BONUS = 0.20
+    # 同一个人连发两条：几乎一定属于同一段（补充说明），给个保底分。
+    # 0.42 而不是 0.36：实测 0.36 时「隔 80 秒的自己上一条」(0.36) 会输给
+    # 「刚说了一句的陌生人」(0.374)，人就被拽进别人的对话里了。
+    LINK_SELF_SCORE = 0.42
+    LINK_SELF_GAP = 90
+    # 「只有我们俩在说」的加分（见候选生成处）
+    LINK_DUO_BONUS = 0.15
+
+    # 关系语用词表（LIWC 的中文近似）。依据 ACL 2012《Self-Disclosure and
+    # Relationship Strength》：强关系里脏话频率接近弱关系的 7 倍，而正面客套话
+    # 在弱关系里更多——**客气是距离**。
+    #
+    # 同一篇还有个反直觉结论，别用错：个人信息（住哪、生日、家里人）在
+    # **弱**关系里反而更多，因为新认识的人靠自曝做自我介绍，熟人早知道了。
+    # 所以「他跟我自曝了很多私事」不能当熟络证据，这里刻意不统计自曝量。
+    PROF_WORDS = ("tmd", "nmd", "tm", "卧槽", "我草", "草", "妈的",
+                  "傻逼", "sb", "尼玛", "淦", "废话", "闭嘴", "滚")
+    NEG_WORDS = ("烦", "累", "崩", "难受", "郁闷", "气死", "恶心", "无聊",
+                 "失眠", "疼", "哭", "烂", "差劲", "受不了", "吐了")
+    POLITE_WORDS = ("谢谢", "感谢", "麻烦你", "辛苦了", "不好意思", "抱歉",
+                    "请问", "拜托", "劳烦")
 
     def social_map(self):
         """uid -> {peer: {...}}：谁跟谁真的有来往。
 
-        信号按可信度排（依据 Gilbert & Karahalios 2009：亲密度 > 强度 > 结构）：
-          threads  一起参与过几段对话    ← 最强：真聊过
-          turns    在这些对话里说了几句
-          at       @ 次数（降权：@ 只是开场，不代表聊过）
-          last     最后一次互动时间（recency 是最强预测因子之一）
-          g        共同群（最弱：同一个大群里可能从没说过话）
+        分两步：**先给每条消息找父消息（它在回哪条），再把连起来的消息拼成
+        段落**。顺序是重点，见 ③。
 
-        **对话线程怎么切**（借 Ubuntu Dialogue Corpus 的做法）：
-        @ 只是**开场标记**，不是关系本身。真实情况是「@ 完第一次，后面顺着
-        聊了几句」——所以先按 @ 找对话起点，再把后续没 @ 的发言按「发送者
-        已经在这个线程里 + 时间连续」归进去。中途第三个人 @ 进来，算加入
-        这个线程（同一话题），不是另起一段。
+        信号按可信度排（Gilbert & Karahalios 2009：亲密度 > 强度 > 结构）：
+          threads  一起聊过几段       ← 最强：真聊过
+          turns    这些对话里说了几句
+          at       @ 次数             ← @ 只是开场，不代表聊过
+          last     最后一次互动
+          g        共同群             ← 最弱：大群里可能从没说过话
+          prof/neg/polite  说话的糙度 ← ACL 2012：脏话≈熟，客气≈远
         """
         key = len(self._search.recs)
         if self._sm_cache is not None and self._sm_key == key:
@@ -1514,108 +1541,190 @@ class BotMemory:
         pat_nick = re.compile(r"[(（]\s*(\d{5,12})\s*[)）]\s*$")
         pat_at = re.compile(r"@(\d{5,12})")
 
-        # ① 按群分组、解析发送者、按时间排序
+        # ① 按群分组，每条消息的特征一次算好。
+        #    切词只做一次——放到配对里反复切会慢一个数量级（2.4 万次配对）。
         by_group = {}
         for conv, ts, nick, body in self._search.recs:
             if not conv.startswith("g"):
                 continue
-            m = pat_nick.search(nick or "")
-            if not m:
+            mm = pat_nick.search(nick or "")
+            if not mm:
                 continue
             try:
                 t = time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
             except Exception:
                 continue
-            by_group.setdefault(conv[1:], []).append(
-                (t, int(m.group(1)), body or ""))
+            txt = body or ""
+            uid = int(mm.group(1))
+            low = txt.lower()
+            by_group.setdefault(conv[1:], []).append({
+                "t": t, "uid": uid, "text": txt,
+                "toks": {x for x, _k in tokenize(txt)},
+                "q": self._is_question(txt),
+                "at": [int(x) for x in pat_at.findall(txt)
+                       if int(x) not in (uid, self.self_id)],
+                "mood": self.classify_mood(txt),
+                "prof": sum(1 for w in self.PROF_WORDS if w in low),
+                "neg": sum(1 for w in self.NEG_WORDS if w in txt),
+                "polite": sum(1 for w in self.POLITE_WORDS if w in txt),
+            })
 
         out = {}
 
         def edge(a, b):
             return out.setdefault(a, {}).setdefault(
                 b, {"g": set(), "threads": set(), "turns": 0, "at": 0,
-                    "last": 0.0})
+                    "last": 0.0, "prof": 0, "neg": 0, "polite": 0, "said": 0})
 
         for gid, rows in by_group.items():
-            rows.sort(key=lambda r: r[0])
-            gmem = {r[1] for r in rows}
-            active = []
-            threads = []               # 建过的全部线程（含已过期的）
-            seq = 0
-            for t, sender, body in rows:
-                ats = [int(x) for x in pat_at.findall(body)
-                       if int(x) not in (sender, self.self_id)]
-                # 过期的线程不再接收新消息（冷场就算结束）
-                active = [a for a in active
-                          if t - a["last"] <= self.THREAD_GAP]
-                # 统一打分：给每个活跃线程算分，取最高的那个；都不够才新建。
-                # 借 Elsner & Charniak (2008) 的分区算法——他们的做法是把新
-                # 消息加到分类器给出最高概率的 cluster，全都判否才新建。
-                # 原来我是「第一个满足条件就归入」，从不比较候选：群里同时
-                # 两段对话在聊时，必然归错。
-                best, best_s = None, 0.0
-                for a in active:
-                    sc = self._thread_score(a, sender, body, t, ats)
-                    if sc > best_s:
-                        best, best_s = a, sc
-                if best is not None and best_s >= self.THREAD_MIN_SCORE:
-                    target = best
+            rows.sort(key=lambda r: r["t"])
+            gmem = {r["uid"] for r in rows}
+            n = len(rows)
+
+            # ② 候选连线：每条消息回看前面若干条，算「像不像在回它」
+            cand = []
+            for i in range(n):
+                cur = rows[i]
+                # 「二人世界」：最近 4 条里只有这两个人在说话 → 基本就是
+                # 他们俩在聊。口语闲聊常常毫无共同词（"在吗"/"在"/"说"），
+                # 光靠语义永远连不上，这条兜住它。
+                win = {r["uid"] for r in rows[max(0, i - 4):i]}
+                win.add(cur["uid"])
+                duo = len(win) == 2
+                for j in range(i - 1, max(-1, i - self.LINK_LOOKBACK - 1), -1):
+                    gap = cur["t"] - rows[j]["t"]
+                    if gap > self.LINK_MAX_GAP:
+                        break              # 更早的只会更远
+                    sc = self._link_score(rows[j], cur, gap)
+                    # 同人连发：时间近就保底。否则他自己那几句会被切成
+                    # 另一段，这一段里就只剩他和别人的一半对话。
+                    if (rows[j]["uid"] == cur["uid"]
+                            and gap <= self.LINK_SELF_GAP):
+                        sc = max(sc, self.LINK_SELF_SCORE)
+                    elif duo and rows[j]["uid"] in win:
+                        sc += self.LINK_DUO_BONUS
+                    if sc >= self.LINK_FLOOR:
+                        cand.append((sc, i, j))
+
+            # ③ easy-first 解码：按置信度**从高到低**逐条定父。
+            #
+            # 旧版是按时间顺序逐条归线程：第 3 条判错，第 4 条看「上一条是
+            # 谁」时已经被带偏，一错到底。先定最稳的那几条，再用它们约束
+            # 模糊的那几条，错误不会连锁。
+            # （算法：TOIS《Revisiting Conversation Discourse for Dialogue
+            #   Disentanglement》的 easy-first decoding。）
+            cand.sort(key=lambda x: -x[0])
+            par = list(range(n))
+            sz = [1] * n
+
+            def find(x):
+                while par[x] != x:
+                    par[x] = par[par[x]]
+                    x = par[x]
+                return x
+
+            uids = {i: {rows[i]["uid"]} for i in range(n)}
+            linked = [False] * n
+            for sc, i, j in cand:
+                if linked[i]:
+                    continue               # 每条消息只认一个父
+                ri, rj = find(i), find(j)
+                if ri == rj:
+                    continue
+                # 发送者已经在这段对话里 → 他在接着自己那段聊，不是插话
+                eff = sc
+                if rows[i]["uid"] in uids[rj]:
+                    eff += self.LINK_CONT_BONUS
+                # 「已成段」= 这段里有 2 个人以上开过口。
+                # 不用消息条数：一个人连发三句只是「链」，还不算一段对话，
+                # 否则两人各连发两句时会被切成两段、之后互不让步（实测过）。
+                ni, nj = len(uids[ri]), len(uids[rj])
+                if ni >= 2 and nj >= 2:
+                    # 例外：两段是**同一批人**在说 → 多半是同一段被切开了
+                    # （同一对人间隔几十秒各说两句，先各自成链、再互相不许并）。
+                    # 这时按「加入」处理，不按「合并」。
+                    need = (self.LINK_JOIN_SCORE
+                            if uids[ri] == uids[rj]
+                            else self.LINK_MERGE_SCORE)
+                elif ni >= 2 or nj >= 2:
+                    need = self.LINK_JOIN_SCORE      # 一边已成段
                 else:
-                    seq += 1
-                    target = {"members": {sender}, "last": t, "counts": {},
-                              "ats": [], "tid": (gid, seq), "speaker": sender,
-                              "last_text": body,
-                              "last_q": self._is_question(body)}
-                    active.append(target)
-                    threads.append(target)
-                target["members"].add(sender)
-                target["members"] |= set(ats)
-                target["last"] = t
-                target["speaker"] = sender
-                target["last_text"] = body
-                target["last_q"] = self._is_question(body)
-                target["counts"][sender] = target["counts"].get(sender, 0) + 1
-                if ats:
-                    target["ats"].append((sender, list(ats)))
-            # 线程结束后统一结算。
-            # 为什么不边处理边记：中途才加入的人，拿不到他进来之前的轮次，
-            # 会让「一起说了几句」严重偏低（实测 4 句只记 2 句）。
-            # 现在按线程走完后的发言次数算：a 和 b 在这段对话里各说了几句，相加。
-            for th in threads:
-                mem = th["members"]
-                for a in mem:
-                    for b in mem:
+                    need = self.LINK_MIN_SCORE       # 都是散句/单人说链
+                if eff < need:
+                    continue
+                if sz[ri] < sz[rj]:
+                    par[ri] = rj
+                    sz[rj] += sz[ri]
+                    uids[rj] |= uids.pop(ri)
+                else:
+                    par[rj] = ri
+                    sz[ri] += sz[rj]
+                    uids[ri] |= uids.pop(rj)
+                linked[i] = True
+
+            # ④ 连通块 = 一段对话。线程走完后统一结算（不边处理边记：
+            #    中途才加入的人拿不到他进来之前的轮次，句数会严重偏低）。
+            comps = {}
+            for i in range(n):
+                comps.setdefault(find(i), []).append(i)
+            for root, idxs in comps.items():
+                counts, tone, ats, last = {}, {}, [], 0.0
+                for i in idxs:
+                    r = rows[i]
+                    u = r["uid"]
+                    counts[u] = counts.get(u, 0) + 1
+                    d = tone.setdefault(u, {"prof": 0, "neg": 0,
+                                            "polite": 0, "said": 0})
+                    d["prof"] += r["prof"]
+                    d["neg"] += r["neg"]
+                    d["polite"] += r["polite"]
+                    d["said"] += 1
+                    last = max(last, r["t"])
+                    for b in r["at"]:
+                        ats.append((u, b))
+                # @ 单独记：喊了没人应，也是「认识」的证据，但不是「聊过」。
+                # 所以放在「是否成段」之前——孤零零一句 @ 也要留痕。
+                for src, b in ats:
+                    if src != b:
+                        edge(src, b)["at"] += 1
+                if len(idxs) < 2:
+                    continue               # 单条独白，除了 @ 不构成关系
+                tid = (gid, root)
+                for a in counts:
+                    for b in counts:
                         if a == b:
                             continue
                         e = edge(a, b)
                         e["g"].add(gid)
-                        e["threads"].add(th["tid"])
-                        e["turns"] += (th["counts"].get(a, 0)
-                                       + th["counts"].get(b, 0))
-                        e["last"] = max(e["last"], th["last"])
-                for src, tgs in th["ats"]:
-                    for b in tgs:
-                        if src != b:
-                            edge(src, b)["at"] += 1
+                        e["threads"].add(tid)
+                        e["turns"] += counts[a] + counts[b]
+                        e["last"] = max(e["last"], last)
+                        e["prof"] += tone[a]["prof"] + tone[b]["prof"]
+                        e["neg"] += tone[a]["neg"] + tone[b]["neg"]
+                        e["polite"] += tone[a]["polite"] + tone[b]["polite"]
+                        e["said"] += tone[a]["said"] + tone[b]["said"]
             # 同群补全（最弱的边：只是在一个群里）
             for a in gmem:
                 for b in gmem:
                     if a != b:
                         edge(a, b)["g"].add(gid)
-        # 对称化：关系是双向的，但统计时「中途加入线程的人」拿不到早期轮次，
-        # 会出现 A→B 3 段、B→A 2 段。取并集补平，免得同一段关系两边说法不一。
+
+        # ⑤ 对称化：关系是双向的。@ 那条边可能只有单向（被 @ 的人一直没
+        #    说话），补成双向，免得同一段关系两边说法不一。
         for a, peers in list(out.items()):
             for b, d in list(peers.items()):
-                rev = out.get(b, {}).get(a)
-                if rev is None:
-                    out.setdefault(b, {})[a] = {
-                        "g": set(d["g"]), "threads": set(d["threads"]),
-                        "turns": d["turns"], "at": d["at"], "last": d["last"]}
-                else:
-                    d["threads"] |= rev["threads"]
-                    d["turns"] = max(d["turns"], rev["turns"])
-                    d["at"] = max(d["at"], rev["at"])
-                    d["last"] = max(d["last"], rev["last"])
+                rev = out.setdefault(b, {}).setdefault(a, {
+                    "g": set(), "threads": set(), "turns": 0, "at": 0,
+                    "last": 0.0, "prof": 0, "neg": 0, "polite": 0, "said": 0})
+                both = d["g"] | rev["g"]
+                d["g"] = rev["g"] = set(both)
+                both = d["threads"] | rev["threads"]
+                d["threads"] = rev["threads"] = set(both)
+                for k in ("turns", "at", "prof", "neg", "polite", "said"):
+                    v = max(d[k], rev[k])
+                    d[k] = rev[k] = v
+                v = max(d["last"], rev["last"])
+                d["last"] = rev["last"] = v
         self._sm_cache = out
         self._sm_key = key
         return out
@@ -1628,68 +1737,64 @@ class BotMemory:
                                         "哪", "谁", "咋", "多少", "是不是")))
 
     @staticmethod
-    def _lex_sim(a, b):
-        """两句的字面相似度（bigram Jaccard）。便宜，不用向量模型。
-
-        为什么不直接用 embedder：它对每条消息算一次太贵（2799 条 × 一次前向），
-        而这里只需要「像不像在同一话题」这种粗判断，字面重叠够用。
-        """
-        sa = {t for t, _k in tokenize(a or "")}
-        sb = {t for t, _k in tokenize(b or "")}
+    def _jaccard(sa, sb):
         if not sa or not sb:
             return 0.0
         return len(sa & sb) / float(len(sa | sb))
 
-    def _thread_score(self, th, sender, body, t, ats):
-        """一条消息属于这个线程的分数（0~1）。
+    @staticmethod
+    def _lex_sim(a, b):
+        """两句的字面相似度（bigram Jaccard）。"""
+        return Memory._jaccard({t for t, _k in tokenize(a or "")},
+                               {t for t, _k in tokenize(b or "")})
 
-        信号来自几篇工作（Elsner & Charniak 2008 的 cue 特征、Kummerfeld 2019
-        的特征集、Slack 版的 Q&A 结束标志），共同点是：**单个信号都不可靠，
-        加权组合才稳**。
+    def _link_score(self, prev, cur, gap):
+        """cur「在回」prev 的分数（0~1）。
+
+        单个信号都不可靠，加权组合才稳（Elsner & Charniak 2008 的 cue 特征）。
+        ⑦ 那组是 ChatSense (McGill 2025) 的启发式：**行为突变**——换人、
+        长度断崖、情绪翻面、标点爆发——是语义向量抓不到的边界线索。
         """
-        gap = t - th["last"]
-        body_q = self._is_question(body)
-        prev_q = bool(th.get("last_q"))
-        sim = self._lex_sim(th.get("last_text"), body)
+        same = prev["uid"] == cur["uid"]
+        sim = self._jaccard(prev["toks"], cur["toks"])
         s = 0.0
-        # ① 时间：越近越可能在聊同一段。权重刻意压得很低——实测时间+交替
-        #    两个弱信号加起来就能顶过阈值，语义根本没参与决策，结果两段
-        #    同时进行的对话被并成一段。
-        s += max(0.0, 1.0 - gap / (self.REPLY_WINDOW * 2.0)) * 0.12
-        # ② 交替：你一句我一句
-        s += 0.12 if th.get("speaker") != sender else -0.20
-        # ②b 我本来就在这段对话里：真人会接着自己那段聊，而不是插进
-        #     旁边另一段。这条是分开「交错对话」最有效的单一信号。
-        if sender in th["members"]:
-            s += 0.25
-        # ③ @：命中这个线程的人 → 强信号；@ 了线程外的人 → 在叫别人
-        if ats:
-            s += 0.40 if set(ats) & th["members"] else -0.30
-        # ④ 语义：权重最高（Gilbert 的结论是内容信号比结构信号更能说明关系）
-        s += sim * 0.60
-        # ⑤ 追问 vs 各开各的话题
-        #    两个都是问句、又有共同词（"有人打游戏吗" → "打什么游戏"）= 追问，加分
-        #    两个都是问句、毫无共同词                           = 各开各的，扣分
-        #    这条是分开「交错的两段对话」的关键
-        if prev_q and body_q:
+        # ① 时间：越近越可能（权重压得低，语义权重更高，见 ④）
+        s += max(0.0, 1.0 - gap / float(self.LINK_MAX_GAP)) * 0.10
+        # ② 换人：你一句我一句才是对话；自己连发多为补充
+        s += -0.28 if same else 0.18
+        # ③ @：直接点名回他 → 强信号；@ 了别人 → 在叫别人，不是回你
+        if cur["at"]:
+            s += 0.45 if prev["uid"] in cur["at"] else -0.22
+        # ④ 语义：权重最高（内容信号比结构信号更能说明「在说同一件事」）
+        s += sim * 0.55
+        # ⑤ 问答配对
+        if prev["q"] and cur["q"]:
+            # 都是问句：有共同词 = 追问；没有 = 各开各的话题
             s += 0.15 if sim >= 0.05 else -0.25
-        elif prev_q and not body_q and sim >= 0.03:
-            # 上一句在问、这句像在答。必须带一点共同词才算——否则任何
-            # 非问句接在问句后面都加分，会把旁边的对话抢过来
+        elif prev["q"] and not cur["q"] and sim >= 0.03:
             s += 0.12
         # ⑥ 短消息：三五个字基本是在接话
-        if len(body) <= 6:
+        if len(cur["text"]) <= 6:
             s += 0.10
+        # ⑦ 行为突变 → 更像换了话题
+        lp, lc = len(prev["text"]), len(cur["text"])
+        if max(lp, lc) >= 10 and abs(lp - lc) / float(max(lp, lc)) >= 0.75:
+            s -= 0.08                      # 长度断崖
+        a_mood, b_mood = prev["mood"], cur["mood"]
+        if ((a_mood == "愉快" and b_mood in ("低落", "不耐烦"))
+                or (b_mood == "愉快" and a_mood in ("低落", "不耐烦"))):
+            s -= 0.10                      # 情绪翻面
+        if ("？？" in cur["text"] or "!!" in cur["text"]) and sim < 0.03:
+            s -= 0.08                      # 标点爆发 + 无共同词
         return max(0.0, min(1.0, s))
 
     def tie_line(self, viewer, uid):
         """给 prompt 用：viewer 和 uid 之间是什么关系（没交集返回空）。
 
-        这个是「关系」，不是「内容」——只描述怎么认识的、来往多密，
-        不含任何一方的私密信息，所以哪个场景都能说。
+        这个是「关系」，不是「内容」——只描述怎么认识的、来往多密、说话什么
+        调子，不含任何一方的私密信息，所以哪个场景都能说。
 
-        先报「一起聊过几段」而不是「@ 过几次」：@ 是开场动作，聊起来才是
-        关系。只 @ 一次后面没接话的，说明更多是「喊了一声」。
+        先报「一起聊过几段」而不是「@ 过几次」：@ 是开场动作，聊起来才是关系。
         """
         try:
             d = (self.social_map().get(int(viewer)) or {}).get(int(uid)) or {}
@@ -1699,10 +1804,13 @@ class BotMemory:
         at = int(d.get("at") or 0)
         turns = int(d.get("turns") or 0)
         last = float(d.get("last") or 0)
-        gs = sorted(d.get("g") or [])
+        gs = sorted(d.get("g") or ())
+        prof = int(d.get("prof") or 0)
+        polite = int(d.get("polite") or 0)
+        said = int(d.get("said") or 0)
         parts = []
         # 分级：真聊过 > 只喊过 > 只在一个群
-        # （原来写成 `if th: 聊过 / elif at: 喊过`，但只要有 @ 就会建线程，
+        # （旧版写成 `if th: 聊过 / elif at: 喊过`，但只要有 @ 就会建线程，
         #  at 那条分支永远走不到——「喊了一声就走」被算成「聊过一回」。）
         if th >= 2 or (th == 1 and turns >= 4):
             parts.append("一起聊过 %d 回" % th)
@@ -1714,6 +1822,12 @@ class BotMemory:
             parts.append("聊过一两句")
         elif at:
             parts.append("喊过你 %d 次" % at)
+        # 说话的糙度：客气是距离，骂人是亲近（ACL 2012）
+        if said >= 4:
+            if prof >= 2 and (prof >= 3 or prof / float(max(1, said)) >= 0.12):
+                parts.append("说话挺糙的，不讲究")
+            elif polite >= 2 and prof == 0:
+                parts.append("说话挺客气")
         if last:
             age = time.time() - last
             if age < 3600:

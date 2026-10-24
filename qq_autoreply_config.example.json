@@ -109,8 +109,9 @@
   "reply_max_chars": 800,
   "reply": {
     "split_multiline": true,
-    "max_parts": 4,
-      "split_max_seg_chars": 25,
+    "max_parts": 12,
+      "seg_max_chars": 30,
+      "seg_min_chars": 6,
     "split_delay_sec": 0.6
   },
   "merge_window_sec": 3,

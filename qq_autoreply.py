@@ -96,10 +96,11 @@ DEFAULTS = {
     "max_parallel": 4,          # 最多同时处理几个会话
     "reply_max_chars": 800,     # 单条回复的硬上限（按句截断），实际长度由模型自己判断
     "reply": {
-        # 小女孩聊天也常把一句话拆成好几条连发，所以按换行拆开分条发更自然
+        # 小女孩聊天也常把一句话拆成好几条连发，所以按标点切开分条发更自然
         "split_multiline": True,
-        "max_parts": 4,             # 最多拆成几条，超出的并回最后一条
-        "split_max_seg_chars": 25,  # 每段超过这个字数就不拆了（长段落整条发，别刷屏）
+        "max_parts": 12,            # 最多拆成几条，超出的并回最后一条
+        "seg_max_chars": 30,        # 每条最多多少字（算标点）
+        "seg_min_chars": 6,         # 太短的碎片跟相邻段合并的门槛
         "split_delay_sec": 0.6,     # 两条之间的间隔（再加 0~0.4s 随机）
     },     # 给模型看的“最近消息”条数（含群里没@我的）
     "restore_context": True,    # 启动时从归档文档回读最近消息，恢复上下文
@@ -215,6 +216,116 @@ KAOMOJI_SYM = set("•̀́ㅂω＼￣▽≧≦╥︿´｀・∀°﹏ಥ╯╰ﾉ
 # 存进避让清单时得连着一起存，否则提示词里给模型看的是个残废。
 # 注意别把句子标点算进来——否则「…_(:3」∠)_，去睡了」会把逗号一起吞掉
 KAOMOJI_ARM = set("_^=∵∴～~*")
+
+
+# ---------- 把长回复切成一条条短消息 ----------
+# 断句用的标点：优先在句末断，其次句中，实在没标点就硬切
+REPLY_END_PUNCT = "。！？!?…～"
+REPLY_MID_PUNCT = "，,；;：:"
+
+
+def _cut_plain(s, limit, min_chars):
+    """对没有受保护片段的普通文本断句。"""
+    frags = []
+    buf = ""
+    for ch in s:
+        buf += ch
+        if ch in REPLY_END_PUNCT:
+            frags.append(buf)
+            buf = ""
+        elif ch in REPLY_MID_PUNCT and len(buf) >= limit // 2:
+            frags.append(buf)
+            buf = ""
+    if buf:
+        frags.append(buf)
+    pieces = []
+    for f in frags:
+        while len(f) > limit:
+            pieces.append(f[:limit])
+            f = f[limit:]
+        if f:
+            pieces.append(f)
+    merged = []
+    for p in pieces:
+        if not merged:
+            merged.append(p)
+            continue
+        if len(merged[-1]) + len(p) <= limit:
+            # 能装下就装下：每条尽量填满接近上限，条数最少
+            merged[-1] += p
+        elif len(p) < min_chars:
+            # 剩个两三个字的碎片单独发很难看，宁可让上一条略微超限
+            merged[-1] += p
+        else:
+            merged.append(p)
+    return merged
+
+
+def _protect_kaomoji(text):
+    """把颜文字（含首尾手臂）换成占位符，防止被从中间切开。
+
+    两个坑：
+    - 只保护 group(0) 不够，KAOMOJI_RE 匹配的是「(:3」∠)」，前后的下划线
+      是「手臂」不在匹配里，硬切会从下划线中间断开
+    - 不能用 re.sub 做替换：sub 只会替换「匹配范围」，扩展出来的手臂
+      会留在原地，拼接时手臂就被复制了一份
+    """
+    store = []
+    spans = []
+    for m in KAOMOJI_RE.finditer(text):
+        if not any(ch in KAOMOJI_SYM for ch in m.group(1)):
+            continue
+        s, e = m.start(), m.end()
+        while s > 0 and text[s - 1] in KAOMOJI_ARM:
+            s -= 1
+        while e < len(text) and text[e] in KAOMOJI_ARM:
+            e += 1
+        spans.append((s, e))
+    if not spans:
+        return text, store
+    out = []
+    pos = 0
+    for s, e in spans:
+        out.append(text[pos:s])
+        key = "\x00%d\x00" % len(store)
+        store.append(text[s:e])
+        out.append(key)
+        pos = e
+    out.append(text[pos:])
+    return "".join(out), store
+
+
+def split_short(text, max_chars=30, min_chars=6):
+    """把一段回复切成若干条短消息，每条不超过 max_chars（算标点）。
+
+    断句优先级：换行 → 句末标点 → 句中标点 → 硬切。
+    颜文字整体保护（不能从中间切开），太短的碎片跟相邻段合并。
+    """
+    if not text:
+        return []
+    limit = max(8, int(max_chars or 30))
+    t, store = _protect_kaomoji(str(text))
+    out = []
+    for para in t.split("\n"):
+        para = para.strip()
+        if not para:
+            continue
+        for chunk in re.split(r"(\x00\d+\x00)", para):
+            if not chunk:
+                continue
+            if chunk.startswith("\x00"):
+                # 颜文字是不可分割的原子，挂在前面那条尾巴上
+                if out:
+                    out[-1] += chunk
+                else:
+                    out.append(chunk)
+                continue
+            out.extend(_cut_plain(chunk, limit, min_chars))
+    res = []
+    for s in out:
+        res.append(re.sub(r"\x00(\d+)\x00",
+                           lambda m: store[int(m.group(1))], s))
+    return res
 
 
 def extract_kaomoji(text):
@@ -815,27 +926,21 @@ class AutoReply:
         return segs
 
     def _split_parts(self, text, max_parts=None):
-        """把一条回复按换行拆成几条分开发——主人本人就是「拆多条连发」的习惯。
+        """把一条回复切成若干条短消息发出去。
 
-        但只拆「真正的碎句连发」：每段都得够短（默认 25 字以内）。
-        长段落一律不拆——把一段完整的话切成三条发出去，对方看到的是
-        「卡了」「刷屏」，而真人连发是「睡了吗」「想你」这种短句。
-        （实测踩过：一句 35+53 字的话被切成三条，4 条连发更夸张）
+        主人本人就爱「拆多条连发」，所以长内容不该整坨发出去——切成一小串
+        短消息更像真人在打字。每条不超过 reply.seg_max_chars（默认 30 字，
+        算标点），最多 reply.max_parts 条。
         """
         cfg = self.cfg.get("reply") or {}
         if not cfg.get("split_multiline", True):
             return [text] if text else []
-        parts = [p.strip() for p in (text or "").split("\n")]
-        parts = [p for p in parts if p]
-        if len(parts) <= 1:
+        limit = int(cfg.get("seg_max_chars", 30) or 30)
+        parts = split_short(text, limit, int(cfg.get("seg_min_chars", 6) or 6))
+        if not parts:
             return [text] if text else []
-        # 只要有一段偏长就整条不拆：要么都拆，要么都不拆，不能拆一半
-        limit = int(cfg.get("split_max_seg_chars", 25) or 0)
-        if limit > 0 and any(len(p) > limit for p in parts):
-            return [text]
-        mp = max_parts if max_parts is not None else int(cfg.get("max_parts", 4) or 0)
+        mp = max_parts if max_parts is not None else int(cfg.get("max_parts", 12) or 12)
         if mp > 0 and len(parts) > mp:
-            # 超出的并到最后一条：用换行接，别拼成一坨
             parts = parts[:mp - 1] + ["\n".join(parts[mp - 1:])]
         return parts
 
@@ -1038,8 +1143,8 @@ class AutoReply:
                          "如果上文有没回答完的问题，可以一并回应。不要任何前缀、解释或引号。")
         else:
             lines.append("请只输出你要回复给对方的内容，不要任何前缀、解释或引号。")
-        lines.append("（写一句话或两段就够了，别写长篇大论——你是陪人聊天，不是写作文。"
-                     "也不管聊到多深，都用大肥鱼平时的口气，别突然变成在讲道理的客服。）")
+        lines.append("（想说什么就说，不用刻意写短——但要用大肥鱼平时的口气，"
+                     "别突然变成在讲道理的客服或写说明书的口气。）")
         imgs = self._list_reply_images()
         if imgs:
             lines.append("想发表情包时，在回复末尾加一个 [[img:文件名]]（一次最多一个）。"

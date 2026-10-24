@@ -2,6 +2,7 @@
   "enabled": true,
   "allowed_private": [],
   "allowed_groups": [],
+  "owner_qq": "",
   "reply_in_private": true,
   "reply_in_group_when_at": true,
   "at_reply_prefix": true,

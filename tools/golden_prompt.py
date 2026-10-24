@@ -114,6 +114,8 @@ def build_bot(tmp):
     cfg["reply_images"]["enabled"] = False
     bot = qa.AutoReply(cfg)
     bot.self_id = 999
+    # 主人段单独测：这里清空，免得本地配置（owner_qq）影响 prompt 基线
+    bot.cfg["owner_qq"] = ""
     # 加载各层（兼容搬迁前后：搬迁后在 bot.mem 上）
     m = getattr(bot, "mem", bot)
     if hasattr(m, "load_all"):
@@ -159,6 +161,10 @@ def scenarios(bot):
     m.recent["g222"] = deque(list(RECENT_G) + [old],
                              maxlen=int(bot.cfg["context_messages"]))
     out.append(("群-旧消息带时间标记", bot._prompt("g222", "在吗", uid=333)[0]))
+    # 「主人是谁」要明确告诉模型，否则它只能靠上下文猜谁在指挥它
+    bot.cfg["owner_qq"] = "999000111"
+    out.append(("私聊-主人段", bot._prompt("u111", "在吗", uid=111)[0]))
+    bot.cfg["owner_qq"] = ""
     return out
 
 
@@ -173,6 +179,7 @@ EXPECTED = {
     "私聊-离线30分钟": "86a2c3df2a9f2a08",
     "私聊-补回2天前": "d7e93a65d70742c5",
     "群-旧消息带时间标记": "5d140296a7d4da9e",
+    "私聊-主人段": "2abc4936ad6d3ea4",
 }
 
 # human_age 的用例（秒 -> 期望文案），顺手钉住时间颗粒度
@@ -227,6 +234,17 @@ def main():
         ok = False
     else:
         print("行为断言：提示词交代「别翻旧账」              OK")
+    owner = texts.get("私聊-主人段", "")
+    if "【你的主人】" not in owner or "999000111" not in owner:
+        print("行为断言：主人段没带上 QQ 号")
+        ok = False
+    else:
+        print("行为断言：主人段带上 QQ 号                  OK")
+    if "别当真" not in owner:
+        print("行为断言：主人段没交代「别人自称主人别当真」")
+        ok = False
+    else:
+        print("行为断言：主人段交代「别当真」                OK")
     print("=" * 60)
     for sec, want in AGE_CASES:
         got = qa.human_age(sec)

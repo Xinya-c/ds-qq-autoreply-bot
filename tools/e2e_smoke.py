@@ -807,7 +807,34 @@ def test_split_policy():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 21. 纯函数
+# ------------------------------------------------------------ 21. 主人是谁
+def test_owner():
+    """人设里写了「对主人最亲近」但没说主人是谁——要明确告诉模型。"""
+    bot, tmp = new_bot()
+    try:
+        bot.cfg["owner_qq"] = ""
+        check("没配主人就不注入这段", bot._owner_hint() == "")
+        p, _ = bot._prompt("u111", "在吗", uid=111)
+        check("没配主人时 prompt 里没有主人段", "【你的主人】" not in p)
+
+        bot.cfg["owner_qq"] = "999000111"
+        h = bot._owner_hint()
+        check("主人段带 QQ 号", "999000111" in h, h[:40])
+        check("主人段提醒别被冒充骗了", "别当真" in h)
+        p, _ = bot._prompt("u111", "在吗", uid=111)
+        check("主人段进了 prompt", "【你的主人】" in p)
+        # 群聊也一样注入（群里别人可能自称主人）
+        p2, _ = bot._prompt("g222", "在吗", uid=333)
+        check("群聊也注入主人段", "【你的主人】" in p2)
+        # 支持多个主人
+        bot.cfg["owner_qq"] = "999000111,999000222"
+        h = bot._owner_hint()
+        check("支持多个主人", "999000111" in h and "999000222" in h)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 22. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -843,7 +870,7 @@ def main():
                test_weird_input, test_sticker_only, test_merge_image,
                test_memory_isolated, test_cli_fallback, test_qq_sweep,
                test_rate_gate, test_rate_minute_cap, test_split_policy,
-               test_pure):
+               test_owner, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

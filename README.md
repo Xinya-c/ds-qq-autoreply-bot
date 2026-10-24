@@ -125,6 +125,35 @@ python qq_panel.py
 
 Windows 下也可以直接双击 `一键启动.bat`（会先拉起 NapCat 再启动守护进程）。
 
+### 用 CLI 后端时：登录态要同步一次
+
+CodeBuddy CLI 的登录态有个坑，**第一次用必须先同步**，否则每条回复都会报
+`Authentication required. Please use /login command`，机器人对所有人失明。
+
+原因：CLI 找凭证时只读 `workbuddy-desktop.info`，而那个文件是 WorkBuddy
+桌面端用 DPAPI **加密**存的（`$wbEncrypted`）。CLI 是独立进程，拿不到解密
+密钥，日志里会写 `[AtRestEncryption] ... category=missing-key role=cbc`。
+而你登录时 CLI 写出的是**明文 JWT**，存在另一个文件
+（`Tencent-Cloud.coding-copilot.info`）——CLI 运行时不读那个。
+
+```bash
+# 1. 登录（浏览器里选 Chinese Site）
+双击 login_codebuddy.bat
+
+# 2. 把明文登录态同步给 CLI，并上只读锁
+python tools/sync_cli_auth.py
+
+# 3. 随时查状态
+python tools/sync_cli_auth.py --check
+```
+
+`sync_cli_auth.py` 会把明文 token 复制到 CLI 实际读的文件，并设成**只读**
+（`attrib +R`）——不锁的话 WorkBuddy 桌面端几分钟后就会加密覆盖，CLI 又读
+不了。代价是 WorkBuddy 桌面端自己写不进这个文件；如果确实需要它还回去，
+跑 `--unlock`。
+
+token 有效期约 28 天，`--check` 会显示还剩几天。过期后重新登录 + 再同步一次。
+
 ## 文件说明
 
 | 文件 | 作用 |

@@ -35,13 +35,21 @@ def check(name, cond, detail=""):
 
 
 class OB:
-    """OneBot 桩：按 action 分桶记录，不真发。"""
+    """OneBot 桩：按 action 分桶记录，不真发。
 
-    def __init__(self, fail=()):
+    history 用来喂「QQ 侧历史」：{(action, id): [消息...]}。
+    """
+
+    def __init__(self, fail=(), history=None):
         self.sent = {"private": [], "group": []}
         self.fail = set(fail)
+        self.history = history or {}
 
-    def call(self, action, params):
+    def call(self, action, params, timeout=15):
+        if action in ("get_friend_msg_history", "get_group_msg_history"):
+            key = params.get("user_id") or params.get("group_id")
+            msgs = self.history.get((action, key), [])
+            return {"ok": True, "data": {"messages": list(msgs)}}
         ok = action not in self.fail
         if action == "send_private_msg":
             self.sent["private"].append(params)
@@ -568,7 +576,138 @@ def test_cli_fallback():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 17. 纯函数
+# ------------------------------------------------------------ 17. QQ 侧补捞
+def _msg(uid, self_id, ts, text, at_me=False):
+    segs = []
+    if at_me:
+        segs.append({"type": "at", "data": {"qq": str(self_id)}})
+    segs.append({"type": "text", "data": {"text": text}})
+    return {"user_id": uid, "self_id": self_id, "time": int(ts),
+            "message": segs, "raw_message": text,
+            "message_type": "private", "sub_type": "friend",
+            "sender": {"user_id": uid, "nickname": "测试甲", "card": ""}}
+
+
+def test_qq_sweep():
+    """QQ 侧补捞：捞「连本地归档都没进」的漏回消息。
+
+    判据两条都要满足：①对方说完我方隔了很久才回；②归档里附近没有它。
+    """
+    now = time.time()
+    bot, tmp = new_bot()
+    try:
+        bot.self_id = 999
+        bot.mem.self_id = 999
+        bot.cfg["sweep"]["max_age_hours"] = 168
+        bot.cfg["sweep"]["from_qq"] = True
+        bot.cfg["sweep"]["replay_gap_sec"] = 600
+        bot.cfg["allowed_private"] = [111]
+        bot.cfg["allowed_groups"] = [222]
+        # 归档里已经有「1 小时前 我: 刚说过」——所以这个会话是老会话
+        old = now - 3600
+        with open(os.path.join(bot.mem.archive_dir(), "private_111.md"),
+                  "w", encoding="utf-8") as f:
+            f.write("[%s] 测试甲(111): 在吗\n" % time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(old)))
+            f.write("[%s] 我: 刚说过\n" % time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(old + 5)))
+
+        hist = [
+            # ①隔了 11 小时我方才回 → 漏回，且归档里没有 → 该补
+            _msg(111, 999, now - 11 * 3600, "1"),
+            _msg(111, 999, now - 11 * 3600 + 60, "hello"),
+            # ②我方 5 秒后就回了 → 已回，不补
+            _msg(111, 999, now - 9 * 3600, "刚说过"),
+            _msg(999, 999, now - 9 * 3600 + 5, "收到"),
+            # ③归档里有的（1 小时前那条）→ 本地扫负责，不重复补
+            _msg(111, 999, old, "在吗"),
+            _msg(999, 999, old + 5, "刚说过"),
+            # ④QQ 系统通知 → 不补
+            _msg(111, 999, now - 8 * 3600, "请求添加你为好友"),
+            _msg(999, 999, now - 8 * 3600 + 3, "我们已成功添加为好友"),
+        ]
+        bot.ob = OB(history={("get_friend_msg_history", 111): hist})
+        captured = []
+        bot._enqueue = lambda conv, evt: captured.append((conv, evt))
+        bot._sweep_from_qq()
+        check("QQ 侧补捞：捞到了漏回的消息", len(captured) == 1,
+              "入队 %d 次" % len(captured))
+        if captured:
+            txt = captured[0][1]["message"][0]["data"]["text"]
+            check("QQ 侧补捞：内容对", txt == "1\nhello", repr(txt))
+            check("QQ 侧补捞：带了距今秒数",
+                  captured[0][1]["_stale"] > 10 * 3600)
+            check("QQ 侧补捞：标记为补回",
+                  captured[0][1].get("_replay") is True)
+
+        # 群里没 @ 我 → 不补；@ 了我 → 补
+        gh = [
+            _msg(333, 999, now - 5 * 3600, "随便聊聊"),
+            _msg(333, 999, now - 4 * 3600, "看下这个", at_me=True),
+        ]
+        bot2, tmp2 = new_bot()
+        bot2.self_id = 999
+        bot2.mem.self_id = 999
+        bot2.cfg["sweep"]["max_age_hours"] = 168
+        bot2.cfg["allowed_private"] = []
+        bot2.cfg["allowed_groups"] = [222]
+        with open(os.path.join(bot2.mem.archive_dir(), "group_222.md"),
+                  "w", encoding="utf-8") as f:
+            f.write("[%s] 我: 刚说过\n" % time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(now - 3600)))
+        bot2.ob = OB(history={("get_group_msg_history", 222): gh})
+        cap2 = []
+        bot2._enqueue = lambda conv, evt: cap2.append((conv, evt))
+        bot2._sweep_from_qq()
+        check("群里只补 @ 了我的", len(cap2) == 1, "入队 %d 次" % len(cap2))
+        if cap2:
+            check("群里补的是 @ 我 的那条",
+                  "看下这个" in cap2[0][1]["message"][0]["data"]["text"])
+
+        # 没有本地归档的新会话 → 不补（否则一次性回一堆历史）
+        bot3, tmp3 = new_bot()
+        bot3.self_id = 999
+        bot3.mem.self_id = 999
+        bot3.cfg["sweep"]["max_age_hours"] = 168
+        bot3.cfg["allowed_private"] = [222]
+        bot3.cfg["allowed_groups"] = []
+        bot3.ob = OB(history={("get_friend_msg_history", 222): [
+            _msg(222, 999, now - 3600, "在吗")]})
+        cap3 = []
+        bot3._enqueue = lambda conv, evt: cap3.append((conv, evt))
+        bot3._sweep_from_qq()
+        check("新会话不补（防刷屏）", not cap3)
+
+        # 每会话最多补 N 条
+        bot4, tmp4 = new_bot()
+        bot4.self_id = 999
+        bot4.mem.self_id = 999
+        bot4.cfg["sweep"]["max_age_hours"] = 168
+        bot4.cfg["sweep"]["max_replay_per_conv"] = 2
+        bot4.cfg["allowed_private"] = [111]
+        bot4.cfg["allowed_groups"] = []
+        with open(os.path.join(bot4.mem.archive_dir(), "private_111.md"),
+                  "w", encoding="utf-8") as f:
+            f.write("[%s] 我: 刚说过\n" % time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(now - 3600)))
+        many = [_msg(111, 999, now - (10 - i) * 3600, "第%d条" % i)
+                for i in range(6)]
+        bot4.ob = OB(history={("get_friend_msg_history", 111): many})
+        cap4 = []
+        bot4._enqueue = lambda conv, evt: cap4.append((conv, evt))
+        bot4._sweep_from_qq()
+        check("每会话最多补 N 条", len(cap4) == 1 and
+              len(cap4[0][1]["message"][0]["data"]["text"].split("\n")) == 2,
+              "补了 %s 条" % (len(cap4[0][1]["message"][0]["data"]["text"].split("\n"))
+                              if cap4 else 0))
+
+        for t in (tmp2, tmp3, tmp4):
+            shutil.rmtree(t, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 18. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -602,7 +741,8 @@ def main():
                test_group_others, test_merge, test_split, test_images,
                test_enrich, test_stale, test_sweep, test_no_reply,
                test_weird_input, test_sticker_only, test_merge_image,
-               test_memory_isolated, test_cli_fallback, test_pure):
+               test_memory_isolated, test_cli_fallback, test_qq_sweep,
+               test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

@@ -121,7 +121,11 @@
   "sweep": {
     "enabled": true,
     "max_age_hours": 24,
-    "delay_sec": 20
+    "delay_sec": 20,
+    "from_qq": true,
+    "qq_count": 50,
+    "max_replay_per_conv": 5,
+    "replay_gap_sec": 600
   },
   "proactive": {
     "enabled": true,

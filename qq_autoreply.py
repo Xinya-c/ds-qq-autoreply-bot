@@ -79,6 +79,9 @@ DEFAULTS = {
         "enabled": True,
         "max_age_hours": 24,           # 超过这个时辰的消息不补（不翻旧账）
         "delay_sec": 20,               # 连上 OneBot 后等一会儿再扫（等登录/回读稳了）
+        "from_qq": True,               # 再从 QQ 侧历史捞一遍「连归档都没进」的
+        "qq_count": 50,                # 每个会话问 QQ 要多少条历史
+        "max_replay_per_conv": 5,      # 每个会话最多补几条（防一次性刷屏）
     },
     "proactive": {                     # 群聊主动搭话：没人 @ 它也偶尔插一句
         "enabled": True,
@@ -368,6 +371,7 @@ class AutoReply:
         self.minute_window = deque()      # 最近一分钟的回复时间
         self.seen = deque(maxlen=2000)    # 已处理 message_id
         self._swept = set()               # 启动补回已入队的 key（防重复补）
+        self._arch_times = {}             # conv -> 归档里的时间戳集合（QQ 侧补捞用）
         self.seen_set = set()
         # 群聊主动搭话：计数从「本次上线」开始，不翻旧账
         self._img_cache = {}              # 表情包目录 -> (缓存时间, 清单)：目录是静态的
@@ -1436,6 +1440,237 @@ class AutoReply:
             self._sweep_unanswered()
         except Exception as e:
             log("启动补回扫描异常: %s" % e)
+        try:
+            self._sweep_from_qq()
+        except Exception as e:
+            log("QQ 侧补捞异常: %s" % e)
+
+    # ---------- 从 QQ 侧历史捞漏回消息 ----------
+    def _qq_history(self, action, ident, count):
+        """问 NapCat 要一段消息历史。ident 对好友是 user_id、对群是 group_id。"""
+        if action == "get_friend_msg_history":
+            params = {"user_id": ident, "count": count}
+        else:
+            params = {"group_id": ident, "count": count}
+        r = self.ob.call(action, params, timeout=25)
+        if not r.get("ok"):
+            raise RuntimeError(str(r.get("raw") or r.get("error"))[:120])
+        return (r.get("data") or {}).get("messages") or []
+
+    def _archive_last_ts(self, conv):
+        """本地归档里最后一条消息的时间戳（0 = 没有归档）。"""
+        try:
+            prefix = "group" if conv.startswith("g") else "private"
+            path = os.path.join(self.mem.archive_dir(),
+                                "%s_%s.md" % (prefix, conv[1:]))
+            if not os.path.exists(path):
+                return 0
+            last = 0
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for ln in f:
+                    if not ln.startswith("["):
+                        continue
+                    mm = re.match(r"^\[([^\]]+)\]", ln)
+                    if not mm:
+                        continue
+                    try:
+                        last = max(last, time.mktime(time.strptime(
+                            mm.group(1), "%Y-%m-%d %H:%M:%S")))
+                    except Exception:
+                        pass
+            return last
+        except Exception:
+            return 0
+
+    def _archive_times(self, conv):
+        """归档里所有消息的时间戳集合（用来判断某条消息到没到过守护进程）。
+
+        一条消息真被守护进程处理过，就必然在归档里留下那一刻的记录
+        （archive_incoming 是同步写的，误差在秒级）。所以「归档里附近
+        有没有记录」就是「它到没到过系统」的可靠判据。
+        """
+        key = "times:" + conv
+        cached = self._arch_times.get(key)
+        if cached is not None:
+            return cached
+        out = set()
+        try:
+            prefix = "group" if conv.startswith("g") else "private"
+            path = os.path.join(self.mem.archive_dir(),
+                                "%s_%s.md" % (prefix, conv[1:]))
+            if os.path.exists(path):
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    for ln in f:
+                        if not ln.startswith("["):
+                            continue
+                        mm = re.match(r"^\[([^\]]+)\]", ln)
+                        if not mm:
+                            continue
+                        try:
+                            out.add(time.mktime(time.strptime(
+                                mm.group(1), "%Y-%m-%d %H:%M:%S")))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        self._arch_times[key] = out
+        return out
+
+    def _sweep_from_qq(self):
+        """捞「连本地归档都没进」的漏回消息——这是以前完全补不回来的一类。
+
+        老边界：本地归档只记「到过守护进程」的消息，NapCat/QQ 不在线时
+        对方发的压根没进归档，所以启动补回扫不到（实测真会漏：对方
+        10-23 22:28 和 22:43 发的两条，机器人在 10-24 09:21 才第一次知道）。
+
+        NapCat 提供了 get_friend_msg_history / get_group_msg_history，
+        能直接问 QQ 要历史，所以补上这一道。
+
+        两道防刷屏：
+        - 只补「本地归档里已有的老会话」，新加的好友不补（否则一次性
+          把他几十条历史全回一遍）
+        - 每个会话最多补 max_replay_per_conv 条
+        """
+        cfg = self.cfg.get("sweep") or {}
+        if not cfg.get("enabled", True) or not cfg.get("from_qq", True):
+            return
+        try:
+            max_age = float(cfg.get("max_age_hours", 24) or 24) * 3600
+        except Exception:
+            max_age = 24 * 3600
+        count = int(cfg.get("qq_count", 50) or 50)
+        cap = int(cfg.get("max_replay_per_conv", 5) or 5)
+        now = time.time()
+        allowed_p = [int(x) for x in self.cfg.get("allowed_private") or []]
+        allowed_g = [int(x) for x in self.cfg.get("allowed_groups") or []]
+        if not (allowed_p or allowed_g):
+            return
+        log("QQ 侧补捞：查 %d 个私聊 + %d 个群的历史（时限 %.0f 小时，"
+            "每会话最多补 %d 条）…"
+            % (len(allowed_p), len(allowed_g), max_age / 3600.0, cap))
+        total = 0
+        for uid in allowed_p:
+            try:
+                hist = self._qq_history("get_friend_msg_history", uid, count)
+            except Exception as e:
+                log("  QQ 侧历史读取失败(%s): %s" % (uid, e))
+                continue
+            total += self._qq_replay("u%d" % uid, "private", uid, hist,
+                                     max_age, now, cap)
+        for gid in allowed_g:
+            try:
+                hist = self._qq_history("get_group_msg_history", gid, count)
+            except Exception as e:
+                log("  QQ 侧历史读取失败(群%s): %s" % (gid, e))
+                continue
+            total += self._qq_replay("g%d" % gid, "group", gid, hist,
+                                     max_age, now, cap)
+        if total:
+            log("QQ 侧补捞合计：%d 条从没进过系统的消息进入回复队列" % total)
+        else:
+            log("QQ 侧补捞完成：没有漏掉的消息")
+
+    def _qq_replay(self, conv, mtype, ident, hist, max_age, now, cap):
+        """从 QQ 历史里挑出「从没进过本地归档」的漏回消息并入队。
+
+        判定漏回靠两条独立证据，缺一不可：
+        1. **间隔**：对方说完之后，我方隔了很久才回（默认超过 10 分钟），
+           说明我方那条回复回的不是它。正常回一条（生成 + 拆分 + 连发合并）
+           都在 1 分钟内，10 分钟还早得很，基本只有「压根没收到」才会这样。
+           这条判据还顺带排掉了 QQ 的系统通知（好友申请那种后面紧跟着
+           我方自动回复，间隔只有几秒）。
+        2. **归档**：本地归档里附近没有它的记录，说明它连守护进程都没到过
+           （到过但没回上的那种由 _sweep_unanswered 负责，别重复补）。
+        """
+        if not hist:
+            return 0
+        local_last = self._archive_last_ts(conv)
+        if not local_last:
+            return 0        # 新会话：不补（否则一次性把人家几十条历史全回一遍）
+        arch = self._archive_times(conv)
+        gap_limit = float((self.cfg.get("sweep") or {}).get(
+            "replay_gap_sec", 600) or 600)
+        seq = sorted([m for m in hist if int(m.get("time") or 0)],
+                     key=lambda m: m.get("time") or 0)
+        pend = []
+        for i, m in enumerate(seq):
+            if int(m.get("user_id") or 0) == self.self_id:
+                continue
+            t = int(m.get("time") or 0)
+            if now - t > max_age:
+                continue
+            if mtype == "group" and not self._msg_at_me(m):
+                continue    # 群里没 @ 我就不用回（那是正常的）
+            if self._is_sys_hint(m):
+                continue
+            # 找它之后最近的一条我方消息：隔太久 = 我方回的不是这条
+            nxt = None
+            for j in range(i + 1, len(seq)):
+                if int(seq[j].get("user_id") or 0) == self.self_id:
+                    nxt = int(seq[j].get("time") or 0)
+                    break
+            gap = (nxt - t) if nxt else (now - t)
+            if gap <= gap_limit:
+                continue
+            # 归档里附近有记录 → 它到过守护进程，交给本地补回
+            if any(abs(t - a) <= 300 for a in arch):
+                continue
+            pend.append(m)
+        if not pend:
+            return 0
+        pend.sort(key=lambda m: m.get("time") or 0)
+        if len(pend) > cap:
+            log("  %s 有 %d 条漏回消息，只补最近 %d 条"
+                % (conv, len(pend), cap))
+            pend = pend[-cap:]
+        texts = []
+        for m in pend:
+            t = flatten_message(m.get("message")).strip()
+            if t:
+                texts.append(t)
+        if not texts:
+            return 0
+        oldest = min(int(m.get("time") or 0) for m in pend)
+        key = "qqsweep-%s-%d" % (conv, oldest)
+        if key in self._swept:
+            return 0
+        self._swept.add(key)
+        nick = (pend[-1].get("sender") or {}).get("nickname") or str(ident)
+        log("QQ 侧补捞：%s 有 %d 条从没进过系统的消息（最新 %.0f 小时前），已入队"
+            % (nick, len(texts), (now - oldest) / 3600.0))
+        self._enqueue(conv, {
+            "post_type": "message",
+            "message_type": mtype,
+            "user_id": pend[-1].get("user_id"),
+            "group_id": ident if mtype == "group" else None,
+            "message_id": key,
+            "time": int(now),
+            "message": [{"type": "text", "data": {"text": "\n".join(texts)}}],
+            "sender": pend[-1].get("sender") or {"nickname": nick},
+            "_replay": True,
+            "_stale": now - oldest,
+        })
+        return len(texts)
+
+    def _msg_at_me(self, m):
+        """这条消息里 @ 的是不是我。"""
+        for seg in (m.get("message") or []):
+            if not isinstance(seg, dict) or seg.get("type") != "at":
+                continue
+            if str((seg.get("data") or {}).get("qq")) == str(self.self_id):
+                return True
+        return False
+
+    @staticmethod
+    def _is_sys_hint(m):
+        """QQ 的系统通知（好友申请之类），不是对方在说话。"""
+        raw = str(m.get("raw_message") or "")
+        for kw in ("请求添加你为好友", "已成功添加为好友", "现在可以开始聊天",
+                   "对方撤回了一条消息", "已开启朋友验证",
+                   "以上是打招呼的内容", "被对方拒收"):
+            if kw in raw:
+                return True
+        return False
 
     def _sweep_unanswered(self):
         """扫私聊归档里「对方发过、我们没有回」的消息，走正常流程补回。

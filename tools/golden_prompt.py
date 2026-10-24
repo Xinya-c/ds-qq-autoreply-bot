@@ -20,6 +20,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from collections import deque
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -149,19 +150,29 @@ def scenarios(bot):
     out.append(("私聊-补回2天前", bot._prompt("u111", "在吗", uid=111,
                                             stale=2 * 86400 + 3600,
                                             replay=True)[0]))
+    # 旧消息要带「N 天前」标记——不然模型分不清「三天前说的」和「刚说的」，
+    # 于是抓着老话题不放（群里真踩过：隔了一天追问"你买的到底是哪把雷霆"）
+    m = getattr(bot, "mem", bot)
+    old = dict(RECENT_G[-1])
+    old["text"] = "三天前的话题"
+    old["ts"] = time.time() - 3 * 86400
+    m.recent["g222"] = deque(list(RECENT_G) + [old],
+                             maxlen=int(bot.cfg["context_messages"]))
+    out.append(("群-旧消息带时间标记", bot._prompt("g222", "在吗", uid=333)[0]))
     return out
 
 
 # 基线哈希（2026-10-23 搬迁前冻结；改动 Prompt 拼装必须有意识地更新这里）
 EXPECTED = {
-    "私聊+画像": "6e0565340e98367c",
-    "群+个人档案+群档案": "e082b1072720dd7f",
-    "群-无uid": "3072168aaf6b231c",
-    "私聊-裸@": "dec13d48bf218125",
-    "私聊-带图": "e19ef5c6bb5ef70c",
-    "私聊-上下文排除": "27360fcfa660fe25",
-    "私聊-离线30分钟": "f76a2a98d1bb06dc",
-    "私聊-补回2天前": "c83fa07005f353aa",
+    "私聊+画像": "2e2e6dd917e7f472",
+    "群+个人档案+群档案": "0d26d6d330b0f4ab",
+    "群-无uid": "d7a9e14aafc1f0fb",
+    "私聊-裸@": "f134183de50b7e1c",
+    "私聊-带图": "8b744291302cbdd3",
+    "私聊-上下文排除": "3e46a8fa52318e36",
+    "私聊-离线30分钟": "defd7afd806272e7",
+    "私聊-补回2天前": "ed525c9bfebe0ffc",
+    "群-旧消息带时间标记": "967f66fe2faf393b",
 }
 
 # human_age 的用例（秒 -> 期望文案），顺手钉住时间颗粒度
@@ -203,6 +214,19 @@ def main():
         if h != exp:
             ok = False
         print("%-14s %s  %s" % (name, h, mark))
+    # 行为断言：旧消息必须带时间标记，且提示词要交代「别翻旧账」
+    texts = dict(rows)
+    marked = texts.get("群-旧消息带时间标记", "")
+    if "（3 天前）" not in marked:
+        print("行为断言：旧消息没带「3 天前」标记")
+        ok = False
+    else:
+        print("行为断言：旧消息带「3 天前」标记              OK")
+    if "别翻旧账追问" not in marked:
+        print("行为断言：提示词没交代「别翻旧账」")
+        ok = False
+    else:
+        print("行为断言：提示词交代「别翻旧账」              OK")
     print("=" * 60)
     for sec, want in AGE_CASES:
         got = qa.human_age(sec)

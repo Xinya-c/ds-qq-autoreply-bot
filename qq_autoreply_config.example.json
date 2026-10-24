@@ -83,6 +83,9 @@
     "stage_enabled": true,
     "stage_every": 200,
     "stage_max": 0,
+    "stage_max_chars": 1200,
+    "mark_after_min": 15,
+    "restore_max_hours": 6,
     "mood_enabled": true,
     "samples": 0,
     "backlog_per_run": 0

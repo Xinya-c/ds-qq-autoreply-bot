@@ -156,6 +156,9 @@ DEFAULTS = {
         "stage_enabled": True,   # 中期记忆：每 N 条压成一段「阶段回顾」
         "stage_every": 200,
         "stage_max": 0,          # 0=压缩结果全部累积，永不丢弃；>0 则最多保留 N 段
+        "stage_max_chars": 1200, # 注入提示词的阶段回顾字数上限（磁盘上仍全留）
+        "mark_after_min": 15,    # 上下文里超过多少分钟的消息要标「N 小时前」
+        "restore_max_hours": 6,  # 启动回读最多回放多少小时内的旧消息（0=不限）
         "mood_enabled": True,    # 情绪轨迹（关键词粗判，不消耗额度）
         "samples": 0,            # Few-shot 风格样本条数（0=关闭；归档里是旧语气样本，开会把风格往回拽）
         "backlog_per_run": 0,    # 启动时最多补压多少段历史（0=不限，一次性补完）
@@ -968,13 +971,17 @@ class AutoReply:
         if ctx:
             lines.append("最近的对话（按时间顺序，可能包含别人之间的聊天，仅作理解上下文用）：")
             lines.extend(ctx)
+            lines.append("（行末的「N 小时前 / N 天前」= 这条是很久以前说的，"
+                         "别当成当前话题；对方现在说什么就回什么，别翻旧账追问。）")
             lines.append("")
         # 离线/补回的消息是「之前」发来的，别再写成「刚」
         when = "之前" if stale else "刚"
         if bare:
             lines.append("对方只 @ 了你，没有写任何文字内容。"
                          "请结合上面的上下文判断他想要什么：如果上文正在讨论某个话题或有问题没答完，"
-                         "就直接接上回；如果看不出意图，就简短回应一句自然的应答。")
+                         "就直接接上回；如果看不出意图，就简短回应一句自然的应答。"
+                         "注意：如果上下文里最近的话题已经是很久以前的了（看行末的时间标记），"
+                         "那多半已经翻篇了，别接着那个旧话题追问，问一句现在想干嘛就行。")
         elif has_image:
             lines.append("对方%s发来一张图片（内容见附图），附带文字：%s"
                          % (when, user_text or "（无文字）"))
@@ -1532,6 +1539,8 @@ class AutoReply:
         "现在没人在跟你说话，你自己判断要不要插一句：\n"
         "- 有你能自然接上的话：就用平时的口吻说一句，像群里的人那样接话。"
         "别总结、别复读别人刚说的话、别用「大家好」式开场，也别 @ 任何人；\n"
+        "- 行末标了「N 小时前 / N 天前」的是以前说过的话，早就翻篇了，"
+        "别接那个旧话题；\n"
         "- 话题你不懂、插不上嘴，或者群里在说正事／吵架／煽情、不适合你捣乱："
         "只输出「跳过」两个字，别的什么都不要输出。"
     )
@@ -1614,13 +1623,14 @@ class AutoReply:
         })
 
     def _p_lines(self, conv, n):
-        """群里最近 n 条消息（含我自己说的），一行一条。"""
+        """群里最近 n 条消息（含我自己说的），一行一条，旧的标出距今多久。"""
         out = []
+        now = time.time()
         for m in list(self.mem.recent.get(conv) or [])[-max(1, n):]:
             who = "我" if m.get("nick") == "我" else (m.get("nick") or "?")
             t = re.sub(r"\s+", " ", str(m.get("text") or "")).strip()
             if t:
-                out.append("%s: %s" % (who, t))
+                out.append("%s: %s%s" % (who, t, self.mem.age_mark(m.get("ts"), now)))
         return out
 
     def _proactive_sys(self, conv, last_text):

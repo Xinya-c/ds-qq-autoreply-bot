@@ -555,6 +555,7 @@ class BotMemory:
             "uid": evt.get("user_id"),
             "text": text or "[图片]",
             "at_me": at_me,
+            "ts": self._epoch(evt.get("time")),
         })
 
     def remember_bot(self, conv, text):
@@ -563,7 +564,7 @@ class BotMemory:
             d = deque(maxlen=int(self.cfg.get("context_messages", 12)))
             self.recent[conv] = d
         d.append({"mid": None, "nick": "我", "uid": self.self_id,
-                  "text": text, "at_me": False})
+                  "text": text, "at_me": False, "ts": time.time()})
         self.sent_since_style += 1
 
     # ---------- 归档（按会话独立文档，超 1MB 轮转）----------
@@ -692,6 +693,7 @@ class BotMemory:
                 files.append((p, conv_prefix))
         total = 0
         convs = 0
+        dropped = 0
         for path, conv_prefix in files:
             base = os.path.basename(path)
             stem = base[:-3]
@@ -710,7 +712,7 @@ class BotMemory:
                 mm = re.match(r"^\[([^\]]*)\]\s*(.+?):\s?(.*)$", ln)
                 if not mm:
                     continue
-                who, text = mm.group(2), mm.group(3)
+                ts_s, who, text = mm.group(1), mm.group(2), mm.group(3)
                 # 剥掉结构化类型标记 〔图〕 之类（老归档没有，kind 就是空）
                 kind = ""
                 km = re.search(r"〔([^〔〕]{1,6})〕\s*$", text)
@@ -723,8 +725,26 @@ class BotMemory:
                 if mu:
                     nick, uid = mu.group(1), int(mu.group(2))
                 items.append({"mid": None, "nick": nick, "uid": uid,
-                              "text": text, "at_me": False, "kind": kind})
+                              "text": text, "at_me": False, "kind": kind,
+                              # 时间戳必须留着：丢了它，模型就分不清
+                              # 「33 小时前说的」和「刚说的」，于是抓着旧话题不放
+                              "ts": self._parse_ts(ts_s)})
             if not items:
+                continue
+            # 只回读「最近还在聊的」那部分：回读两天前的老话题，等于把
+            # 已经翻篇的事重新摆到对方面前，模型会顺着它追问（「你问的
+            # 几百年前的问题，群里最近说啥你也不看」）。
+            # 更早的内容由摘要/阶段回顾/关系档案负责，不靠原文回放。
+            max_hours = float((self.cfg.get("memory") or {}).get(
+                "restore_max_hours", 6) or 0)
+            if max_hours > 0:
+                cutoff = time.time() - max_hours * 3600
+                kept = [it for it in items
+                        if it.get("ts") and it["ts"] >= cutoff]
+                dropped += len(items) - len(kept)
+                items = kept
+            if not items:
+                convs += 1
                 continue
             dq = deque(maxlen=n)
             dq.extend(items)
@@ -732,7 +752,10 @@ class BotMemory:
             total += len(items)
             convs += 1
         if total:
-            log("已回读上次聊天记录：%d 个会话 / %d 条" % (convs, total))
+            log("已回读上次聊天记录：%d 个会话 / %d 条%s"
+                % (convs, total,
+                   ("（另有 %d 条超过 %.0f 小时太旧，没回读）"
+                    % (dropped, max_hours) if dropped else "")))
 
     # ---------- 长期记忆：滚动摘要 ----------
     def _summary_path(self, conv):
@@ -1311,6 +1334,7 @@ class BotMemory:
             ex = set(excludes)
             items = [x for x in items if x.get("mid") not in ex]
         out = []
+        now = time.time()
         # 别漏了 `or 12`：slice[-0:] 等于全文，配置填 0 会把整个缓冲塞进 prompt
         for x in items[-int(self.cfg.get("context_messages", 12) or 12):]:
             tag = ""
@@ -1318,8 +1342,49 @@ class BotMemory:
                 tag = "（%s）" % x["kind"]
             elif x.get("at_me"):
                 tag = "（@了你）"
-            out.append("%s: %s%s" % (x.get("nick"), x.get("text"), tag))
+            # 旧消息标出距今多久——不然模型会把「两天前说的」当成现在的话题
+            mark = self.age_mark(x.get("ts"), now)
+            out.append("%s: %s%s%s" % (x.get("nick"), x.get("text"), tag, mark))
         return out
+
+    # ---------- 时间标记：让模型分得清「刚才」和「很久以前」 ----------
+    @staticmethod
+    def _parse_ts(s):
+        """归档里的 '[2026-10-22 16:33:36]' → 时间戳。"""
+        try:
+            return time.mktime(time.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _epoch(v):
+        try:
+            return float(v) if v else None
+        except (TypeError, ValueError):
+            return None
+
+    def age_mark(self, ts, now=None):
+        """超过阈值的旧消息加「（N 小时前）」这类标记。
+
+        这是「机器人揪着很久以前的内容不放」的直接解药：上下文里混着
+        两天前和两分钟前的消息时，光有先后顺序，模型判断不出哪个才是
+        当下的话题，只能顺着最像「被问到」的那条旧话接下去。
+        """
+        ts = self._epoch(ts)
+        if not ts:
+            return ""
+        now = now if now is not None else time.time()
+        dt = now - ts
+        if dt <= 0:
+            return ""
+        after = int((self.cfg.get("memory") or {}).get("mark_after_min", 15) or 15)
+        if dt < after * 60:
+            return ""
+        if dt < 3600:
+            return "（%d 分钟前）" % max(1, int(round(dt / 60.0)))
+        if dt < 86400:
+            return "（%d 小时前）" % int(dt // 3600)
+        return "（%d 天前）" % int(dt // 86400)
 
     # ================= 两钩子（主程序唯一入口） =================
     @staticmethod
@@ -1336,7 +1401,6 @@ class BotMemory:
             kept.append(b)
             total += len(b)
         return "".join(reversed(kept)).strip()
-
     def recall(self, conv, uid=None, text="", mid=None, excludes=None):
         """收消息时调用：一次拿齐全部记忆，返回拼 prompt 用的 dict。
 
@@ -1351,7 +1415,10 @@ class BotMemory:
             "user_profile": "",
             # 摘要/档案/风格都有上限，唯独阶段回顾默认「永不丢弃」无限累积；
             # 磁盘上照旧全留，只在注入时截断，别让 prompt 越长越大
-            "stages": self._clip_stage(self.stages.get(conv) or ""),
+            "stages": self._clip_stage(
+                self.stages.get(conv) or "",
+                int((self.cfg.get("memory") or {}).get("stage_max_chars", 1200)
+                    or 1200)),
             "style": self.style,
             "samples": self.style_samples(conv),
             "mood": self.mood_line(conv),

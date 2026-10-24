@@ -1055,7 +1055,75 @@ def test_group_layers():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 28. 纯函数
+# ------------------------------------------------------------ 28. 戳一戳
+def test_poke():
+    """戳一戳要能回应。
+
+    NapCat 把戳一戳推成 notice(notify/poke)，以前 on_event 按
+    post_type != "message" 直接丢掉 → 戳了没反应。
+    群里的戳也可能作为消息里的 poke 段出现（NapCat 段类型表里有 poke）。
+    两种都要支持。
+    """
+    bot, tmp = new_bot()
+    try:
+        bot.self_id = 999
+        bot.mem.self_id = 999
+        bot.llm_reply = FakeLLM("戳到我了", "又戳我", "群里的戳", "私聊的戳")
+
+        # ①群里的 notice(poke)，戳的是我
+        bot.on_event({
+            "post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+            "group_id": 222, "user_id": 333, "target_id": 999,
+            "time": int(time.time()),
+        })
+        check("群里的戳一戳有回应",
+              wait_for(lambda: bot.ob.sent["group"], 3.0),
+              "群发出 %d 条" % len(bot.ob.sent["group"]))
+        check("群里的戳带 @ 前缀",
+              bool(bot.ob.sent["group"])
+              and bot.ob.sent["group"][0]["message"][0].get("type") == "at")
+
+        # ②戳的是别人 → 不掺和
+        n = len(bot.ob.sent["group"])
+        bot.on_event({
+            "post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+            "group_id": 222, "user_id": 333, "target_id": 888,
+            "time": int(time.time()),
+        })
+        time.sleep(0.4)
+        check("戳别人不掺和", len(bot.ob.sent["group"]) == n)
+
+        # ③消息里带 poke 段（群戳的另一种表示）
+        bot.on_event(grp(mid="pk1", at=False, message=[
+            {"type": "poke", "data": {"id": "999", "name": "机器人"}}]))
+        check("消息里的 poke 段也认",
+              wait_for(lambda: len(bot.ob.sent["group"]) > n, 3.0),
+              "群发出 %d 条" % len(bot.ob.sent["group"]))
+
+        # ④私聊戳一戳
+        bot.on_event({
+            "post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+            "user_id": 111, "target_id": 999, "time": int(time.time()),
+        })
+        check("私聊戳一戳有回应",
+              wait_for(lambda: bot.ob.sent["private"], 3.0),
+              "私聊发出 %d 条" % len(bot.ob.sent["private"]))
+
+        # ⑤别的事件类型照旧忽略
+        bot.on_event({
+            "post_type": "notice", "notice_type": "group_increase",
+            "group_id": 222, "user_id": 333, "time": int(time.time()),
+        })
+        time.sleep(0.3)
+        check("别的 notice 不处理",
+              len(bot.ob.sent["group"]) == 2 and len(bot.ob.sent["private"]) == 1,
+              "群 %d / 私聊 %d" % (len(bot.ob.sent["group"]),
+                                   len(bot.ob.sent["private"])))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 29. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1093,7 +1161,7 @@ def main():
                test_rate_gate, test_rate_minute_cap, test_split_policy,
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
-               test_pure):
+               test_poke, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

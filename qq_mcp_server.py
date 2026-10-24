@@ -174,6 +174,9 @@ def flatten_message(msg):
                 parts.append("[文件]")
             elif t == "reply":
                 parts.append("[回复]")
+            elif t == "poke":
+                # 戳一戳：NapCat 的群戳会以这种段出现在消息里
+                parts.append("[戳一戳]")
             elif t == "markdown":
                 parts.append(data.get("content", "[Markdown]"))
             elif t == "json":

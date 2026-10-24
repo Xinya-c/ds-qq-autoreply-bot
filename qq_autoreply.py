@@ -1541,9 +1541,71 @@ class AutoReply:
         return self._api_reply(conv_key, user_text)
 
     # ---------- 事件 ----------
+    # ---------- 戳一戳 ----------
+    def _handle_notice(self, evt):
+        """处理 notice 事件，目前只管「戳一戳」。
+
+        NapCat 推的格式（从它的源码里确认的）：
+          {"post_type":"notice", "notice_type":"notify", "sub_type":"poke",
+           "group_id": 群号（私聊戳没有）, "user_id": 戳的人, "target_id": 被戳的人}
+
+        群里的戳一戳也可能作为**消息段** {"type":"poke"} 出现在消息里
+        （NapCat 的段类型表里有 poke），那条路在 _handle 的 at_me 判断里处理。
+        两种都支持，免得 NapCat 换版本就又不回了。
+        """
+        if str(evt.get("sub_type") or "") != "poke":
+            return
+        uid = evt.get("user_id")
+        target = evt.get("target_id")
+        gid = evt.get("group_id")
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return
+        if target and str(target) != str(self.self_id):
+            return          # 戳的是别人，不掺和
+        if uid == int(self.self_id or 0):
+            return
+        mtype = "group" if gid else "private"
+        if not self.mem.allowed({"message_type": mtype, "user_id": uid,
+                                 "group_id": gid}):
+            return
+        log("收到戳一戳 %s 来自 %s%s" % (mtype, uid,
+                                          ("(群 %s)" % gid) if gid else ""))
+        segs = []
+        if gid:
+            # 群里：等价于「只 @ 了我、没说话」→ 走按上下文接话那条路
+            segs.append({"type": "at", "data": {"qq": str(self.self_id)}})
+        else:
+            segs.append({"type": "text", "data": {"text": "[戳一戳]"}})
+        evt2 = {
+            "post_type": "message",
+            "message_type": mtype,
+            "user_id": uid,
+            "group_id": gid,
+            "message_id": "poke-%s-%s-%s" % (uid, gid or 0,
+                                            evt.get("time") or time.time()),
+            "time": evt.get("time") or int(time.time()),
+            "message": segs,
+            "sender": {"user_id": uid, "nickname": "某人", "card": ""},
+        }
+        try:
+            self.mem.remember_incoming(evt2)
+            if self.mem.allowed(evt2):
+                self.mem.archive_incoming(evt2)
+        except Exception as e:
+            log("  戳一戳的记忆/归档失败（不影响回复）: %s" % e)
+        self._handle(evt2)
+
     def on_event(self, evt):
         try:
-            if evt.get("post_type") != "message":
+            ptype = evt.get("post_type")
+            if ptype == "notice":
+                # 戳一戳是 notice(notify/poke)，不是 message。
+                # 以前这里按 post_type != "message" 直接丢掉，所以戳一戳永远没回应。
+                self._handle_notice(evt)
+                return
+            if ptype != "message":
                 return
             mtype = evt.get("message_type")
             uid = evt.get("user_id")
@@ -2468,8 +2530,19 @@ class AutoReply:
             # 必须 @我
             at_me = False
             for seg in (evt.get("message") or []):
-                if isinstance(seg, dict) and seg.get("type") == "at":
+                if not isinstance(seg, dict):
+                    continue
+                if seg.get("type") == "at":
                     if str((seg.get("data") or {}).get("qq")) == str(self.self_id):
+                        at_me = True
+                        break
+                elif seg.get("type") == "poke":
+                    # 群戳一戳的另一种表示：消息里带 poke 段。
+                    # 戳的是我也算「@ 了我」；字段名各版本不一，都认一下
+                    d = seg.get("data") or {}
+                    tgt = (d.get("id") or d.get("qq") or d.get("target_id")
+                           or d.get("target"))
+                    if not tgt or str(tgt) == str(self.self_id):
                         at_me = True
                         break
             if not at_me:

@@ -1331,7 +1331,7 @@ class BotMemory:
                 continue
             if exclude_conv and k == exclude_conv:
                 continue
-            body = " ".join(str(v).split())
+            body = " ".join(str(v).split()).lstrip("- ").strip()
             key = body[:40]
             if key in seen:
                 continue                  # 同一个群里的档案重复（多群同内容）
@@ -1351,7 +1351,12 @@ class BotMemory:
                 except (TypeError, ValueError):
                     continue
                 t = (m.get("text") or "").strip()
-                if t and len(t) > 1 and t not in got:
+                # 占位符（（空消息）（图片）【表情】）没信息量，带上反而是噪音
+                if not t or len(t) < 2:
+                    continue
+                if (t[0] in "（(【" and t[-1] in "）)】"):
+                    continue
+                if t not in got:
                     got.append(t)
         for t in got[-max_msgs:]:
             out.append("他最近在群里说过：%s" % t[:60])

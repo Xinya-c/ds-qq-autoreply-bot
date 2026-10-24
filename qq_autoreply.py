@@ -32,6 +32,7 @@ import base64
 import glob
 import uuid
 import threading
+import contextlib
 import subprocess
 import urllib.request
 from collections import deque
@@ -373,6 +374,41 @@ def sniff_image(raw):
     return None
 
 
+def _pid_alive(pid):
+    """进程还在不在（判断陈旧锁用）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            k = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not k:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if ctypes.windll.kernel32.GetExitCodeProcess(k, ctypes.byref(code)):
+                    return code.value == STILL_ACTIVE
+                return True
+            finally:
+                ctypes.windll.kernel32.CloseHandle(k)
+        except Exception:
+            return True          # 查不了就当还活着（保守）
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return True
+
+
 def sanitize_reply(text, max_len=800):
     """净化模型输出：去代码块/伪标签/markdown 记号、压空格、按句截断。"""
     if not text:
@@ -498,6 +534,12 @@ class AutoReply:
         self.kaomoji_hist = {}            # conv_key -> deque 最近用过的颜文字
         self.next_gap = {}                # conv_key -> 本轮要求的间隔（区间配置时随机）
         self.last_reply_at = {}           # conv_key -> ts
+        # CLI 登录态是否失效（失效 = 换模型也没用，只能重新登录或降级）
+        self._cli_auth_failed = False
+        self._auth_warned = False           # 登录失效只提醒一次，别刷屏
+        # 进程内的 CLI 互斥锁（Windows 的 msvcrt.locking 是进程级的，
+        # 同进程多线程会一起拿到锁，所以这层必须自己加）
+        self._cli_file_lock = threading.Lock()
         # 每分钟回复数按**会话**分别算：以前是全局共享的，一个活跃私聊
         # 刷屏会把群聊的额度一起吃掉，群里就发不出话来了
         self.minute_windows = {}          # conv_key -> deque 最近一分钟的回复时间
@@ -639,6 +681,80 @@ class AutoReply:
             "CODEBUDDY_DISABLE_SYSTEM_REMINDER_MD": "1",
             "DISABLE_AUTOUPDATER": "1",
         }
+
+    @contextlib.contextmanager
+    def _cli_process_lock(self, timeout=300):
+        """跨进程文件锁：同一时间只让一个 CodeBuddy CLI 实例在跑。
+
+        为什么需要：CodeBuddy CLI 把登录态存在**文件**里（~/.codebuddy），
+        多个进程并发跑时，刷新 token 会互相覆盖，写空的那份就把登录态
+        搞没了——表现为「突然所有回复都报 Authentication required」。
+        （真踩过：17:33 我起了个额外实例，17:34 起 hasSession 就变成 false
+        了，16:xx 明明还好的。）
+
+        两层保护：
+          ① 进程内 threading.Lock——Windows 的 msvcrt.locking 是**进程级**的，
+             同进程多个线程会一起拿到锁，所以必须自己先加线程锁
+          ② 跨进程文件锁——挡另一个守护进程 / WorkBuddy 自己的 CLI 实例
+             （拿不到就退化成只靠线程锁，不至于彻底不能用）
+        """
+        if not self._cli_file_lock.acquire(timeout=timeout):
+            raise TimeoutError("等待 CLI 锁超时")
+        f = None
+        try:
+            lock_path = os.path.join(BASE, ".cli.lock")
+            try:
+                # 用「原子创建锁文件」做跨进程互斥：O_CREAT|O_EXCL 保证
+                # 同一时刻只有一个进程能建成它（Windows 和 POSIX 都可靠）。
+                # 比 msvcrt.locking 稳——那个是遗留 API，行为不一致，
+                # 实测两个进程能同时拿到锁。
+                #
+                # 陈旧锁处理：进程崩了锁文件会留下，永久锁死。
+                # 用「最后修改时间」判断，不看 PID——PID 判断不可靠
+                # （Windows 上没有 PID 1，而 _pid_alive(1) 会返回 False，
+                #  那样会把别人的活锁误删）。
+                # 锁只活几秒（一次模型调用），超过 5 分钟没动就是陈旧的。
+                try:
+                    age = time.time() - os.path.getmtime(lock_path)
+                    if age > 300:
+                        log("  清理陈旧 CLI 锁（%.0f 分钟没更新）" % (age / 60.0))
+                        try:
+                            os.remove(lock_path)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                try:
+                    os.write(fd, b"%d" % os.getpid())
+                except Exception:
+                    pass
+                f = os.fdopen(fd, "r+")
+            except FileExistsError:
+                # 别的进程在跑 CLI。这个锁只用来保护登录态不被并发写坏，
+                # 并不需要严格互斥（真正防「登录态被写坏」的是「别并发跑
+                # CLI」，而那由调用方的信号量 + 这里的锁共同保证）。
+                # 所以拿不到锁就降级成「只用进程内锁」，不阻塞主流程——
+                # 宁可偶尔并发，也不要卡住不回复。
+                log("  跨进程 CLI 锁被占用（另一个进程在跑 CLI），"
+                    "本次只用进程内锁")
+                f = None
+            except (IOError, OSError) as e:
+                log("  跨进程 CLI 锁拿不到（%s），只用进程内锁" % e)
+                f = None
+            yield f
+        finally:
+            if f:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                # 释放 = 删掉锁文件（只有持有者才删）
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
+            self._cli_file_lock.release()
 
     # ---------- 图片提取（不落盘、不给模型文件权限）----------
     def _download_image(self, data):
@@ -1451,11 +1567,12 @@ class AutoReply:
                 args += ["-p", prompt, "--output-format", "json"]
 
         try:
-            p = subprocess.run(
-                args, cwd=cb.get("cwd") or ".", env=self._cli_env(),
-                input=stdin_data, capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-                timeout=float(cb["timeout"]))
+            with self._cli_process_lock():
+                p = subprocess.run(
+                    args, cwd=cb.get("cwd") or ".", env=self._cli_env(),
+                    input=stdin_data, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    timeout=float(cb["timeout"]))
         except subprocess.TimeoutExpired:
             log("CodeBuddy CLI 超时（>%ss，prompt %d 字）"
                 % (cb["timeout"], len(prompt)))
@@ -1473,6 +1590,14 @@ class AutoReply:
             raw = ((p.stderr or "") + out)[:400]
             if "429" in raw:
                 self._cli_429(model, raw)
+            elif "Authentication required" in raw or "use /login" in raw \
+                    or "no valid authSession" in raw:
+                # 登录态没了（过期 / 被别的实例清掉）。这不是模型问题，
+                # 换模型也没用——立刻标记，让调用方直接降级，别把整条
+                # 模型链都试一遍（每次都要等好几秒，纯浪费）。
+                self._cli_auth_failed = True
+                log("CLI 登录态失效（需要重新登录）：%s"
+                    % (raw[:120] or "").replace("\n", " "))
             else:
                 log("CLI 无有效输出: %s" % (raw[:200] or "").replace("\n", " "))
             return None
@@ -1518,6 +1643,8 @@ class AutoReply:
 
     def _cli_reply_locked(self, prompt, hist, image, user_text):
         text = None
+        # 登录态失效是全局问题：整个模型链都用不了，碰到一次就别试第二、第三个
+        self._cli_auth_failed = False
         for idx, m in enumerate(self._cli_ready_models()):
             if image:
                 text = self._cli_invoke(prompt, image, m)
@@ -1529,6 +1656,9 @@ class AutoReply:
             if text:
                 if idx:
                     log("  已切换到备选模型 %s，回复成功" % (m or "Auto"))
+                break
+            if self._cli_auth_failed:
+                log("  CLI 登录态失效，不再试其他模型，直接降级")
                 break
         if not text:
             return None
@@ -1613,7 +1743,18 @@ class AutoReply:
         try:
             with urllib.request.urlopen(req, timeout=float(self.llm["timeout"])) as r:
                 d = json.load(r)
-            text = d["choices"][0]["message"]["content"].strip()
+            msg = (d.get("choices") or [{}])[0].get("message") or {}
+            text = (msg.get("content") or "").strip()
+            # reasoning 模型（deepseek-flash 等）会把正文放在 reasoning_content，
+            # content 只在思考完才填。max_tokens 太小就会 content 空但思考没结束。
+            if not text:
+                rc = (msg.get("reasoning_content") or "").strip()
+                if rc:
+                    log("  直连 API：正文为空，取 reasoning_content（模型是思考型）")
+                    text = rc
+            if not text:
+                log("  直连 API 返回空正文：%s" % json.dumps(d, ensure_ascii=False)[:200])
+                return None
         except Exception as e:
             log("LLM 调用失败: %s" % e)
             return None
@@ -1648,6 +1789,11 @@ class AutoReply:
         顺序：直连 API（fallback_to_api 打开且有 Key 时）→ 额度耗尽的占位回复
         （quota_reply，留空就是干脆不回，避免刷屏）。
         """
+        if self._cli_auth_failed and not self._auth_warned:
+            self._auth_warned = True
+            log("⚠ CodeBuddy CLI 登录态已失效，正在用直连 API 兜底。"
+                "要恢复 CLI 请双击运行 login_codebuddy.bat 重新登录"
+                "（浏览器里选「Log in via Chinese Site」）。")
         if self.cfg.get("fallback_to_api", True) and self.api_key:
             log("  CLI 未出结果，改用直连 API 兜底")
             fb = user_text or ("（只@了你，没有文字）" if bare else "")
@@ -1688,14 +1834,19 @@ class AutoReply:
         try:
             uid = int(uid)
         except (TypeError, ValueError):
+            log("收到戳一戳但 user_id 不认: %s" % uid)
             return
         if target and str(target) != str(self.self_id):
+            log("收到戳一戳，但戳的是别人（%s→%s），不掺和" % (uid, target))
             return          # 戳的是别人，不掺和
         if uid == int(self.self_id or 0):
             return
         mtype = "group" if gid else "private"
         if not self.mem.allowed({"message_type": mtype, "user_id": uid,
                                  "group_id": gid}):
+            # 被白名单挡住：一定要记一笔，不然「戳了没反应」根本查不出来
+            log("收到戳一戳 %s 来自 %s，但不在白名单里，不回应"
+                % (mtype, uid))
             return
         log("收到戳一戳 %s 来自 %s%s" % (mtype, uid,
                                           ("(群 %s)" % gid) if gid else ""))
@@ -1705,6 +1856,22 @@ class AutoReply:
             segs.append({"type": "at", "data": {"qq": str(self.self_id)}})
         else:
             segs.append({"type": "text", "data": {"text": "[戳一戳]"}})
+        # 昵称：从最近的消息里查这个人的真昵称。
+        # 别用「某人」这种占位——它会被写进归档，模型就真以为对方叫「某人」
+        # （踩过：戳一戳用了「某人」当昵称，结果归档里真出现了「某人(QQ号)」，
+        #  模型就真以为对方叫「某人」了）
+        nick = ""
+        try:
+            for m in (self.mem.recent.get(self.mem.conv_of(
+                    {"message_type": mtype, "user_id": uid,
+                     "group_id": gid})) or []):
+                if str(m.get("uid")) == str(uid) and m.get("nick"):
+                    nick = m["nick"]
+                    break
+        except Exception:
+            pass
+        if not nick:
+            nick = str(uid)
         evt2 = {
             "post_type": "message",
             "message_type": mtype,
@@ -1714,7 +1881,7 @@ class AutoReply:
                                             evt.get("time") or time.time()),
             "time": evt.get("time") or int(time.time()),
             "message": segs,
-            "sender": {"user_id": uid, "nickname": "某人", "card": ""},
+            "sender": {"user_id": uid, "nickname": nick, "card": ""},
         }
         try:
             self.mem.remember_incoming(evt2)
@@ -1727,6 +1894,15 @@ class AutoReply:
     def on_event(self, evt):
         try:
             ptype = evt.get("post_type")
+            # 原始事件落盘：诊断用。有些事件（戳一戳、各种 notice）在日志里
+            # 完全看不见——因为它们没走到下面任何一个分支。全部记下来，
+            # 才能确认 NapCat 到底推了什么（格式、字段名）。
+            if ptype not in ("message",):
+                try:
+                    log("原始事件 post_type=%s: %s" % (
+                        ptype, json.dumps(evt, ensure_ascii=False)[:400]))
+                except Exception:
+                    pass
             if ptype == "notice":
                 # 戳一戳是 notice(notify/poke)，不是 message。
                 # 以前这里按 post_type != "message" 直接丢掉，所以戳一戳永远没回应。
@@ -2738,10 +2914,47 @@ class AutoReply:
                 self._p_reset(conv)
 
     # ---------- 主循环 ----------
+    def _self_check(self):
+        """启动自检：配置里的白名单是不是「假的」。
+
+        踩过的坑：隐私清洗脚本用 os.walk 遍历工作目录做批量替换，把被
+        gitignore 的本地配置也替换了——白名单里全是假号，机器人对所有
+        真人失明，但日志里只显示一串看不出问题的号。
+        所以启动时直接验一遍：号在不在、是不是明显的假号。
+        """
+        priv = self.cfg.get("allowed_private") or []
+        groups = self.cfg.get("allowed_groups") or []
+        owner = str(self.cfg.get("owner_qq") or "")
+        # 隐私清洗用的假号段
+        fake = [x for x in list(priv) + list(groups) + [owner]
+                if re.match(r"^(?:999000|900000)\d{3}$", str(x))]
+        if fake:
+            log("⚠ 白名单里出现假号 %s——这些不是真实 QQ 号，"
+                "机器人会对所有真人失明！" % ", ".join(map(str, fake)))
+            log("⚠ 可能是某个批量替换脚本误伤了本地配置，"
+                "请检查 %s" % CONFIG_PATH)
+        # 白名单里的号在归档里见过没有（说明是真人聊过的）
+        known = set()
+        try:
+            ad = self.mem.archive_dir()
+            for f in os.listdir(ad) if os.path.isdir(ad) else []:
+                m = re.match(r"^private_(\d+)\.md$", f)
+                if m:
+                    known.add(m.group(1))
+        except Exception:
+            pass
+        if known and priv:
+            unknown = [x for x in priv if str(x) not in known]
+            if unknown and len(unknown) == len(priv):
+                log("⚠ 私聊白名单里的号在归档里一个都没出现过（%s）——"
+                    "多半不是真实 QQ 号" % ", ".join(map(str, unknown)))
+        return bool(fake)
+
     def run(self):
         log("=" * 56)
         log("QQ 自动回复已启动 | 私聊白名单 %s | 群白名单 %s" % (
             self.cfg.get("allowed_private"), self.cfg.get("allowed_groups")))
+        self._self_check()
         backend = (self.cfg.get("backend") or "deepseek").lower()
         if backend == "codebuddy_cli":
             log("生成后端 CodeBuddy CLI | 模型链 %s | %s | 限流 %ss/次、%s条/分钟 | 连发合并 %ss | 并发 %s" % (

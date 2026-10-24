@@ -9,6 +9,7 @@
   python tools/e2e_smoke.py
 """
 
+import json
 import os
 import shutil
 import sys
@@ -961,11 +962,15 @@ def test_time_words():
     check("「刚才」不触发（上下文里就有）", rng("刚才") is None)
     check("没有时间词返回 None", rng("在吗") is None)
 
-    # 造归档：昨天 23:00 一条、两小时前一条
+    # 造归档：时间点必须**落在「昨晚」窗口内**（昨天 18:00 ~ 今天 06:00）。
+    # 别用 now-12h 这种相对偏移——那样跑到白天/傍晚就落到窗口外了
+    # （下午跑能过、晚上跑就挂，这种时间依赖最难查）。
     bot, tmp = new_bot()
     try:
         now = time.time()
-        yst = now - 12 * 3600
+        today0 = time.mktime(time.localtime(now)[:3] + (0, 0, 0, 0, 0, -1))
+        # 昨天 20:00 = 今天 00:00 往前 4 小时（昨晚窗口是昨天 18:00~今天 06:00）
+        yst = today0 - 4 * 3600
         p = os.path.join(bot.mem.archive_dir(), "private_111.md")
         with open(p, "w", encoding="utf-8") as f:
             f.write("[%s] 测试甲(111): 昨晚我们说的那个事\n"
@@ -1239,7 +1244,149 @@ def test_image_limits():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 30. 纯函数
+# ------------------------------------------------------------ 30. CLI 登录态与锁
+def test_cli_auth_and_lock():
+    """CLI 登录态失效时要立刻降级；CLI 调用要有跨进程互斥锁。
+
+    真踩过两个坑：
+    ① 登录态被别的 CLI 实例并发刷新搞没了（hasSession 变 false），
+       表现是所有回复都报 Authentication required。必须能识别出来、
+          立刻降级到直连 API，而不是把整条模型链都试一遍。
+    ② 多个 CLI 实例并发会互相覆盖登录态 → 用「原子创建锁文件」互斥。
+    """
+    bot, tmp = new_bot()
+    try:
+        # ① 进程内互斥：两个线程不能同时进临界区
+        marks = []
+        def worker():
+            with bot._cli_process_lock(timeout=10):
+                marks.append(time.time())
+                time.sleep(0.6)
+        ths = [threading.Thread(target=worker) for _ in range(2)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+        marks.sort()
+        check("CLI 锁：同进程两个线程互斥",
+              len(marks) == 2 and marks[1] - marks[0] >= 0.5,
+              "间隔 %.2fs" % (marks[1] - marks[0]) if len(marks) == 2 else "只有 %d 个" % len(marks))
+
+        # ② 跨进程互斥：锁文件用 O_EXCL 原子创建
+        #    用一个「存在但不是自己」的 PID 当持有者（模拟别的进程持锁）。
+        #    注意不能用不存在的 PID——那种会被当陈旧锁清掉。
+        lock = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), ".cli.lock")
+        try:
+            if os.path.exists(lock):
+                os.remove(lock)
+        except Exception:
+            pass
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(fd, b"1")
+            os.close(fd)
+            got = None
+            try:
+                with bot._cli_process_lock(timeout=2):
+                    # 拿不到跨进程锁时不阻塞（降级成只用进程内锁），
+                    # 但**不能删掉别人持有的锁**
+                    got = os.path.exists(lock)
+            except Exception:
+                got = False
+            check("CLI 锁：别的进程持锁时不删掉别人的锁", got is True,
+                  "锁还在=%s" % got)
+        finally:
+            try:
+                os.remove(lock)
+            except Exception:
+                pass
+
+        # ③ 陈旧锁（很久没更新）要能自动清理
+        try:
+            if os.path.exists(lock):
+                os.remove(lock)
+        except Exception:
+            pass
+        with open(lock, "w") as f:
+            f.write("1")
+        old = time.time() - 3600          # 一小时前（陈旧判据是 mtime）
+        try:
+            os.utime(lock, (old, old))
+        except Exception:
+            pass
+        ok = False
+        try:
+            with bot._cli_process_lock(timeout=5):
+                ok = True
+        except Exception as e:
+            ok = False
+        check("CLI 锁：陈旧锁（很久没更新）能自动清理", ok)
+        try:
+            os.remove(lock)
+        except Exception:
+            pass
+
+        # ④ 登录态失效 → 标记 + 走兜底，而不是发占位回复
+        bot2, tmp2 = new_bot()
+        try:
+            bot2.cfg["fallback_to_api"] = True     # 本地配置默认关着
+            bot2.api_key = "sk-test"
+            bot2._cli_auth_failed = False
+            bot2._auth_warned = False
+            # 模拟 CLI 返回认证失败
+            def fake_invoke(prompt=None, image=None, model=None, tools=None):
+                bot2._cli_auth_failed = True
+                return None
+            bot2._cli_invoke = fake_invoke
+            bot2._api_reply = lambda *a, **k: "直连兜底的回复"
+            # 先直接置位（_cli_invoke 只在真实调用路径里跑，这里测的是
+            # 「已知道登录态失效」时的降级与提示行为）
+            bot2._cli_auth_failed = True
+            r = bot2._last_resort("u111", "在吗")
+            check("CLI 登录态失效 → 走直连 API 兜底", r == "直连兜底的回复", repr(r))
+            check("CLI 登录态失效 → 有醒目提示",
+                  bot2._auth_warned is True)
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
+
+        # ⑤ 直连 API：reasoning 模型正文在 reasoning_content 时也要能取到
+        bot3, tmp3 = new_bot()
+        try:
+            bot3.api_key = "sk-test"
+            bot3.llm = dict(bot3.llm)
+            bot3.llm["url"] = "http://127.0.0.1:1/none"
+            # 不发真请求，只验证取正文的逻辑
+            orig = qa.urllib.request.urlopen
+
+            class FakeResp:
+                def read(self):
+                    return json.dumps({
+                        "choices": [{"message": {"content": "",
+                                                "reasoning_content": "思考出的正文"}}]
+                    }).encode()
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+            qa.urllib.request.urlopen = lambda *a, **k: FakeResp()
+            try:
+                t = bot3._api_post([{"role": "user", "content": "x"}],
+                                   "u111", "x", deque(maxlen=4))
+                check("直连 API：正文在 reasoning_content 也能取到",
+                      t == "思考出的正文", repr(t))
+            finally:
+                qa.urllib.request.urlopen = orig
+        finally:
+            shutil.rmtree(tmp3, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 31. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1277,7 +1424,8 @@ def main():
                test_rate_gate, test_rate_minute_cap, test_split_policy,
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
-               test_poke, test_image_limits, test_pure):
+               test_poke, test_image_limits, test_cli_auth_and_lock,
+               test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

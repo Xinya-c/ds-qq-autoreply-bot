@@ -36,6 +36,9 @@ qq_autoreply.pid
 # ===== 本地配置（含白名单 QQ 号，不上传）=====
 qq_autoreply_config.json
 
+# CLI 跨进程锁（运行时生成）
+.cli.lock
+
 # ===== 本地脚本/旧版备份（含个人路径，仅本地保留）=====
 login_codebuddy.bat
 qq_panel_旧版备份.py

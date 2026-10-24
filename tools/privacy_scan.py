@@ -36,6 +36,12 @@ SECRET_PAT = re.compile(
     r"(?:api[_-]?key|secret|token|password)\s*[=:]\s*[\"'][^\"'\n]{12,}[\"'])",
     re.I)
 PATH_PAT = re.compile(r"(?:[A-Z]:\\Users\\[a-z][\w]*|/c/Users/[a-z][\w]*)")
+# 隐私清洗时用的假号（999000111 / 900000001…）。这些号**不该出现在本地
+# 配置里**——真出现说明配置被批量替换脚本误伤了（机器人会对真人失明）。
+# 隐私清洗时用的假号：999000xxx（999000111 之类）和 900000xxx（900000001 之类）
+FAKE_QID_PAT = re.compile(r"\b(?:999000|900000)\d{3}\b")
+# 本地配置：被 gitignore，不在 git ls-files 里，但同样要查
+LOCAL_CFG = "qq_autoreply_config.json"
 
 
 def sh(args, **kw):
@@ -78,6 +84,49 @@ def scan_text(name, text, qids, nicks, findings):
         findings.append((name, "疑似密钥", m.group(0)[:40]))
     for m in PATH_PAT.finditer(text):
         findings.append((name, "本机路径", m.group(0)))
+
+
+def scan_local_config(qids, nicks, findings):
+    """查本地配置（被 gitignore，不在 git ls-files 里，但同样重要）。
+
+    两种查法：
+      ① 泄漏：真实 QQ 号/昵称出现在配置里 → 本地文件不算泄漏，但
+         如果配置被提交就会泄漏，所以这里只提示不报错
+      ② **污染**：假号（999000xxx / 900000xxx）出现在配置里 → 这是
+         严重问题！说明某个批量替换脚本把真号误伤成假号了，
+         机器人会对所有真人失明（白名单里没有一个真人）。
+         （真踩过：隐私清洗脚本用 os.walk 遍历工作目录，把被 gitignore
+         的本地配置也替换了）
+    """
+    p = os.path.join(BASE, LOCAL_CFG)
+    if not os.path.exists(p):
+        return
+    try:
+        t = open(p, encoding="utf-8", errors="replace").read()
+    except Exception:
+        return
+    # ① 假号污染
+    fakes = sorted(set(FAKE_QID_PAT.findall(t)))
+    if fakes:
+        findings.append((LOCAL_CFG, "假号污染",
+                         "白名单/主人里出现 %d 个假号（%s…）——"
+                         "机器人认不出任何真人！"
+                         % (len(fakes), ", ".join(fakes[:3]))))
+    # ② 白名单里一个真人都没有（更直接的判断）
+    try:
+        import json
+        c = json.load(open(p, encoding="utf-8"))
+        wl = [x for x in (c.get("allowed_private") or []) if isinstance(x, int)]
+        owner = str(c.get("owner_qq") or "")
+        if wl and not any(str(x) in qids for x in wl):
+            findings.append((LOCAL_CFG, "白名单失效",
+                             "allowed_private 里 %d 个号没有一个在归档里出现过——"
+                             "白名单是假的" % len(wl)))
+        if owner and owner not in qids:
+            findings.append((LOCAL_CFG, "主人失效",
+                             "owner_qq=%s 在归档里没出现过" % owner))
+    except Exception:
+        pass
 
 
 def scan_worktree(qids, nicks, findings):
@@ -132,6 +181,7 @@ def main():
 
     findings = []
     scan_worktree(qids, nicks, findings)
+    scan_local_config(qids, nicks, findings)
     if not a.no_history:
         scan_history(qids, nicks, findings)
 

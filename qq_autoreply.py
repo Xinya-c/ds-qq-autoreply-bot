@@ -2691,8 +2691,8 @@ class AutoReply:
         seen[str(uid)] = time.time()
         self._send_private_text(
             uid,
-            "咱俩还不是好友呢，我这边只跟好友聊天。\n"
-            "你要是想聊，先加个好友吧——加了我会跟你打招呼的。")
+            "我主人不让我和陌生人聊天，\n"
+            "加我好友我去跟他说。")
 
     def _handle_notice(self, evt):
         """处理 notice 事件，目前只管「戳一戳」。

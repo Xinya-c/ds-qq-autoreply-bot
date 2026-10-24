@@ -1936,10 +1936,11 @@ def test_nonfriend_msg():
         bot._handle_stranger_msg(priv2(777))
         sent = [p for p in bot.ob.sent["private"] if p.get("user_id") == 777]
         check("非好友：会回一句引导（不是完全不理）", len(sent) == 1, str(len(sent)))
-        check("非好友：提示他先加好友",
-              sent and ("不是好友" in sent[0]["message"][0]["data"]["text"]
-                        or "加个好友" in sent[0]["message"][0]["data"]["text"]),
-              sent[0]["message"][0]["data"]["text"] if sent else "")
+        said = sent[0]["message"][0]["data"]["text"] if sent else ""
+        check("非好友：说的是「主人不让」，理由归到主人身上",
+              "主人" in said and "不让" in said, said.replace("\n", " "))
+        check("非好友：让他加好友，并说会去问主人",
+              "加我好友" in said and "说" in said, said.replace("\n", " "))
         check("非好友：不进回复队列（不真聊）", len(queued) == 0, str(len(queued)))
         check("非好友：不登记 stranger 状态（加好友后走正常流程）",
               not bot._stranger_get(777))

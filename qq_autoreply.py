@@ -23,6 +23,7 @@ QQ 自动回复守护进程（白名单 + 大模型生成）
 import os
 import re
 import sys
+import io
 import json
 import time
 import queue
@@ -128,9 +129,15 @@ DEFAULTS = {
     ),
     "media": {
         "enabled": True,
-        "max_bytes": 2097152,     # 单张图片上限 2MB，超过则只当文字处理
+        "max_bytes": 10485760,    # 单张图片下载上限 10MB，超过则只当文字处理
         "max_images": 1,          # 每条消息最多带 1 张图
         "save_dir": "",           # 空 = qq_messages/attachments
+        # 送给模型前先缩一缩：多模态 API 对 base64 图片有硬上限（10MB 原图
+        # 编出来 13MB，下游会拒），而且长边超过 ~1568px 服务端也会自己缩。
+        # 这里的规则是「宽高都不超过 max_edge，且总字节不超过 max_out_bytes」。
+        "max_edge": 1568,
+        "max_out_bytes": 1500000,
+        "jpeg_quality": 82,
     },
     "archive": {
         "enabled": True,
@@ -635,16 +642,20 @@ class AutoReply:
 
     # ---------- 图片提取（不落盘、不给模型文件权限）----------
     def _download_image(self, data):
-        """把图片段取成二进制，做大小与格式校验；返回 (raw, mime) 或 None。"""
+        """把图片段取成二进制，做大小与格式校验；返回 (raw, mime) 或 None。
+
+        超过 media.max_bytes 只是「不下载」——图片本身还在，只是机器人看不见。
+        日志要把原因分开写：格式不符 vs 太大，不然排查时看不出是哪一种。
+        """
         cfg = self.cfg.get("media") or {}
-        limit = int(cfg.get("max_bytes", 2097152))
+        limit = int(cfg.get("max_bytes", 10485760))
         url = data.get("url") or ""
         f = data.get("file") or ""
         raw = None
         try:
             if url.startswith("http"):
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=20) as r:
+                with urllib.request.urlopen(req, timeout=30) as r:
                     raw = r.read(limit + 1)
             elif f.startswith("base64://"):
                 raw = base64.b64decode(f[len("base64://"):])
@@ -653,14 +664,105 @@ class AutoReply:
             elif f and (os.path.isabs(f) or f.startswith("/")):
                 with open(f, "rb") as fh:
                     raw = fh.read(limit + 1)
-        except Exception:
+        except Exception as e:
+            log("  图片下载失败: %s" % e)
             return None
-        if not raw or len(raw) > limit:
+        if not raw:
+            log("  图片取不到内容（url/file 都是空的？）")
+            return None
+        if len(raw) > limit:
+            log("  图片太大被拒：%.1fMB > 上限 %.1fMB"
+                % (len(raw) / 1048576.0, limit / 1048576.0))
             return None
         mime = sniff_image(raw)
         if not mime:
+            log("  图片格式不符（不认得的格式头）")
             return None
         return raw, mime
+
+    def _fit_for_model(self, raw, mime):
+        """把图缩到模型能吃下的尺寸，返回 (raw, mime)。
+
+        为什么必须压：图片是 base64 编码后塞进 CLI 请求体的，体积要膨胀约
+        1/3（10MB 原图 → 13.3MB），下游多模态 API 对单图有硬上限，超了直接
+        报 "image too large" —— 机器人还是等于失明。所以「下载得下」不等于
+        「模型看得见」，这一步是后者的保证。
+
+        规则：宽高都不超过 media.max_edge（默认 1568px，跟主流多模态 API
+        的推荐上限一致），字节数不超过 media.max_out_bytes。
+        压不动就原样返回（宁可让下游报错，也别把图丢了）。
+        """
+        cfg = self.cfg.get("media") or {}
+        max_edge = int(cfg.get("max_edge", 1568) or 0)
+        max_out = int(cfg.get("max_out_bytes", 1500000) or 0)
+        quality = int(cfg.get("jpeg_quality", 82) or 82)
+        if not raw:
+            return None, None
+        # 已经是小图且够小 → 原样送，别白白损失画质
+        # （max_out=0 表示不限字节、max_edge=0 表示不限尺寸，任一不满足就压）
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(raw)) as im:
+                w, h = im.size
+            size_ok = (not max_out) or len(raw) <= max_out
+            dim_ok = (not max_edge) or (w <= max_edge and h <= max_edge)
+            if size_ok and dim_ok:
+                return raw, mime
+        except Exception:
+            # 认不出尺寸：至少按字节上限判断一下，别让超大图裸奔过去
+            if not max_out or len(raw) <= max_out:
+                return raw, mime
+        try:
+            from PIL import Image
+        except Exception:
+            log("  没有 PIL，无法压缩图片（%s）" % mime)
+            return raw, mime
+        try:
+            with Image.open(io.BytesIO(raw)) as im:
+                # GIF 动图只取第一帧：模型看动图本来也只看一帧
+                if getattr(im, "n_frames", 1) > 1:
+                    try:
+                        im.seek(0)
+                    except Exception:
+                        pass
+                # 透明底转白底（PNG/GIF 常见），转 JPEG 才不会黑成一片
+                if im.mode in ("RGBA", "LA", "P"):
+                    im = im.convert("RGBA")
+                    bg = Image.new("RGB", im.size, (255, 255, 255))
+                    bg.paste(im, mask=im.split()[-1])
+                    im = bg
+                else:
+                    im = im.convert("RGB")
+                if max_edge and max(im.size) > max_edge:
+                    im.thumbnail((max_edge, max_edge), Image.LANCZOS)
+                out = io.BytesIO()
+                im.save(out, format="JPEG", quality=quality, optimize=True)
+                data = out.getvalue()
+                # 还是太大就一路降质量
+                q = quality
+                while max_out and len(data) > max_out and q > 40:
+                    q -= 10
+                    out = io.BytesIO()
+                    im.save(out, format="JPEG", quality=q, optimize=True)
+                    data = out.getvalue()
+                if max_out and len(data) > max_out:
+                    # 质量不能再降了，改缩尺寸
+                    w, h = im.size
+                    scale = (max_out / float(len(data))) ** 0.5
+                    nw, nh = max(64, int(w * scale)), max(64, int(h * scale))
+                    im = im.resize((nw, nh), Image.LANCZOS)
+                    out = io.BytesIO()
+                    im.save(out, format="JPEG", quality=q, optimize=True)
+                    data = out.getvalue()
+                if len(data) < len(raw):
+                    log("  图片已压缩：%.1fMB → %.1fMB（%dx%d，JPEG q%d）"
+                        % (len(raw) / 1048576.0, len(data) / 1048576.0,
+                           im.size[0], im.size[1], q))
+                    return data, "image/jpeg"
+                return raw, mime
+        except Exception as e:
+            log("  图片压缩失败（按原图送）: %s" % e)
+            return raw, mime
 
     def _save_bytes(self, raw, conv_key, ext, sub):
         """把收到的文件/语音原样存到 qq_messages/<sub>/ 下。"""
@@ -755,11 +857,13 @@ class AutoReply:
                 continue
             if got >= want:
                 break
-            got += 1
             got_img = self._download_image(seg.get("data") or {})
             if not got_img:
-                log("  图片被拒（格式不符或超过大小上限）")
+                # 原因已经在 _download_image 里写进日志了，这里不再重复。
+                # 注意：被拒的图不计入 got —— 否则第一张超限就会把同一���消息里
+                # 后面的图全跳过去（一条消息里有多张图的情况）。
                 continue
+            got += 1
             raw, mime = got_img
             path = self._save_image(raw, mime, conv_key)
             if path:
@@ -768,7 +872,10 @@ class AutoReply:
                 log("  图片已保存：%s（%s）" % (path, size_txt))
             else:
                 log("  图片保存失败，仅内存使用")
-            return {"raw": raw, "mime": mime, "path": path, "size": len(raw)}
+            # 存盘的是原图；给模型的是压缩过的（小图原样，大图缩到能送进去）
+            mraw, mmime = self._fit_for_model(raw, mime)
+            return {"raw": mraw, "mime": mmime, "path": path, "size": len(raw),
+                    "model_size": len(mraw or b"")}
         return None
 
     # ---------- 语音转文字 ----------

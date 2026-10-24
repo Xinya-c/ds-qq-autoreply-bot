@@ -65,6 +65,11 @@
   吵架时它就该闭嘴）。被 @ 回复过也会重新计数。频率太吵就调大 `min_msgs` 或
   设 `proactive.enabled: false`
 - **多媒体**：图片存盘后交给模型看内容；语音转写；文件提取文字
+- **大图也能看**：单张上限 10MB（`media.max_bytes`），但送给模型前会先缩到
+  长边 ≤ `media.max_edge`（默认 1568px）、体积 ≤ `media.max_out_bytes`
+  （默认 1.5MB）——图片是 base64 后塞进请求体的（膨胀 1/3），不缩的话
+  下游多模态 API 会直接拒，机器人等于失明。小图原样透传，不损失画质；
+  透明底 PNG 转白底 RGB（不会变黑块）；GIF 动图取第一帧
 - **表情包**：`assets/replies/` 图库 + `stickers.json` 场景标注，模型自行决定何时配图
 - **模型链**：主力模型 429（日额度耗尽）时自动顺位切备选；CLI 挂了可降级直连 API
   （prompt 过长时自动改走 stdin 传给 CLI，绕开 Windows 命令行 32767 字符上限）

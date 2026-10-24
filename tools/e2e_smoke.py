@@ -12,6 +12,7 @@
 import os
 import shutil
 import sys
+import io
 import tempfile
 import threading
 import time
@@ -1123,7 +1124,122 @@ def test_poke():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 29. 纯函数
+# ------------------------------------------------------------ 29. 图片大小与压缩
+def test_image_limits():
+    """图片上限放到 10MB，且大图要压到模型能吃下的尺寸。
+
+    用户实测：群里连发几张图全被拒，机器人对那些图等于失明。
+    两件事要同时成立：
+      ①「下载得下」——上限从 2MB 提到 10MB
+      ②「模型看得见」——图片是 base64 后塞进请求体的（膨胀 1/3），
+         下游多模态 API 对单图有硬上限，不压就会被拒（还是失明）
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        check("图片压缩（跳过：没装 PIL）", True)
+        return
+    bot, tmp = new_bot()
+    try:
+        d = tempfile.mkdtemp(prefix="qqimg2_")
+        # 一张大图：3000x2000 的噪声 JPEG（几 MB）
+        big = os.path.join(d, "big.jpg")
+        im = Image.new("RGB", (3000, 2000), (30, 90, 160))
+        px = im.load()
+        for y in range(0, 2000, 2):
+            for x in range(0, 3000, 2):
+                px[x, y] = ((x * 7) % 256, (y * 11) % 256, (x * y) % 256)
+        im.save(big, "JPEG", quality=95)
+        raw_big = open(big, "rb").read()
+        # 一张小图
+        small = os.path.join(d, "small.jpg")
+        Image.new("RGB", (600, 400), (200, 100, 50)).save(small, "JPEG")
+        raw_small = open(small, "rb").read()
+
+        # ①上限已经是 10MB
+        check("图片上限是 10MB",
+              int(bot.cfg["media"]["max_bytes"]) == 10 * 1024 * 1024,
+              str(bot.cfg["media"]["max_bytes"]))
+
+        # ②几 MB 的图不再被拒（旧上限 2MB 会拒）
+        res = bot._download_image({"file": big})
+        check("几 MB 的图能下载下来（不再被 2MB 挡掉）", res is not None,
+              "%.2fMB" % (len(raw_big) / 1048576.0))
+
+        # ③超过 10MB 的仍然拒（不能无限收）
+        bot.cfg["media"]["max_bytes"] = 1024
+        check("超过上限的图仍然被拒",
+              bot._download_image({"file": big}) is None)
+        bot.cfg["media"]["max_bytes"] = 10 * 1024 * 1024
+
+        # ④大图会被压到能送进模型的尺寸
+        out, omime = bot._fit_for_model(raw_big, "image/jpeg")
+        check("大图被压缩", len(out) < len(raw_big),
+              "%.2fMB → %.2fMB" % (len(raw_big) / 1048576.0, len(out) / 1048576.0))
+        check("压缩后不超过 media.max_out_bytes",
+              len(out) <= int(bot.cfg["media"]["max_out_bytes"]),
+              "%.2fMB" % (len(out) / 1048576.0))
+        with Image.open(io.BytesIO(out)) as x:
+            check("压缩后长边不超过 max_edge",
+                  max(x.size) <= int(bot.cfg["media"]["max_edge"]),
+                  "%dx%d" % x.size)
+
+        # ⑤base64 之后不能太大（下游硬上限在这儿）
+        import base64 as _b64
+        b64 = len(_b64.b64encode(out))
+        check("base64 后不超过 5MB（多模态 API 的常见硬上限）",
+              b64 <= 5 * 1024 * 1024, "%.2fMB" % (b64 / 1048576.0))
+
+        # ⑥小图不动（别白白损失画质）
+        out2, mime2 = bot._fit_for_model(raw_small, "image/jpeg")
+        check("小图原样送，不压缩", out2 == raw_small and mime2 == "image/jpeg")
+
+        # ⑦GIF 动图：取第一帧转 JPEG（模型看动图本来也只看一帧）
+        gif = os.path.join(d, "a.gif")
+        fr = [Image.new("P", (800, 800), i % 3) for i in range(4)]
+        fr[0].save(gif, save_all=True, append_images=fr[1:], duration=100, loop=0)
+        raw_gif = open(gif, "rb").read()
+        out3, mime3 = bot._fit_for_model(raw_gif, "image/gif")
+        with Image.open(io.BytesIO(out3)) as x:
+            check("GIF 压缩后能打开", x.size[0] > 0, "%dx%d %s" % (x.size + (x.format,)))
+
+        # ⑧透明底 PNG 不能压成黑一片
+        # （用大尺寸触发压缩路径：小图是原样透传的，不该动它）
+        png = os.path.join(d, "a.png")
+        Image.new("RGBA", (2400, 2400), (255, 0, 0, 128)).save(png)
+        raw_png = open(png, "rb").read()
+        out4, mime4 = bot._fit_for_model(raw_png, "image/png")
+        with Image.open(io.BytesIO(out4)) as x:
+            check("透明 PNG 转成白底 RGB（不是黑块）",
+                  x.mode == "RGB" and x.getpixel((0, 0))[0] > 200,
+                  "%s %s" % (x.mode, str(x.getpixel((0, 0)))))
+
+        # 小图原样透传（透明底也保留原样，不动它）
+        spng = os.path.join(d, "s.png")
+        Image.new("RGBA", (300, 300), (255, 0, 0, 128)).save(spng)
+        raw_spng = open(spng, "rb").read()
+        out4b, _ = bot._fit_for_model(raw_spng, "image/png")
+        check("小 PNG 原样透传", out4b == raw_spng)
+
+        # ⑨关掉压缩（max_out_bytes=0）→ 原样送
+        bot.cfg["media"]["max_out_bytes"] = 0
+        bot.cfg["media"]["max_edge"] = 0
+        out5, _ = bot._fit_for_model(raw_big, "image/jpeg")
+        check("关掉压缩就原样送", out5 == raw_big)
+
+        # ⑩一条消息里第一张图被拒，不该把后面的图也跳过
+        bot.cfg["media"]["max_bytes"] = 1024          # 让所有图都被拒
+        segs = [{"type": "image", "data": {"file": big}},
+                {"type": "image", "data": {"file": small}}]
+        check("被拒的图不占用 max_images 配额",
+              bot._extract_image(segs, "u111") is None)
+        bot.cfg["media"]["max_bytes"] = 10 * 1024 * 1024
+        shutil.rmtree(d, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 30. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1161,7 +1277,7 @@ def main():
                test_rate_gate, test_rate_minute_cap, test_split_policy,
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
-               test_poke, test_pure):
+               test_poke, test_image_limits, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

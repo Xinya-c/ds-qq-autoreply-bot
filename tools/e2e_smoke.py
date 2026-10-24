@@ -2558,6 +2558,29 @@ def test_person_brief():
               m.find_person("小猪佩奇在吗") == (666, "小猪佩奇"),
               str(m.find_person("小猪佩奇在吗")))
 
+        # 认人时给的内容顺序：**身份线索（最早说的）要排在最近发言前面**。
+        # 实测只给「最近说过」（全是抱怨）时模型只会说「好像有点耳熟」；
+        # 给上最早那句「你会背出师吗」才能说出「背出师表那个」。
+        m._search.recs.extend([
+            ("u77777", "2026-10-20 10:00:00", "老王", "你会背出师吗"),
+            ("u77777", "2026-10-20 10:01:00", "老王", "水浴后颜色差别不大，是哪里出问题了"),
+            ("u77777", "2026-10-20 10:02:00", "老王",
+             "09 HU7405 666:/🗝3KU3Tsujm欢每晚8点抢免单红包"),
+        ])
+        m._name_cache = None
+        m._aliases["老王"] = 77777
+        m._name_cache = None
+        brief = m.person_brief(77777, None, viewer=111)
+        idx_early = next((i for i, x in enumerate(brief) if "最开始" in x), 99)
+        idx_recent = next((i for i, x in enumerate(brief) if "最近" in x), -1)
+        check("认人：身份线索排在最近发言前面",
+              idx_early < (idx_recent if idx_recent >= 0 else 99),
+              "%d vs %d" % (idx_early, idx_recent))
+        check("认人：带上「聊过的具体事」（长句才定得住人）",
+              any("具体事" in x for x in brief), str(brief)[:120])
+        check("认人：淘口令/链接不算「具体事」",
+              not any("抢免单" in x for x in brief), str(brief)[:160])
+
         # 隐私分级：认人可以，爆料不行——按「是否在同一个场合」定
         bot.cfg["owner_qq"] = "111"
         bot.cfg["reply_images"]["enabled"] = False

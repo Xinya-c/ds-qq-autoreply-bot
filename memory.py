@@ -2003,18 +2003,10 @@ class BotMemory:
             if body:
                 out.append("他在群里是这样的：%s" % body[:140])
             break
-        # ③ 最近说过的话（私聊的只有主人能看；群里的按 scope）
-        d = self.recent.get(conv)
-        if d and scope is None:
-            said = []
-            for m in list(d)[-10:]:
-                t = (m.get("text") or "").strip()
-                if len(t) < 3 or is_placeholder(t):
-                    continue
-                said.append(t)
-            if said:
-                out.append("他最近跟你说过：%s" % " / ".join(said[-max_msgs:])[:200])
-        # ④ 群体发言 + 最早那几句
+        # ③ 先算「最早那几句」——它才是身份线索，必须排在最近发言前面。
+        #    实测：只给「他最近跟你说过」（都是抱怨：你连我名字都记不住？）
+        #    时模型只会说「好像有点印象」；给上最早那句「你会背出师吗」，
+        #    它立刻能说「背出师表那个」。顺序就是权重。
         try:
             recs = [(r[0], r[2], r[3].strip()) for r in self._search.recs]
         except Exception:
@@ -2027,11 +2019,18 @@ class BotMemory:
         def ok(c):
             return c in want
 
+        def spammy(t):
+            """淘口令 / 链接 / 二维码文本：汉字占比太低，当不了身份线索。"""
+            n = sum(1 for ch in t if "\u4e00" <= ch <= "\u9fff")
+            return n < len(t) * 0.5 or ":/" in t or "http" in t
+
         early, last, seen = [], [], set()
         for c, nick, body in recs:
             if not ok(c) or nick == "我":
                 continue
             if len(body) < 3 or is_placeholder(body) or body in seen:
+                continue
+            if spammy(body):
                 continue
             # 群里的消息要确认是这个人说的：nick 尾部的 (QQ号)
             if c.startswith("g"):
@@ -2043,10 +2042,49 @@ class BotMemory:
             if len(early) < 4:
                 early.append(body)
             last.append(body)
+        if early:
+            out.append("他最开始来找你时说的（**这几句最能说明他是谁**）：%s"
+                       % " / ".join(early)[:180])
+        # 只给「最早几句」不够：那几句常常很短（"你会背出师吗"），模型只能
+        # 说「好像有点耳熟」。再挑**内容最具体**的两句——做过的实验、问过的
+        # 问题、讲过的梗——这种才定得住人。只在主人私聊（scope=None）给。
+        if scope is None:
+            rich = []
+            for c, nick, body in recs:
+                if c != conv or nick == "我":
+                    continue
+                b = body.strip()
+                if len(b) < 10 or len(b) > 120:
+                    continue
+                if is_placeholder(b) or "attachments/" in b:
+                    continue
+                # 淘口令/链接那种垃圾：汉字占比低就别当「他聊过的具体事」
+                cjk = sum(1 for ch in b if "\u4e00" <= ch <= "\u9fff")
+                if cjk < len(b) * 0.6 or "://" in b or ":/" in b:
+                    continue
+                if b in rich:
+                    continue
+                rich.append(b)
+            rich = sorted(rich, key=len, reverse=True)[:2]
+            if rich:
+                out.append("他跟你聊过的具体事：%s" % " / ".join(rich))
+            said_n = sum(1 for c, nick, body in recs
+                         if c == conv and nick != "我" and len(body.strip()) >= 3)
+            if said_n >= 20:
+                out.append("（他跟你在私聊里说过的有 %d 条，不算陌生）" % said_n)
+        # ④ 最近说过的话（私聊的只有主人能看；群里的按 scope）
+        d = self.recent.get(conv)
+        if d and scope is None:
+            said = []
+            for m in list(d)[-10:]:
+                t = (m.get("text") or "").strip()
+                if len(t) < 3 or is_placeholder(t):
+                    continue
+                said.append(t)
+            if said:
+                out.append("他最近跟你说过：%s" % " / ".join(said[-max_msgs:])[:200])
         if last and scope is not None:
             out.append("他最近在群里说过：%s" % " / ".join(last[-max_msgs:])[:200])
-        if early:
-            out.append("他最开始跟你聊时说的是：%s" % " / ".join(early)[:180])
         return out
 
     # ---------- 关系档案 ----------

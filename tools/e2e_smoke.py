@@ -1542,6 +1542,69 @@ def test_sweep_no_repeat():
 
 
 # ------------------------------------------------------------ 32. 戳一戳不阻塞接收线程
+def test_poke_not_swept():
+    """戳一戳不能被「启动补回」当成漏回的消息。
+
+    真踩过：归档里记了 `[戳一戳]`（为了让模型知道对方戳过），启动补回
+    一扫，「最后一条『我:』之后还有对方消息」→ 判定为漏回 → 补回一句
+    「又戳。手不闲啊你。」。可用户刚打开客户端，根本没戳，回来说
+    「我没戳你」。
+    """
+    bot, tmp = new_bot()
+    try:
+        cfg = bot.cfg
+        uid = int(cfg["allowed_private"][0])     # 必须在白名单，否则补捞直接跳过
+        d = bot.mem.archive_dir()
+        os.makedirs(d, exist_ok=True)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        P = qa.POKE_MARK
+        nick = "测试甲(%d)" % uid
+        path = os.path.join(d, "private_%d.md" % uid)
+
+        def queue_of():
+            got = []
+            bot._enqueue = lambda k, e: got.append(e)
+            bot._swept.clear()
+            bot._swept_convs.clear()
+            qa_quiet = qa.log
+            qa.log = lambda *a, **k: None
+            try:
+                bot._sweep_unanswered()
+            finally:
+                qa.log = qa_quiet
+            return got
+
+        def write(body):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body)
+
+        # ① 只戳了、没说话 → 一条都不该补
+        write("[%s] 我: 在啊\n[%s] %s: %s\n[%s] %s: %s\n"
+              % (now, now, nick, P, now, nick, P))
+        got = queue_of()
+        check("戳一戳：只有戳没有话时，补回不动作", len(got) == 0,
+              "补了 %d 条" % len(got))
+
+        # ② 戳完之后说了句话 → 只补那句话
+        write("[%s] 我: 在啊\n[%s] %s: %s\n[%s] %s: 你吃饭了没\n"
+              % (now, now, nick, P, now, nick))
+        got = queue_of()
+        txt = ""
+        if got:
+            txt = got[0]["message"][0]["data"]["text"]
+        check("戳一戳：戳+真话时只补真话",
+              len(got) == 1 and P not in txt and "吃饭" in txt,
+              "补了 %d 条：%r" % (len(got), txt))
+
+        # ③ 回归：普通漏回消息照旧补
+        write("[%s] 我: 在啊\n[%s] %s: 你在干嘛\n" % (now, now, nick))
+        got = queue_of()
+        check("戳一戳：普通漏回消息仍然照补", len(got) == 1,
+              "补了 %d 条" % len(got))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_poke_not_blocking():
     """戳一戳必须入队处理，不能在 WebSocket 接收线程里同步调模型。
 
@@ -1891,7 +1954,7 @@ def main():
                test_rate_gate, test_rate_minute_cap, test_split_policy,
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
-               test_poke, test_image_limits, test_cli_auth_and_lock,
+               test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
                test_tools_fallback, test_ai_boilerplate,
                test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_cli_parallel, test_pure):
         print("--- %s ---" % fn.__name__)

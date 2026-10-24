@@ -556,6 +556,15 @@ STALE_MSG_SEC = 600
 # 远低于上限，但足够覆盖日常的中等上下文。
 CLI_STDIN_THRESHOLD = 8000
 
+# 戳一戳在归档里的占位文本。
+# 它是「动作」不是「话」——记进归档只为让模型知道对方戳过（上下文有温度），
+# 但**不能**被当成一句待回复的消息。踩过两次：
+#   ① 启动补回把它当成「漏回的消息」补回，守护进程一重启就发一句
+#      「又戳。手不闲啊你。」，可用户刚打开客户端、根本没戳；
+#   ② 模型看到归档里满屏 [戳一戳]，会以为对方一直在戳它。
+# 所以补捞时必须按这个常量跳过（见 _sweep_local）。
+POKE_MARK = "[戳一戳]"
+
 
 def human_age(sec):
     """把一段秒数说成人话，用于 prompt 里的「距今多久」。
@@ -2020,7 +2029,7 @@ class AutoReply:
             # 群里：等价于「只 @ 了我、没说话」→ 走按上下文接话那条路
             segs.append({"type": "at", "data": {"qq": str(self.self_id)}})
         else:
-            segs.append({"type": "text", "data": {"text": "[戳一戳]"}})
+            segs.append({"type": "text", "data": {"text": POKE_MARK}})
         # 昵称：从最近的消息里查这个人的真昵称。
         # 别用「某人」这种占位——它会被写进归档，模型就真以为对方叫「某人」
         # （踩过：戳一戳用了「某人」当昵称，结果归档里真出现了「某人(QQ号)」，
@@ -2609,6 +2618,15 @@ class AutoReply:
                 if mm.group(2) == "我":
                     break                   # 这条之后我们都回过，到此为止
                 pend.append((mm.group(1), mm.group(2), mm.group(3)))
+            if not pend:
+                checked += 1
+                continue
+            # 戳一戳不是「话」：它记进归档只为让模型知道上下文，但
+            # **不能当「漏回的消息」补回**——否则守护进程一重启就回一句
+            # 「又戳」，可用户刚打开客户端根本没戳（真踩过：22:00 补回了
+            # 一条 94 分钟前的 [戳一戳]，用户回「我没戳你」）。
+            pend = [(t, w, x) for t, w, x in pend
+                    if x.strip() and x.strip() != POKE_MARK]
             if not pend:
                 checked += 1
                 continue

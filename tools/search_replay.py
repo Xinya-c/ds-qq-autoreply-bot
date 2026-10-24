@@ -38,7 +38,7 @@ import re
 import sys
 from collections import Counter
 
-# 归档行：[2025-07-06 13:16:26] 好友C(999000222): 文本
+# 归档行：[2025-07-06 13:16:26] 测试甲(999000222): 文本
 LINE_RE = re.compile(r"^\[([^\]]+)\]\s*(.+?):\s?(.*)$")
 # 只认主归档文件，排除 _stage/_profile/_summary 和轮转 _N
 FILE_RE = re.compile(r"^(private|group)_(\d+)\.md$")

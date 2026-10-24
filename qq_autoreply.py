@@ -646,6 +646,9 @@ class AutoReply:
         self._tools_cool_until = 0.0
         # 非好友来消息的「已回复过」时间戳（同一人冷却期内不再回，避免复读）
         self._nf_seen = {}
+        # 防编造：上次重生成的时间（按会话冷却）、当前需要警告的会话集合
+        self._fab_at = {}
+        self._fab_warn = set()
         # 好友 ID 缓存：(拉取时间, {uid,...})。判断「是不是好友」要在每条
         # 陌生人消息上做，每次现拉一遍太浪费。
         self._friend_cache = None
@@ -1843,6 +1846,11 @@ class AutoReply:
         # 长度硬要求放**最后一行**：这是模型服从度最高的位置。
         # system_prompt 里那句「中位数 5 个字」说了也没用——隔两千多字，
         # 早被稀释了（实测中位数 18 字，真人 5 字）。
+        # 防编造：上一次生成的回复引用了「你以前说过」但归档里查不到出处，
+        # 这次明说一句。放在长度要求**之前**——长度那句必须是最后一行。
+        if conv_key in self._fab_warn:
+            lines.append("（注意：别提以前说过什么。你手头没有那些记录，现在提就是编。"
+                         "就着对方这句话回，实在想不起来就说想不起来。）")
         lines.append("（现在这条：说完就停。超过 20 个字就删到 20 字以内再发。"
                      "别补充解释，别收尾客套。）")
         out = "\n".join(lines)
@@ -2198,6 +2206,72 @@ class AutoReply:
 
     def llm_reply(self, conv_key, user_text, image=None, mid=None, bare=False,
                   excludes=None, uid=None, stale=0, replay=False, proactive=False):
+        """对外统一出口：生成完再过一道「有没有编造过去」的检查。
+
+        检查放在这里而不是 _prompt 里，是因为它需要看**生成结果**——
+        prompt 阶段还不知道模型会编什么。
+        """
+        args = (conv_key, user_text, image, mid, bare, excludes, uid, stale,
+                replay, proactive)
+        text = self._llm_reply_raw(*args)
+        try:
+            text = self._guard_fabrication(conv_key, text, args, proactive)
+        except Exception as e:
+            log("  防编造检查失败（不影响回复）: %s" % e)
+        return text
+
+    # 引用旧事的句式。只认「你」开头的——「我说过」是自己说的，不算引用对方。
+    CLAIM_RE = re.compile(
+        r"你(?:之前|上次|上回|那天|昨天|前天)?(?:说|讲|提)(?:过|起)")
+
+    def _guard_fabrication(self, conv, text, args, proactive=False):
+        """回复里引用了「你以前说过」但归档里查不到 → 带警告重生成一次。
+
+        治的是最尴尬的故障：它信誓旦旦说「你上次说你想养猫」，但你们根本
+        没聊过。这种错比答不上来更伤信任，因为它听起来笃定。
+
+        校验方式：把这条回复当查询去归档检索。引用旧事的回复，如果真有出处，
+        几乎必然能命中那条原话；一条都命中不了，基本就是编的。
+
+        宁可漏判不可误判——误判的代价是白多一次模型调用（十几秒），
+        而漏判只是一次编造（本来就会发生）。
+        """
+        cfg = self.cfg.get("guard") or {}
+        if not cfg.get("enabled", True):
+            return text
+        if not text or len(text) < 8:
+            return text
+        if not self.CLAIM_RE.search(text):
+            return text
+        # 冷却：同一会话一小时最多重生成 N 次。不设上限的话，
+        # 模型一旦习惯性引用，每次回复都要跑两遍，延迟翻倍。
+        now = time.time()
+        last = self._fab_at.get(conv) or 0.0
+        if now - last < float(cfg.get("cooldown_sec", 900) or 0):
+            return text
+        try:
+            evidence = self.mem.related(conv, text, k=2)
+        except Exception:
+            return text
+        if evidence:
+            return text                     # 有出处，是正常回忆
+        self._fab_at[conv] = now
+        log("  防编造：回复引用了以前的事，但归档里查不到出处 → 重生成一次 | %s"
+            % text[:40].replace("\n", " "))
+        self._fab_warn.add(conv)            # 让 _prompt 带上警告
+        try:
+            text2 = self._llm_reply_raw(*args)
+        finally:
+            self._fab_warn.discard(conv)
+        if not text2 or len(text2) < 2:
+            return text                     # 重生成失败就发原话，别不回
+        if self.CLAIM_RE.search(text2):
+            log("  防编造：重生成后仍在引用旧事，照发（已经尽力）")
+        return text2
+
+    def _llm_reply_raw(self, conv_key, user_text, image=None, mid=None, bare=False,
+                       excludes=None, uid=None, stale=0, replay=False,
+                       proactive=False):
         backend = (self.cfg.get("backend") or "deepseek").lower()
         if backend == "codebuddy_cli":
             if not self._cli_ready_models():

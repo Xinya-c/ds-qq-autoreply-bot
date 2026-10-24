@@ -86,7 +86,9 @@
     "stage_max": 0,
     "stage_max_chars": 1200,
     "mark_after_min": 15,
-    "restore_max_hours": 6,
+    "restore_gap_hours": 3,
+      "restore_segments": 3,
+      "restore_max_hours": 24,
     "mood_enabled": true,
     "samples": 0,
     "backlog_per_run": 0

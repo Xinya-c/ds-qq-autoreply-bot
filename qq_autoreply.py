@@ -164,7 +164,9 @@ DEFAULTS = {
         "stage_max": 0,          # 0=压缩结果全部累积，永不丢弃；>0 则最多保留 N 段
         "stage_max_chars": 1200, # 注入提示词的阶段回顾字数上限（磁盘上仍全留）
         "mark_after_min": 15,    # 上下文里超过多少分钟的消息要标「N 小时前」
-        "restore_max_hours": 6,  # 启动回读最多回放多少小时内的旧消息（0=不限）
+        "restore_gap_hours": 3,  # 相邻消息间隔超过这个小时数 = 断了一段对话
+        "restore_segments": 3,   # 私聊保留最近几段（隔夜也要记得）
+        "restore_max_hours": 24, # 群聊的时间上限（群里久远的不是当前话题）
         "mood_enabled": True,    # 情绪轨迹（关键词粗判，不消耗额度）
         "samples": 0,            # Few-shot 风格样本条数（0=关闭；归档里是旧语气样本，开会把风格往回拽）
         "backlog_per_run": 0,    # 启动时最多补压多少段历史（0=不限，一次性补完）
@@ -436,6 +438,12 @@ def resolve_api_key(llm):
 # 发来的」（NapCat/QQ 重启后 QQ 服务端会把离线消息补推上来）。给模型的
 # prompt 里会带上「距今多久」，让它自己判断该怎么回。
 STALE_MSG_SEC = 600
+
+# prompt 超过这个字符数就改走 stdin 传给 CodeBuddy CLI。
+# Windows 命令行有 32767 字符上限，超了 subprocess 直接抛
+# [WinError 206]，长上下文下每条回复都会失败。8000 是个保守值：
+# 远低于上限，但足够覆盖日常的中等上下文。
+CLI_STDIN_THRESHOLD = 8000
 
 
 def human_age(sec):
@@ -1272,8 +1280,20 @@ class AutoReply:
             args += ["--input-format", "stream-json", "--output-format", "json"]
             stdin_data = line + "\n"
         else:
-            args += ["-p", prompt, "--output-format", "json"]
             stdin_data = ""
+            # prompt 走命令行有 32767 字符上限（Windows），上下文一长就会
+            # [WinError 206]「文件名或扩展名太长」——整个调用直接失败。
+            # 所以长的改走 stdin（和带图那条同一个 stream-json 通道）。
+            # 短的仍走命令行：那条路径一直在用，不动它降低风险。
+            if len(prompt) > CLI_STDIN_THRESHOLD:
+                content = [{"type": "text", "text": prompt}]
+                line = json.dumps({"type": "user",
+                                   "message": {"role": "user", "content": content}},
+                                  ensure_ascii=False)
+                args += ["--input-format", "stream-json", "--output-format", "json"]
+                stdin_data = line + "\n"
+            else:
+                args += ["-p", prompt, "--output-format", "json"]
 
         try:
             p = subprocess.run(

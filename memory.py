@@ -196,6 +196,13 @@ def parse_dates(text, today=None):
     for kw, delta in (("大前天", 3), ("前天", 2), ("昨天", 1), ("今天", 0)):
         if kw in text:
             out.add((today - datetime.timedelta(days=delta)).isoformat())
+    # 「昨晚」「今天晚上」这类跨夜的：晚上说的、凌晨做的，落在两个日期上。
+    # 少了这一条，「我昨晚干了啥」根本触发不了日期通道（实测返回 None）。
+    if "昨晚" in text or "昨天晚上" in text or "今天晚上" in text \
+            or "今天夜里" in text or "昨天夜里" in text \
+            or "今天凌晨" in text or "昨天凌晨" in text:
+        out.add((today - datetime.timedelta(days=1)).isoformat())
+        out.add(today.isoformat())
     for s in re.findall(r"([0-9]+|[一二两三四五六七八九十]+)\s*天前", text):
         n = _cn_int(s)
         if n:
@@ -708,7 +715,9 @@ class BotMemory:
             except Exception:
                 continue
             items = []
-            for ln in lines[-n:]:
+            # 多读几行：按段切分时，最近几段合起来可能超过 context_messages，
+            # 只看最后 N 行会把前一段切掉（主人的隔夜对话就常在 N 行之外）
+            for ln in lines[-(n * 4):]:
                 mm = re.match(r"^\[([^\]]*)\]\s*(.+?):\s?(.*)$", ln)
                 if not mm:
                     continue
@@ -731,18 +740,67 @@ class BotMemory:
                               "ts": self._parse_ts(ts_s)})
             if not items:
                 continue
-            # 只回读「最近还在聊的」那部分：回读两天前的老话题，等于把
-            # 已经翻篇的事重新摆到对方面前，模型会顺着它追问（「你问的
-            # 几百年前的问题，群里最近说啥你也不看」）。
-            # 更早的内容由摘要/阶段回顾/关系档案负责，不靠原文回放。
-            max_hours = float((self.cfg.get("memory") or {}).get(
-                "restore_max_hours", 6) or 0)
-            if max_hours > 0:
-                cutoff = time.time() - max_hours * 3600
-                kept = [it for it in items
-                        if it.get("ts") and it["ts"] >= cutoff]
-                dropped += len(items) - len(kept)
-                items = kept
+            # 回读哪一段，用「对话段」而不是绝对时长来判断。
+            #
+            # 之前用「最近 N 小时」一刀切，踩了两个坑：
+            # - 群里隔了 33 小时的旧话题该忘掉（"你问的几百年前的问题"），
+            #   但主人隔了 14 小时的私聊该记得（"我昨晚干了啥"）——
+            #   同样都是"隔了很久"，性质完全不同，用小时数分不开。
+            # 所以改成：相邻消息间隔超过 restore_gap_hours 就算断了一段，
+            #   私聊保留最近若干段（我和主人上次聊到哪，隔夜也得记得），
+            #   群聊只保留最后一段（群里久远的不是当前话题）。
+            mcfg = self.cfg.get("memory") or {}
+            gap = float(mcfg.get("restore_gap_hours", 3) or 3) * 3600
+            is_priv = conv.startswith("u")
+            keep_segs = int(mcfg.get("restore_segments", 3) or 3) if is_priv else 1
+            segs = []
+            cur = []
+            prev_ts = None
+            for it in reversed(items):
+                ts = it.get("ts")
+                if prev_ts is not None and ts and prev_ts - ts > gap:
+                    segs.append(cur)
+                    cur = []
+                cur.append(it)
+                prev_ts = ts if ts else prev_ts
+            if cur:
+                segs.append(cur)
+            keep = []
+            # 条数预算按段从近到远分：每段先分到一份（后面的段少分点，
+            # 越靠后的越不重要），段里再**均匀采样**——只取头尾的话，
+            # 段中间的内容（「我把抖音接入给你」这种）会被整段漏掉，
+            # 而主人问「我昨晚干了啥」要的恰恰是整段。
+            nsegs = min(keep_segs, len(segs))
+            budget = n
+            for i, s in enumerate(segs[:nsegs]):
+                share = budget // (nsegs - i)
+                if share <= 0:
+                    break
+                if len(s) <= share:
+                    take = s
+                else:
+                    # 首尾必含、之间均匀：对话开头（「你睡了吗」）常是关键线索，
+                    # 不能因为采样而整个丢掉
+                    if share == 1:
+                        take = [s[0]]
+                    else:
+                        last = len(s) - 1
+                        take = [s[int(round(j * last / float(share - 1)))]
+                                for j in range(share)]
+                keep.extend(take)
+                budget -= len(take)
+            keep.reverse()
+            dropped += len(items) - len(keep)
+            items = keep
+            # 群聊再兜一层时间上限：万一最后一段本身就是很久以前的
+            if not is_priv:
+                max_hours = float(mcfg.get("restore_max_hours", 24) or 0)
+                if max_hours > 0:
+                    cutoff = time.time() - max_hours * 3600
+                    kept = [it for it in items
+                            if it.get("ts") and it["ts"] >= cutoff]
+                    dropped += len(items) - len(kept)
+                    items = kept
             if not items:
                 convs += 1
                 continue
@@ -754,8 +812,8 @@ class BotMemory:
         if total:
             log("已回读上次聊天记录：%d 个会话 / %d 条%s"
                 % (convs, total,
-                   ("（另有 %d 条超过 %.0f 小时太旧，没回读）"
-                    % (dropped, max_hours) if dropped else "")))
+                   ("（另有 %d 条不属于最近的对话，没回读）" % dropped
+                    if dropped else "")))
 
     # ---------- 长期记忆：滚动摘要 ----------
     def _summary_path(self, conv):

@@ -834,7 +834,98 @@ def test_owner():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 22. 纯函数
+# ------------------------------------------------------------ 22. 回读的对话段
+def test_restore_segments():
+    """回读按「对话段」切，不按绝对时长。
+
+    踩过的坑：用「最近 6 小时」一刀切，结果主人隔了 14 小时的私聊
+    （"我昨晚干了啥"）直接忘了；同一把尺子又让群里 33 小时前的老话题
+    一直抓着不放。同样是"隔了很久"，私聊和群聊性质完全不同。
+    """
+    bot, tmp = new_bot()
+    try:
+        now = time.time()
+        h = 3600
+
+        def stamp(off):
+            return time.strftime("%Y-%m-%d %H:%M:%S",
+                                 time.localtime(now - off))
+
+        # 私聊：两段（间隔 5 小时 > 3 小时的断点），两段都要在
+        p = os.path.join(bot.mem.archive_dir(), "private_111.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("[%s] 测试甲(111): 昨晚说的那句话\n" % stamp(14 * h))
+            f.write("[%s] 我: 嗯，我记得\n" % stamp(14 * h - 60))
+            f.write("[%s] 测试甲(111): 今天说的这句\n" % stamp(h))
+            f.write("[%s] 我: 这句是刚说的\n" % stamp(h - 60))
+        bot.mem.recent.clear()
+        bot.mem._restore_context()
+        ctx = bot.mem.context_lines("u111")
+        check("私聊：隔夜那段也回读了",
+              any("昨晚说的那句话" in x for x in ctx), str(ctx))
+        check("私聊：今天这段也在",
+              any("今天说的这句" in x for x in ctx))
+
+        # 群里：只保留最后一段（久远的那段不算当前话题）
+        g = os.path.join(bot.mem.archive_dir(), "group_222.md")
+        with open(g, "w", encoding="utf-8") as f:
+            f.write("[%s] 测试乙(333): 很久以前那个老话题\n" % stamp(33 * h))
+            f.write("[%s] 我: 哦\n" % stamp(33 * h - 60))
+            f.write("[%s] 测试乙(333): 刚说的这句\n" % stamp(h))
+            f.write("[%s] 我: 这句是刚说的\n" % stamp(h - 60))
+        bot.mem.recent.clear()
+        bot.mem._restore_context()
+        ctx = bot.mem.context_lines("g222")
+        check("群：久远的那段不回读",
+              not any("很久以前那个老话题" in x for x in ctx), str(ctx))
+        check("群：最后一段在",
+              any("刚说的这句" in x for x in ctx))
+
+        # 条数预算不够时，每段都要露脸（不能整段被挤掉）
+        p2 = os.path.join(bot.mem.archive_dir(), "private_222.md")
+        with open(p2, "w", encoding="utf-8") as f:
+            for i in range(40):
+                f.write("[%s] 测试甲(222): 老段第%d条\n"
+                        % (stamp(10 * h), i))
+            for i in range(40):
+                f.write("[%s] 测试甲(222): 新段第%d条\n"
+                        % (stamp(h), i))
+        bot.cfg["context_messages"] = 30
+        bot.mem.recent.clear()
+        bot.mem._restore_context()
+        ctx = bot.mem.context_lines("u222")
+        check("预算不够时老段也露脸",
+              any("老段第0条" in x for x in ctx),
+              "共 %d 条" % len(ctx))
+        check("新段也在",
+              any("新段第39条" in x for x in ctx))
+        check("总量不超上限", len(ctx) <= 30, "共 %d 条" % len(ctx))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 23. 「昨晚」认得吗
+def test_last_night_dates():
+    """「昨晚」必须能触发日期通道——它跨夜，涉及两个日期。"""
+    import memory as M
+    import datetime
+    today = datetime.date.today()
+    y = (today - datetime.timedelta(days=1)).isoformat()
+    t = today.isoformat()
+    check("「昨晚」能解析出日期",
+          M.parse_dates("我昨晚干了啥") == {y, t},
+          str(M.parse_dates("我昨晚干了啥")))
+    check("「昨天晚上」也认",
+          M.parse_dates("昨天晚上说了啥") == {y, t})
+    check("「今天晚上」认今天",
+          M.parse_dates("今天晚上有空吗") == {y, t})
+    check("「前天」还是原来那样",
+          M.parse_dates("前天") == {(today - datetime.timedelta(days=2)).isoformat()})
+    check("没有日期词返回 None",
+          M.parse_dates("在吗") is None)
+
+
+# ------------------------------------------------------------ 24. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -870,7 +961,8 @@ def main():
                test_weird_input, test_sticker_only, test_merge_image,
                test_memory_isolated, test_cli_fallback, test_qq_sweep,
                test_rate_gate, test_rate_minute_cap, test_split_policy,
-               test_owner, test_pure):
+               test_owner, test_restore_segments, test_last_night_dates,
+               test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

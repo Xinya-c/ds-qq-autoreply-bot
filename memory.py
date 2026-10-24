@@ -1306,6 +1306,57 @@ class BotMemory:
                 break
         return ["- %s - %s - %s" % e for e in picked[:limit]]
 
+    def cross_context(self, uid, exclude_conv=None, max_profiles=3, max_msgs=4):
+        """把「这个人在别的场合」的信息拼起来，私聊时注入。
+
+        为什么需要：群里的 conv 是 g<群号>，私聊是 u<QQ>，两本完全独立的账。
+        他在群里说「我养了只猫叫豆豆」，私聊时机器人不知道——同一件事要
+        重新说一遍，很出戏。
+
+        不新建存储、不动 conv 结构（那会影响补捞、检索索引、档案全套），
+        只做一层**读视图**：把已有的群内个人档案和各会话 recent 里的发言
+        捞出来拼在一起。
+
+        两处都从内存读，不扫文件、不花额度。
+        """
+        out = []
+        try:
+            tag = "|u%d" % int(uid)
+        except (TypeError, ValueError):
+            return out
+        seen = set()
+        # ① 各群里的个人档案
+        for k, v in self.user_profile.items():
+            if not k.endswith(tag) or not (v or "").strip():
+                continue
+            if exclude_conv and k == exclude_conv:
+                continue
+            body = " ".join(str(v).split())
+            key = body[:40]
+            if key in seen:
+                continue                  # 同一个群里的档案重复（多群同内容）
+            seen.add(key)
+            out.append("他在别处提过：%s" % body)
+            if len(out) >= max_profiles:
+                break
+        # ② 他在各群最近说的话（有人味，比档案更像"认识这个人"）
+        got = []
+        for conv, d in list(self.recent.items()):
+            if not conv.startswith("g") or conv == exclude_conv or not d:
+                continue
+            for m in list(d)[-20:]:
+                try:
+                    if int(m.get("uid") or 0) != int(uid):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                t = (m.get("text") or "").strip()
+                if t and len(t) > 1 and t not in got:
+                    got.append(t)
+        for t in got[-max_msgs:]:
+            out.append("他最近在群里说过：%s" % t[:60])
+        return out
+
     # ---------- 关系档案 ----------
     def _profile_path(self, key):
         # key 三种形态："u123" 私聊 | "g123" 群级 | "g123|u456" 群内个人

@@ -1686,6 +1686,24 @@ class AutoReply:
         if il:
             lines.append("（%s）" % il)
             lines.append("")
+        # 私聊：把「他在群里说过什么」也带上。
+        # 群聊 conv 是 g<群号>，私聊是 u<QQ>，两本账——他在群里说养了猫，
+        # 私聊时不知道，同一件事要重说一遍。这里只做读视图，不动存储结构。
+        #
+        # 关键是下面那句「别主动提」：突然说「我知道你养了只猫」会很渗人，
+        # 对方第一反应是「你怎么知道」。要用在对方提到的时候自然接上。
+        if not conv_key.startswith("g") and uid:
+            try:
+                cross = self.mem.cross_context(uid)
+            except Exception:
+                cross = []
+            if cross:
+                lines.append("【他在别的地方说过的事（你从别处听来的）】")
+                lines.extend(cross)
+                lines.append("（这些不是他跟**你**说的。**绝对别主动提**——"
+                             "突然说出来他会觉得你在监视他。只在他自己提到相关的事时，"
+                             "顺着接一句，像本来就知道一样。）")
+                lines.append("")
         if mem["stages"]:
             lines.append("【更早的阶段回顾（较早发生的事）】")
             lines.append(mem["stages"])

@@ -1888,6 +1888,98 @@ def test_tools_fallback():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_nonfriend_msg():
+    """非好友发私聊不能跟好友一样聊——否则申请流程被绕过。
+
+    QQ 允许非好友发消息（群临时会话、开了"允许陌生人发消息"）。以前只判断
+    白名单，非好友和「已加好友但没批准」走的是同一条路，等于：
+    不用加好友也能聊 → 那「加好友 → 问主人 → 批权限」就成了摆设。
+
+    非好友的处理：回一句引导加好友，但**不进记忆、不读媒体、不登记状态**。
+    不进记忆尤其重要——否则陌生人可以往上下文里灌任意内容，蹭到后面的对话。
+    """
+    bot, tmp = new_bot(owner_qq="111")
+    try:
+        bot.cfg["allowed_private"] = [111]
+        bot.cfg["stranger"] = {"enabled": True, "auto_accept": True,
+                               "greet": True, "notify_owner": True,
+                               "reply_nonfriend": True,
+                               "nonfriend_cooldown_sec": 3600}
+        bot.self_id = 999
+        bot._schedule = lambda e: None
+
+        class FriendOB2(OB):
+            def __init__(self, friends):
+                super().__init__()
+                self.friends = friends
+
+            def call(self, action, params, timeout=15):
+                if action == "get_friend_list":
+                    return {"ok": True, "data": list(self.friends)}
+                return super().call(action, params, timeout)
+
+        # 111 在白名单（好友）；555 是好友但没批准；777 根本不是好友
+        bot.ob = FriendOB2([{"user_id": 111}, {"user_id": 555}])
+        bot._stranger_set(555, status="pending", nick="好友没批")
+
+        queued = []
+        bot._schedule = lambda e: queued.append(e)
+
+        def priv2(uid):
+            return {"post_type": "message", "message_type": "private",
+                    "user_id": uid, "message_id": "m%d" % uid,
+                    "time": int(time.time()),
+                    "message": [{"type": "text", "data": {"text": "在吗"}}],
+                    "sender": {"nickname": "n%d" % uid, "user_id": uid}}
+
+        # ① 非好友：回一句，但不进队列
+        bot._handle_stranger_msg(priv2(777))
+        sent = [p for p in bot.ob.sent["private"] if p.get("user_id") == 777]
+        check("非好友：会回一句引导（不是完全不理）", len(sent) == 1, str(len(sent)))
+        check("非好友：提示他先加好友",
+              sent and ("不是好友" in sent[0]["message"][0]["data"]["text"]
+                        or "加个好友" in sent[0]["message"][0]["data"]["text"]),
+              sent[0]["message"][0]["data"]["text"] if sent else "")
+        check("非好友：不进回复队列（不真聊）", len(queued) == 0, str(len(queued)))
+        check("非好友：不登记 stranger 状态（加好友后走正常流程）",
+              not bot._stranger_get(777))
+
+        # ② 冷却：同一个人短时间内再来消息，不再回
+        n0 = len([p for p in bot.ob.sent["private"] if p.get("user_id") == 777])
+        bot._handle_stranger_msg(priv2(777))
+        n1 = len([p for p in bot.ob.sent["private"] if p.get("user_id") == 777])
+        check("非好友：冷却期内不重复回", n1 == n0, "%d → %d" % (n0, n1))
+
+        # ③ 换个人照常回
+        bot._handle_stranger_msg(priv2(888))
+        check("非好友：换一个人仍然回",
+              any(p.get("user_id") == 888 for p in bot.ob.sent["private"]))
+
+        # ④ 好友（未批准）照常聊
+        queued.clear()
+        bot._handle_stranger_msg(priv2(555))
+        check("好友未批准：照常进队列聊", len(queued) == 1, str(len(queued)))
+
+        # ⑤ 白名单的人不算陌生人
+        check("白名单：_is_stranger 为 False", not bot._is_stranger(111))
+        check("好友判断：_is_friend 正确",
+              bot._is_friend(111) and bot._is_friend(555) and not bot._is_friend(777))
+
+        # ⑥ 拉好友列表失败时要放宽（不能把所有人当非好友而集体不回话）
+        class BrokenOB(OB):
+            def call(self, action, params, timeout=15):
+                if action == "get_friend_list":
+                    return {"ok": False, "error": "boom"}
+                return super().call(action, params, timeout)
+
+        bot._friend_cache = None
+        bot.ob = BrokenOB()
+        check("好友判断：拉列表失败时放宽（当好友处理）",
+              bot._is_friend(12345))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_scan_new_friends():
     """扫好友列表，补处理「已经加上但没登记」的人。
 
@@ -2238,7 +2330,8 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_tools_fallback, test_scan_new_friends,
+               test_tools_fallback, test_nonfriend_msg,
+               test_scan_new_friends,
                test_stranger_flow,
                test_sticker_understanding,
                test_face_text, test_ai_boilerplate,

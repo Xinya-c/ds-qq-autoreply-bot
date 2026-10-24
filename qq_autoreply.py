@@ -114,6 +114,11 @@ DEFAULTS = {
         # 事后查不到；而你在手机 QQ 上手动同意的人，系统也完全不知道。
         # 只能反查好友列表来兜底。
         "scan_on_start": True,
+        # 非好友发私聊（群临时会话、或对方开了"允许陌生人发消息"）怎么处理。
+        # QQ 允许非好友发消息，如果照常聊，「加好友 → 问主人 → 批权限」这套
+        # 流程就等于被绕过。所以默认不聊，只回一句引导加好友。
+        "reply_nonfriend": True,     # false = 非好友消息完全不回
+        "nonfriend_cooldown_sec": 3600,  # 同一个人多久内只回一次（别当复读机）
     },
     "sweep": {                         # 启动补回：扫漏回的私聊消息并补回复
         "enabled": True,
@@ -639,6 +644,11 @@ class AutoReply:
         self._cli_last_timeout_with_tools = False
         # 工具卡住后的冷却截止时间（这之前不带工具，避免反复白等）
         self._tools_cool_until = 0.0
+        # 非好友来消息的「已回复过」时间戳（同一人冷却期内不再回，避免复读）
+        self._nf_seen = {}
+        # 好友 ID 缓存：(拉取时间, {uid,...})。判断「是不是好友」要在每条
+        # 陌生人消息上做，每次现拉一遍太浪费。
+        self._friend_cache = None
         # 进程内的 CLI 互斥锁（Windows 的 msvcrt.locking 是进程级的，
         # 同进程多线程会一起拿到锁，所以这层必须自己加）
         self._cli_file_lock = threading.Lock()
@@ -2198,6 +2208,53 @@ class AutoReply:
         self._stranger_save()
         return cur
 
+    def _friend_ids(self, refresh=False, ttl=600):
+        """好友 ID 集合（带缓存）。
+
+        为什么要缓存：判断「他是不是我好友」要在**每条**陌生人消息上做，
+        每次现拉 get_friend_list 得多一个网络往返（几十到几百毫秒），
+        纯粹浪费。好友关系变化很慢，缓存 10 分钟足够。
+
+        刷新时机：
+        - 缓存过期（ttl）
+        - 明确传 refresh=True（加完好友、扫完列表之后）
+        - 拉取失败时不覆盖旧缓存（网络抖一下不该让所有人突然变陌生人）
+        """
+        now = time.time()
+        cache = getattr(self, "_friend_cache", None)
+        if (not refresh and cache and now - cache[0] < ttl):
+            return cache[1]
+        try:
+            r = self.ob.call("get_friend_list", {}, timeout=15)
+        except Exception as e:
+            log("  拉好友列表失败（沿用旧缓存）: %s" % e)
+            return cache[1] if cache else set()
+        data = r.get("data")
+        if not isinstance(data, list) or not r.get("ok", True):
+            log("  好友列表返回异常（沿用旧缓存）: %s" % str(data)[:100])
+            return cache[1] if cache else set()
+        ids = set()
+        for f in data:
+            try:
+                ids.add(int(f.get("user_id") or 0))
+            except (TypeError, ValueError):
+                continue
+        ids.discard(0)
+        self._friend_cache = (now, ids)
+        return ids
+
+    def _is_friend(self, uid):
+        """是不是好友。拿不到列表时**放宽**（当好友处理），
+        避免把「API 抽风」误判成「所有人都不是好友」而集体不回话。"""
+        try:
+            u = int(uid)
+        except (TypeError, ValueError):
+            return True
+        ids = self._friend_ids()
+        if not ids:
+            return True
+        return u in ids
+
     def _is_stranger(self, uid):
         """不在白名单里的私聊对象就是陌生人（群不适用）。"""
         try:
@@ -2252,6 +2309,9 @@ class AutoReply:
         log("  已同意 %s(%s) 的好友申请" % (nick, uid))
         self._stranger_set(uid, status="pending", nick=nick,
                            comment=comment, approved_at=0)
+        # 刚加了好友，好友列表变了——刷新缓存，否则 _is_friend 还认为他不是
+        # 好友，接下来的聊天会被当成「非好友」挡掉
+        self._friend_ids(refresh=True)
 
         if cfg.get("greet", True):
             self._greet_stranger(uid, nick)
@@ -2444,9 +2504,19 @@ class AutoReply:
         uid = evt.get("user_id")
         conv = self.mem.conv_of(evt)
         nick = (evt.get("sender") or {}).get("nickname") or str(uid)
+
+        # 非好友：QQ 允许非好友发消息（群临时会话、开了"允许陌生人发消息"），
+        # 但**不能跟好友一样聊**——否则「加好友 → 问主人 → 批权限」这套流程
+        # 等于被绕过：不加好友也能聊，那还加什么？
+        # 处理方式：回一句引导加好友，但**不进记忆、不读媒体、不登记状态**
+        # （不登记是为了让他加好友后走正常的初次流程，而不是带着半截上下文）。
+        if not self._is_friend(uid):
+            self._handle_nonfriend_msg(evt, nick)
+            return
         st = self._stranger_get(uid) or {}
         if not st:
-            # 没登记过（比如加好友那步漏了 / 从别的设备加的）→ 补登记成待批准
+            # 是好友但没登记过（比如加好友那步漏了 / 从别的设备加的）
+            # → 补登记成待批准
             st = self._stranger_set(uid, status="pending", nick=nick)
         status = st.get("status") or "pending"
         can_read = (status == "approved")
@@ -2564,6 +2634,10 @@ class AutoReply:
         if not newbies:
             log("扫好友列表：%d 个好友，没有未登记的新朋友" % len(friends))
             return 0
+        # 列表已经拿到了，顺手刷新好友缓存（scan 通常就是「刚加完好友」的场景）
+        self._friend_cache = (time.time(), set(
+            int(f.get("user_id") or 0) for f in friends
+            if str(f.get("user_id") or "").isdigit()))
 
         for uid, nick, remark in newbies:
             log("扫到新朋友：%s(%s)%s —— 补登记"
@@ -2584,6 +2658,41 @@ class AutoReply:
                        uid, uid))
         log("扫好友列表完成：补登记 %d 个新朋友" % len(newbies))
         return len(newbies)
+
+    def _handle_nonfriend_msg(self, evt, nick=""):
+        """非好友发来私聊：回一句引导加好友，然后到此为止。
+
+        不做的三件事（都很重要）：
+        1. **不进记忆** —— 否则陌生人可以往上下文里灌任意内容，蹭到后面的对话里
+        2. **不读媒体** —— 非好友发的文件更不可信
+        3. **不登记 stranger 状态** —— 让他加好友之后走正常初次流程，
+           而不是带着这半截没头没尾的上下文
+
+        为什么要回一句而不是完全不理：群临时会话（从群里点开私聊）是很常见的
+        场景，一句不吭会被当成机器人死了。回一句"先加个好友"既不失礼，
+        也把门槛说清楚了。
+        """
+        uid = evt.get("user_id")
+        sp = self._stranger_cfg()
+        log("  非好友 %s(%s) 发来私聊，按规则回一句引导（不进记忆、不读媒体）"
+            % (nick or "?", uid))
+        if not sp.get("reply_nonfriend", True):
+            log("  已配置非好友不回复，跳过")
+            return
+        # 同一个人别每来一条就回一遍，烦人且像复读机
+        cool = float(sp.get("nonfriend_cooldown_sec", 3600) or 0)
+        seen = getattr(self, "_nf_seen", None)
+        if seen is None:
+            seen = self._nf_seen = {}
+        last = float(seen.get(str(uid)) or 0)
+        if cool and time.time() - last < cool:
+            log("  非好友 %s 刚回过（冷却中），这条不再回" % uid)
+            return
+        seen[str(uid)] = time.time()
+        self._send_private_text(
+            uid,
+            "咱俩还不是好友呢，我这边只跟好友聊天。\n"
+            "你要是想聊，先加个好友吧——加了我会跟你打招呼的。")
 
     def _handle_notice(self, evt):
         """处理 notice 事件，目前只管「戳一戳」。

@@ -707,7 +707,64 @@ def test_qq_sweep():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 18. 纯函数
+# ------------------------------------------------------------ 18. 限流不该丢消息
+def test_rate_gate():
+    """上一条刚回完就又发一条——间隔不够，应该等一下再回，不能把消息扔掉。
+
+    这是用户实测踩到的：机器人在第二条刚发出时回了第一条，第二条就没了，
+    而且日志里一个字都没有（`_rate_ok` 返回 False 就直接 return）。
+    """
+    bot, tmp = new_bot()
+    try:
+        bot.cfg["min_interval_sec"] = 1      # 测试用小值，不用等 5 秒
+        bot.llm_reply = FakeLLM("回你一", "回你二", "回你三")
+        bot.on_event(priv(mid="rg1"))
+        check("第一条回了", wait_for(lambda: len(bot.ob.sent["private"]) >= 1))
+        # 立刻再发：此刻距上次回复不足 1 秒，旧逻辑会直接丢弃这条
+        bot.on_event(priv(mid="rg2"))
+        check("间隔不够时等一下再回，不丢弃",
+              wait_for(lambda: len(bot.ob.sent["private"]) >= 2, 5.0),
+              "实发 %d 条" % len(bot.ob.sent["private"]))
+        check("两条都回了，内容不串",
+              len(bot.ob.sent["private"]) >= 2
+              and "回你一" in str(bot.ob.sent["private"][0]["message"])
+              and "回你二" in str(bot.ob.sent["private"][1]["message"]))
+        # 再来一条，顺序依旧
+        bot.on_event(priv(mid="rg3"))
+        check("第三条也回了",
+              wait_for(lambda: len(bot.ob.sent["private"]) >= 3, 5.0),
+              "实发 %d 条" % len(bot.ob.sent["private"]))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 19. 每分钟上限
+def test_rate_minute_cap():
+    """每分钟上限是故意的限流（等也没用），该丢弃——但不能影响后续会话。"""
+    bot, tmp = new_bot()
+    try:
+        bot.cfg["min_interval_sec"] = 0
+        bot.cfg["max_replies_per_minute"] = 1
+        bot.llm_reply = FakeLLM("一", "二")
+        bot.on_event(priv(mid="rm1"))
+        wait_for(lambda: bot.ob.sent["private"])
+        bot.on_event(priv(mid="rm2"))
+        time.sleep(0.5)
+        check("每分钟超限：不硬发", len(bot.ob.sent["private"]) == 1,
+              "实发 %d 条" % len(bot.ob.sent["private"]))
+        # 另一个会话不该被连带影响
+        bot2, tmp2 = new_bot()
+        bot2.cfg["min_interval_sec"] = 0
+        bot2.cfg["max_replies_per_minute"] = 1
+        bot2.llm_reply = FakeLLM("三")
+        bot2.on_event(priv(uid=111, mid="rm3"))
+        check("别的会话不受影响", wait_for(lambda: bot2.ob.sent["private"], 3.0))
+        shutil.rmtree(tmp2, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 20. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -742,7 +799,7 @@ def main():
                test_enrich, test_stale, test_sweep, test_no_reply,
                test_weird_input, test_sticker_only, test_merge_image,
                test_memory_isolated, test_cli_fallback, test_qq_sweep,
-               test_pure):
+               test_rate_gate, test_rate_minute_cap, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

@@ -397,14 +397,43 @@ class AutoReply:
         return False
 
     def _rate_ok(self, key):
+        """现在能不能回。返回 (能不能, 还要等几秒, 原因)。
+
+        两种「不能回」性质完全不同，不能一视同仁：
+        - **间隔不够**（同一会话两次回复的最小间隔）：等一等就恢复了，
+          所以调用方应该等一下再回，而不是把这条消息扔掉。
+        - **每分钟超上限**：这是有意的限流（防止刷屏），等也没用
+          （窗口还没滑过去），该丢弃——但必须留痕。
+        """
         now = time.time()
-        if now - self.last_reply_at.get(key, 0) < float(self.cfg["min_interval_sec"]):
-            return False
+        mi = float(self.cfg["min_interval_sec"])
+        gap = now - self.last_reply_at.get(key, 0)
+        if gap < mi:
+            return False, mi - gap, "间隔"
         while self.minute_window and now - self.minute_window[0] > 60:
             self.minute_window.popleft()
         if len(self.minute_window) >= int(self.cfg["max_replies_per_minute"]):
-            return False
-        return True
+            return False, 0.0, "每分钟上限"
+        return True, 0.0, ""
+
+    def _rate_gate(self, conv, label=""):
+        """回复前的限流闸：间隔不够就等，等不到才放弃。
+
+        以前这里直接 return 掉，用户的第二条消息就这么人间蒸发——
+        而且日志里一个字都没有（静默 = 故障信号，这条教训记着）。
+        """
+        ok, wait, why = self._rate_ok(conv)
+        if ok:
+            return True
+        if why == "间隔" and 0 < wait <= 30:
+            log("  距上次回复只隔了 %.1fs，等 %.1fs 再回这条"
+                % (float(self.cfg["min_interval_sec"]) - wait, wait))
+            time.sleep(wait + 0.05)
+            ok, wait, why = self._rate_ok(conv)
+            if ok:
+                return True
+        log("  %s超限，这条不回了（%s）" % (why, label))
+        return False
 
     def _mark(self, key):
         now = time.time()
@@ -2100,7 +2129,7 @@ class AutoReply:
             if int(uid) not in [int(x) for x in self.cfg.get("allowed_private") or []]:
                 return
             conv = "u%d" % uid
-            if not self._rate_ok(conv):
+            if not self._rate_gate(conv, "私聊"):
                 return
             if not text and not image:
                 return
@@ -2175,7 +2204,7 @@ class AutoReply:
             bare = (not clean and not image)   # 只 @ 了我、没写内容
             if bare:
                 log("  只 @ 了我，没有文字内容 —— 按上下文接话")
-            if not self._rate_ok(conv):
+            if not self._rate_gate(conv, "群聊"):
                 return
             clean = self._enrich(evt, clean, conv)
             reply = self.llm_reply(conv, clean, image, evt.get("message_id"), bare,

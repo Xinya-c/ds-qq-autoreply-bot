@@ -357,6 +357,7 @@ class AutoReply:
         self._sem = threading.Semaphore(int(cfg.get("max_parallel", 4) or 4))
         self.mem = BotMemory(cfg, llm_fn=self._ask_summary)   # 记忆状态与读写全在 memory.py
         self.cli_429_until = 0.0           # 全局 429 熔断：此时间前不再调用 CLI
+        self._conn_fail = 0                # 连续连不上 OneBot 的次数（用来报警）
         self.model_429 = {}                # 模型名 -> 冷却截止时间戳（哪个模型额度耗尽了）
         self.quota_reply_at = {}           # conv_key -> 上次发占位回复的时间（防刷屏）
         self.reply_seq = {}               # conv_key -> 已回复次数
@@ -2037,6 +2038,9 @@ class AutoReply:
                 else:
                     log("get_login_info 失败: %s" % info)
                 self.ob.set_event_handler(self.on_event)
+                if self._conn_fail:
+                    log("连上了（前面连了 %d 次都失败）" % self._conn_fail)
+                    self._conn_fail = 0
                 # 阻塞保持：靠接收线程维持，这里只做心跳检查
                 threading.Thread(target=self._sweep_once, daemon=True).start()
                 while True:
@@ -2048,6 +2052,15 @@ class AutoReply:
                 return
             except Exception as e:
                 log("连接异常，5 秒后重连: %s" % e)
+                self._conn_fail += 1
+                # 光看「10061 目标计算机积极拒绝」很难反应过来是 NapCat 没了。
+                # 这段时间消息全丢在这儿（QQ 服务端也不补推），得说人话
+                if self._conn_fail in (3, 20) or self._conn_fail % 50 == 0:
+                    log("已经连续 %d 次连不上 OneBot（%s）。"
+                        "多半是 NapCat 没起来或 QQ 掉线了——"
+                        "这段时间的聊天记录机器人都收不到，"
+                        "去确认一下 NapCat 窗口还在不在、QQ 有没有登录"
+                        % (self._conn_fail, e))
                 # 换连接前必须关旧的：连接若是半开（系统睡眠唤醒、NapCat 被强杀，
                 # 没有 FIN/RST），旧对象的 recv 线程会永远卡在 recv 上，
                 # 旧 socket + 旧线程一起永久泄漏；在途的发送也会写进死连接

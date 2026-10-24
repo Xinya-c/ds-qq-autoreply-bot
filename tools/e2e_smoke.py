@@ -1456,9 +1456,52 @@ def test_sweep_no_repeat():
                                 168 * 3600, now + 60, 5)
         check("补捞：重启后不再重复补（用户踩过的 bug）", n2 == 0,
               "%d 条" % n2)
+        # 重启后不再重复
         n3 = mkbot()._qq_replay("u111", "private", 111, hist,
                                 168 * 3600, now + 120, 5)
         check("补捞：再重启一次也不重复", n3 == 0, "%d 条" % n3)
+
+        # 离线期间发的（晚于本地最后一条记录）必须补，哪怕 gap 很小。
+        # 踩过的坑：gap_limit 默认 10 分钟，本意是「对方说完我很快就回了」。
+        # 但刚启动时根本没回，10 分钟内的消息 gap 算出来很小 → 全被跳过
+        # （实测：启动前 9 秒 @ 机器人的两条群消息，既没收到也没补，用户以为不回）
+        tmp2 = tempfile.mkdtemp(prefix="qqsweep2_")
+        try:
+            cfg2 = dict(cfg)
+            cfg2["archive"] = dict(cfg.get("archive") or {})
+            cfg2["archive"]["dir"] = tmp2
+
+            def mk2():
+                b = qa.AutoReply(cfg2)
+                b.self_id = 999
+                b.mem.self_id = 999
+                return b
+
+            g = os.path.join(tmp2, "group_222.md")
+            with open(g, "w", encoding="utf-8") as f:
+                f.write("[%s] 测试乙(333): 之前的话\n" % time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(now - 700)))
+                f.write("[%s] 我: 回过了\n" % time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(now - 660)))
+
+            ghist = [{"time": now - 40, "user_id": 333,
+                      "message": [{"type": "at", "data": {"qq": "999"}},
+                                  {"type": "text", "data": {"text": "嘻嘻"}}],
+                      "sender": {"nickname": "测试乙"}}]
+            n4 = mk2()._qq_replay("g222", "group", 222, ghist,
+                                  168 * 3600, now, 5)
+            check("补捞：离线期间发的（40 秒前的 @）也要补", n4 == 1,
+                  "%d 条" % n4)
+
+            # 群里没 @ 我的，离线也不补（那是正常的聊天）
+            ghist2 = [{"time": now - 30, "user_id": 333,
+                       "message": [{"type": "text", "data": {"text": "随便聊聊"}}],
+                       "sender": {"nickname": "测试乙"}}]
+            n5 = mk2()._qq_replay("g222", "group", 222, ghist2,
+                                  168 * 3600, now + 5, 5)
+            check("补捞：群里没 @ 我的离线消息不补", n5 == 0, "%d 条" % n5)
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

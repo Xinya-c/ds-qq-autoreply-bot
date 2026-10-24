@@ -2260,6 +2260,22 @@ class AutoReply:
             t = int(m.get("time") or 0)
             if now - t > max_age:
                 continue
+            # 机器人离线期间发的消息（晚于本地最后一条记录）→ 必补。
+            #
+            # 为什么要单独走这条路：下面那个 `gap <= gap_limit`（默认 10 分钟）
+            # 的本意是「对方说完之后我方很快就回了，说明回的就是这条，不用补」。
+            # 但机器人刚启动时根本没回，**10 分钟内的消息恰恰最该补**——
+            # 而 gap 算出来就是「现在 - 它发出时间」，启动补捞时必然很小，
+            # 于是全被跳过。
+            # （实测：启动前 9 秒 @ 机器人的两条群消息，既没实时收到、
+            #  也没被补捞，用户以为「@它不回」。）
+            if t > local_last:
+                if mtype == "group" and not self._msg_at_me(m):
+                    continue    # 群里没 @ 我就不用回（那是正常的）
+                if self._is_sys_hint(m):
+                    continue
+                pend.append(m)
+                continue
             if mtype == "group" and not self._msg_at_me(m):
                 continue    # 群里没 @ 我就不用回（那是正常的）
             if self._is_sys_hint(m):

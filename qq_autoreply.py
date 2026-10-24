@@ -1439,10 +1439,29 @@ class AutoReply:
             parts = parts[:mp - 1] + ["\n".join(parts[mp - 1:])]
         return parts
 
-    def _split_delay(self):
-        """两条之间的间隔，带点随机，别像机器连发。"""
-        base = float((self.cfg.get("reply") or {}).get("split_delay_sec", 0.6) or 0)
-        return max(0.0, base + random.uniform(0, 0.4))
+    def _split_delay(self, chars=0):
+        """两条之间的间隔：按字数算，别用一个固定值。
+
+        为什么按字数：固定 0.6 秒的话，回「嗯」和回 30 个字一样快 —— 这就是
+        「唰一下全出来」的机械感来源。真人是一条一条打出来的，长的那条后面
+        自然停顿更久。
+
+            「嗯」      → 约 0.7 秒（秒回）
+            20 个字     → 约 1.5 秒
+            30 个字     → 约 2.0 秒（封顶 2.5）
+
+        参数都可配；chars 不给时退回旧的固定行为（向后兼容，老配置不用改）。
+        """
+        cfg = self.cfg.get("reply") or {}
+        base = float(cfg.get("split_delay_sec", 0.6) or 0)
+        per_char = float(cfg.get("delay_per_char_sec", 0.045) or 0)
+        cap = float(cfg.get("delay_max_sec", 2.5) or 0)
+        # 随机量加在封顶**之前**——不然 60 字会算出 2.5 + 随机 = 3 秒，
+        # 封顶形同虚设
+        d = base + per_char * max(0, int(chars or 0)) + random.uniform(0, 0.5)
+        if cap > 0:
+            d = min(d, cap)
+        return max(0.0, d)
 
     def _required_gap(self, conv):
         """取当前会话这一轮要求的间隔；区间配置则在每次发表情包后重新抽。"""
@@ -1739,6 +1758,49 @@ class AutoReply:
         if stale:
             lines.append(self._stale_line(stale, replay))
             lines.append("")
+        # 相关旧记忆：拿对方这句话去归档里搜，把很久以前提过的相关内容带进来。
+        #
+        # 以前这一步**只在群聊主动搭话时**做（见 _proactive_prompt 的 related），
+        # 正常回复路径从来不检索——所以私聊里提三个月前的事，它只能翻最近
+        # N 条（context_size 那么点），翻不到就说不知道。而检索索引其实早就
+        # 建好了（2717 条），纯粹是没用上。
+        #
+        # 成本：检索走本地向量/关键词，**不花 token**，只花一点 CPU。
+        # 放在这里（贴紧「对方刚说」之后）是因为模型对靠后的内容服从度最高。
+        #
+        # 只在**向量就绪**时才检索：向量没建好时会退化到关键词匹配，而口语
+        # 查询（"那个""我家那只猫"）字面重叠很少，实测 6 个查询只召回 1 个
+        # 还全是噪音。宁可不注入，也别往上下文里塞不相干的东西。
+        if user_text:
+            rel = []
+            try:
+                if self.mem._search.vec_ready():
+                    rel = self.mem.related(conv_key, user_text, k=2)
+            except Exception as e:
+                log("  相关记忆检索失败（不影响回复）: %s" % e)
+            if rel:
+                lines.append("【搜到的旧记录（更早的聊天里提过，可能跟这句有关）】")
+                lines.extend(rel)
+                lines.append("（这些是检索出来的，**不一定真相关**。用得上就自然接一句，"
+                             "用不上就当没看见——别硬扯，也别原样复述。"
+                             "对方没问起的时候，别主动翻这些旧账。）")
+                lines.append("")
+            # 关系图联想：从「他提到的东西」顺着关系网跳一两步。
+            # 跟上面的向量检索是两件事——向量找的是「说过的原话」，
+            # 这里找的是「那些东西之间有什么关系」（他说到豆豆，能顺出
+            # 豆豆掉毛让他头疼）。图是提炼档案时顺手建的，检索纯本地，不花 token。
+            try:
+                g = self.mem.graph_neighbors(conv_key, user_text, hops=2, limit=6)
+            except Exception as e:
+                g = []
+                log("  关系图检索失败（不影响回复）: %s" % e)
+            if g:
+                lines.append("【顺着关系想到的（他提到的东西，你还知道这些）】")
+                lines.extend(g)
+                lines.append("（这是从你记得的关系里顺出来的。能自然接上就用，"
+                             "接不上千万别硬套——比如他说豆豆，你顺口问一句掉毛的事"
+                             "就很自然；但别把整条关系念出来。）")
+                lines.append("")
         if conv_key.startswith("g"):
             lines.append("请结合上面的上下文，只输出你要回复给对方的内容；"
                          "如果上文有没回答完的问题，可以一并回应。不要任何前缀、解释或引号。")
@@ -3652,7 +3714,7 @@ class AutoReply:
                     conv, (part + (" 【图片】" + os.path.basename(imgs[0])
                                    if (imgs and last) else "")).strip())
             if not last:
-                time.sleep(self._split_delay())
+                time.sleep(self._split_delay(len(part)))
         if sent:
             # 让风格提炼和摘要也吃到这次接话（q 用群里最后一句充数）
             last_line = focus[-1].split(": ", 1)[-1] if focus else ""
@@ -3834,7 +3896,7 @@ class AutoReply:
                         conv, (part + (" 【图片】" + os.path.basename(imgs[0])
                                        if (imgs and last) else "")).strip())
                 if not last:
-                    time.sleep(self._split_delay())
+                    time.sleep(self._split_delay(len(part)))
             if sent:
                 self.mem.remember(conv, uid, text, body)   # 重活进后台 writer
             return
@@ -3926,7 +3988,7 @@ class AutoReply:
                         conv, (part + (" 【图片】" + os.path.basename(imgs[0])
                                        if (imgs and last) else "")).strip())
                 if not last:
-                    time.sleep(self._split_delay())
+                    time.sleep(self._split_delay(len(part)))
             if sent:
                 self.mem.remember(conv, uid, clean, body)  # 重活进后台 writer
                 # 刚在群里说过话，主动搭话的计数从头攒

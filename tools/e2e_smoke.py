@@ -2228,6 +2228,60 @@ def test_sticker_understanding():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_humanize_batch():
+    """拟人化第一批：打字节奏 / 私聊检索 / 共同经历 / 关系图。"""
+    bot, tmp = new_bot()
+    try:
+        # ① 打字节奏按字数算（不是固定值）
+        #    固定 0.6 秒的话，回「嗯」和回 30 字一样快 —— 「唰一下全出来」的机械感
+        d_short = [bot._split_delay(2) for _ in range(20)]
+        d_long = [bot._split_delay(30) for _ in range(20)]
+        check("节奏：短句比长句快",
+              max(d_short) < min(d_long),
+              "短 %.2f~%.2f / 长 %.2f~%.2f" % (min(d_short), max(d_short),
+                                              min(d_long), max(d_long)))
+        check("节奏：长文本有封顶",
+              max(bot._split_delay(200) for _ in range(20)) <= 2.5)
+        check("节奏：向后兼容（不传字数也能用）",
+              bot._split_delay() >= 0)
+
+        # ② 私聊检索：只在向量就绪时注入，避免关键词召回噪音
+        m = bot.mem
+        m.graph_add("u111", [("老王", "养了", "豆豆"), ("豆豆", "是", "猫"),
+                             ("豆豆", "掉毛", "让老王头疼"),
+                             ("老王", "爱吃", "火锅")])
+        pr = bot._prompt("u111", "豆豆最近怎么样", uid=111)
+        pr = pr[0] if isinstance(pr, tuple) else pr
+        check("关系图：命中实体时注入联想", "顺着关系想到" in pr, pr[:60])
+        check("关系图：两跳能带到「老王爱吃火锅」",
+              "火锅" in pr, "prompt 里有火锅: %s" % ("火锅" in pr))
+        pr2 = bot._prompt("u111", "今天天气不错", uid=111)
+        pr2 = pr2[0] if isinstance(pr2, tuple) else pr2
+        check("关系图：没命中实体时不注入", "顺着关系想到" not in pr2)
+        check("检索：向量没就绪时不注入旧记录（防噪音）",
+              "搜到的旧记录" not in pr2)
+
+        # ③ 关系图本身：去重 / 两跳 / 空
+        n1 = m.graph_add("u111", [("A1", "认识", "B1")])
+        n2 = m.graph_add("u111", [("A1", "认识", "B1")])   # 重复
+        check("关系图：重复边不重复写", n1 == 1 and n2 == 0, "%d/%d" % (n1, n2))
+        nb = m.graph_neighbors("u111", "豆豆")
+        check("关系图：豆豆能顺出 4 条边", len(nb) == 4, str(len(nb)))
+        check("关系图：没有实体时返回空",
+              m.graph_neighbors("u111", "随便说点什么") == [])
+
+        # ④ 共同经历：写进档案，且最多留 4 条
+        for i in range(7):
+            m._merge_profile("u888", "- 他叫我老板\n- 【经历】第 %d 次熬夜" % i)
+        prof = m.profile.get("u888") or ""
+        evs = [l for l in prof.splitlines() if "【经历】" in l]
+        check("经历：最多留 4 条", len(evs) == 4, str(len(evs)))
+        check("经历：不挤掉其他档案行", "他叫我老板" in prof)
+        check("经历：留的是最近的", "第 6 次" in prof, prof.replace("\n", " | ")[:60])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_face_text():
     """QQ 自带表情要带上名字，不能只留个「[表情]」。
 
@@ -2331,7 +2385,8 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_tools_fallback, test_nonfriend_msg,
+               test_tools_fallback, test_humanize_batch,
+               test_nonfriend_msg,
                test_scan_new_friends,
                test_stranger_flow,
                test_sticker_understanding,

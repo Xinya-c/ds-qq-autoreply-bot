@@ -22,6 +22,7 @@ self.mem 访问这里的一切；LLM 调用经构造时注入的 llm_fn（内含
 """
 
 import glob
+import json
 import math
 import os
 import queue
@@ -1171,6 +1172,133 @@ class BotMemory:
         if done:
             log("历史补压完成：本次共 %d 段" % done)
 
+    # ---------- 轻量关系图 ----------
+    #
+    # 为什么做这个：向量/关键词检索是「找相似的句子」，而真人聊天靠的是
+    # **联想**——你说「上次那家店」，对方能顺出「你女朋友不吃辣」「那天排了
+    # 两小时」。这个跳跃需要「实体之间有关系」这一层，光靠句子相似度做不到。
+    #
+    # 为什么是「轻量」：不建全量三元组图谱（那要给每条消息调一次 LLM 抽
+    # OpenIE，几千条就是几千次调用）。这里的边是**搭档案提炼的顺风车**产出的
+    # ——同一次 LLM 调用里，除了写档案，顺手让它把这个人的关系写成三联行。
+    # 零额外 token 成本，节点只有几十个（一个人认识的人和事），够用。
+    GRAPH_STOP = frozenset({
+        "我", "你", "他", "她", "它", "我们", "你们", "他们", "自己",
+        "这个", "那个", "这里", "那里", "现在", "今天", "昨天", "明天",
+        "什么", "怎么", "为什么", "一个", "东西", "事情",
+    })
+
+    def _graph_path(self, conv):
+        prefix = "group" if conv.startswith("g") else "private"
+        return os.path.join(self.archive_dir(),
+                            "%s_%s_graph.jsonl" % (prefix, conv[1:]))
+
+    def _graph_load(self, conv):
+        """读这个会话的边，返回 [(主体, 关系, 客体)]（去重）。"""
+        out, seen = [], set()
+        try:
+            with open(self._graph_path(conv), encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        d = json.loads(ln)
+                    except ValueError:
+                        continue
+                    e = (str(d.get("s") or "").strip(),
+                         str(d.get("r") or "").strip(),
+                         str(d.get("o") or "").strip())
+                    if not all(e) or e in seen:
+                        continue
+                    seen.add(e)
+                    out.append(e)
+        except OSError:
+            pass
+        return out
+
+    def graph_add(self, conv, edges):
+        """追加边（自动去重、限总量）。edges: [(s, r, o), ...]"""
+        edges = [tuple(str(x).strip() for x in e) for e in (edges or [])
+                 if e and len(e) == 3 and all(str(x).strip() for x in e)]
+        if not edges:
+            return 0
+        old = set(self._graph_load(conv))
+        new = [e for e in edges if e not in old]
+        if not new:
+            return 0
+        try:
+            p = self._graph_path(conv)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                for s, r, o in new:
+                    f.write(json.dumps({"s": s, "r": r, "o": o,
+                                        "t": int(time.time())},
+                                       ensure_ascii=False) + "\n")
+        except Exception as e:
+            log("  关系图写入失败: %s" % e)
+            return 0
+        # 边太多就压：只保留最近的 GRAPH_MAX 条（老的图价值低于维护成本）
+        try:
+            all_edges = self._graph_load(conv)
+            if len(all_edges) > self.GRAPH_MAX:
+                keep = all_edges[-self.GRAPH_MAX:]
+                with open(self._graph_path(conv), "w", encoding="utf-8") as f:
+                    for s, r, o in keep:
+                        f.write(json.dumps({"s": s, "r": r, "o": o,
+                                            "t": int(time.time())},
+                                           ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        return len(new)
+
+    GRAPH_MAX = 300
+
+    def graph_neighbors(self, conv, text, hops=2, limit=10):
+        """从 text 里提到的实体出发在图上扩散，返回可读的三元组行。
+
+        匹配方式故意用**子串**而不是分词：实体是「豆豆」「火锅店」这种专名，
+        分词反而会把「豆豆」切碎。只要实体出现在这句话里就算命中。
+
+        hops=2 就够：一跳是「他提到的人/物」，两跳是「那个东西又连着什么」。
+        再远就发散到不相干了。
+        """
+        t = (text or "").strip()
+        if not t:
+            return []
+        edges = self._graph_load(conv)
+        if not edges:
+            return []
+        ents = set()
+        for s, _r, o in edges:
+            ents.add(s)
+            ents.add(o)
+        seed = {e for e in ents
+                if len(e) >= 2 and e not in self.GRAPH_STOP and e in t}
+        if not seed:
+            return []
+        visited = set(seed)
+        frontier = set(seed)
+        picked = []
+        seen = set()
+        for _ in range(max(1, int(hops))):
+            nxt = set()
+            for s, r, o in edges:
+                if s not in frontier and o not in frontier:
+                    continue
+                if (s, r, o) in seen:
+                    continue
+                seen.add((s, r, o))
+                picked.append((s, r, o))
+                other = o if s in frontier else s
+                if other not in visited:
+                    visited.add(other)
+                    nxt.add(other)
+            frontier = nxt
+            if not frontier or len(picked) >= limit:
+                break
+        return ["- %s - %s - %s" % e for e in picked[:limit]]
+
     # ---------- 关系档案 ----------
     def _profile_path(self, key):
         # key 三种形态："u123" 私聊 | "g123" 群级 | "g123|u456" 群内个人
@@ -1243,6 +1371,13 @@ class BotMemory:
                 merged.append(ln)
         if len(merged) > 24:                  # 防止无限增长，截最旧的自动行
             merged = merged[-24:]
+        # 「共同经历」单独限 4 条：它是事件不是事实，越积越挤占档案空间
+        # （24 行里如果塞了十几条经历，称呼/禁忌这些更常用的反而被挤掉）。
+        # 留最近 4 条，够模型感觉到「我们一起经历过事」就行。
+        ev_idx = [i for i, ln in enumerate(merged) if "【经历】" in ln]
+        if len(ev_idx) > 4:
+            drop = set(ev_idx[:len(ev_idx) - 4])
+            merged = [ln for i, ln in enumerate(merged) if i not in drop]
         self._write_profile(key, "\n".join(merged).strip())
 
     def _apply_rel(self, conv, rel_lines):
@@ -1424,8 +1559,27 @@ class BotMemory:
             )
             rel_prompt = (
                 "## 关系\n"
-                "不超过 5 行要点，每行以「- 」开头：只写关系——他怎么称呼我、我怎么称呼他、"
-                "亲密度如何、有什么禁忌话题或他明确不喜欢的事；看不出来就不写。\n\n"
+                "不超过 6 行要点，每行以「- 」开头：只写关系和经历——他怎么称呼我、"
+                "我怎么称呼他、亲密度如何、有什么禁忌话题或他明确不喜欢的事。\n"
+                "如果这几轮里真的发生过「一起经历的事」，单独写一行，格式是 "
+                "「- 【经历】…」，最多一条。\n"
+                "  · 写**具体的画面**，不写评价：\n"
+                "    ✓ 「凌晨三点陪他改代码，他说眼睛都快闭上了」\n"
+                "    ✓ 「他失恋那次，我陪他骂了半小时」\n"
+                "    ✓ 「他第一次夸我『还行』」\n"
+                "    ✗ 「他很累」「我们关系很好」「聊得很开心」（这是评价，不是经历）\n"
+                "  · 没有值得记的事就别硬写这一行——大部分人日常聊天并没有「经历」。\n"
+                "看不出来就不写，不要编造。\n\n"
+                "## 关系图\n"
+                "把这个人和他提到的人/物/事之间的关系，写成三联行，每行格式"
+                "「- 主体 - 关系 - 客体」，最多 6 行：\n"
+                "  - 老王 - 养了 - 豆豆\n"
+                "  - 豆豆 - 是 - 猫\n"
+                "  - 老王 - 讨厌 - 加班\n"
+                "  - 豆豆 - 让老王 - 头疼\n"
+                "要求：只写**具体的人名/物名/事情**；不要用「他」「我」「这个」"
+                "这类人称代词当主体或客体；关系用两三个字的动词；"
+                "看不出来就别写，宁缺勿滥。\n\n"
             )
         prompt = (
             head
@@ -1444,15 +1598,40 @@ class BotMemory:
             log("  摘要生成失败，要再攒 %d 条才重试" % every)
             return
 
-        fact_lines, rel_lines, cur = [], [], "fact"
+        fact_lines, rel_lines, graph_lines, cur = [], [], [], "fact"
         for ln in res.splitlines():
             s = ln.strip()
-            if re.match(r"^#{1,6}\s*关系", s):
-                cur = "rel"
+            m = re.match(r"^#{1,6}\s*(\S+)", s)
+            if m:
+                head = m.group(1)
+                if head.startswith("关系图") or head.startswith("关系图谱"):
+                    cur = "graph"
+                elif head.startswith("关系"):
+                    cur = "rel"
+                else:
+                    cur = "fact"
                 continue
             if s.startswith("- "):
-                (fact_lines if cur == "fact" else rel_lines).append(s)
+                if cur == "fact":
+                    fact_lines.append(s)
+                elif cur == "rel":
+                    rel_lines.append(s)
+                else:
+                    graph_lines.append(s)
         self._apply_rel(conv, rel_lines)      # 群里按人分流：个人档案 + 群级档案
+        # 关系图：解析「- 主体 - 关系 - 客体」，存成边
+        edges = []
+        for s in graph_lines:
+            body = s[2:].strip()
+            parts = [p.strip() for p in re.split(r"\s*[-－—]\s*", body)]
+            parts = [p for p in parts if p]
+            if len(parts) == 3:
+                edges.append(tuple(parts))
+        if edges:
+            n_new = self.graph_add(conv, edges)
+            if n_new:
+                log("  关系图 +%d 条边（共 %d 条）"
+                    % (n_new, len(self._graph_load(conv))))
         pts = self._filter_facts(conv, fact_lines)
         if not pts:
             # 正常结果：本轮事实都没到两次命中，候选已进观察区
@@ -1721,17 +1900,25 @@ class BotMemory:
                       for _t, ts, nick, body in rows]
 
     def related(self, conv, text, k=SEARCH_TOPK):
-        """搜本条会话的归档，返回可直接注入 prompt 的行（无命中返回 []）。"""
+        """搜本条会话的归档，返回可直接注入 prompt 的行（无命中返回 []）。
+
+        按正文去重：归档里同一句话可能出现多次（对方重复说过、或者你回了两遍），
+        检索会分别命中——原样拼进 prompt 就是同一段内容出现好几遍，白占地方。
+        """
         t = (text or "").strip()
         if not t:
             return []
         qtoks = tokenize(t)
         hits = self._search.search(conv, t, k)
-        out = []
+        out, seen = [], set()
         for _sc, _m, i in hits:
             _c, ts, nick, body = self._search.recs[i]
             if body.strip() == t:
                 continue                      # 当前消息自己，跳过
+            key = re.sub(r"\s+", "", body)[:40]
+            if key in seen:
+                continue
+            seen.add(key)
             out.append("[%s] %s: %s"
                        % (ts[:10], nick, preview_around(body, qtoks)))
         return out

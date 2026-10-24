@@ -925,7 +925,72 @@ def test_last_night_dates():
           M.parse_dates("在吗") is None)
 
 
-# ------------------------------------------------------------ 24. 纯函数
+# ------------------------------------------------------------ 25. 模糊时间词定位
+def test_time_words():
+    """出现「昨晚/今天/前天」这类模糊时间词 → 把那段时间的记录连时间戳给它。
+
+    想法来自用户：「出现（昨晚，今天，昨天）这种模糊时间词时，连当时的聊天
+    记录中的时间戳一起发送给模型，根据具体的时间戳的昨晚，这样去查找」。
+    语义检索找不到「我昨晚干了啥」（问句和内容对不上），但时间范围是确定的。
+    """
+    import memory as M
+    import datetime
+    today = datetime.date.today()
+
+    def rng(q):
+        r = M.parse_time_range(q)
+        return (r[0], r[1]) if r else None
+
+    # 「昨晚」跨夜：昨天傍晚到今天凌晨
+    y = (today - datetime.timedelta(days=1)).isoformat()
+    t = today.isoformat()
+    r = rng("我昨晚干了啥")
+    check("「昨晚」解析出跨夜范围", r is not None)
+    if r:
+        check("「昨晚」从昨天 18:00 开始",
+              time.strftime("%H:%M", time.localtime(r[0])) == "18:00",
+              time.strftime("%m-%d %H:%M", time.localtime(r[0])))
+        check("「昨晚」到今天 06:00 结束",
+              time.strftime("%H:%M", time.localtime(r[1])) == "06:00",
+              time.strftime("%m-%d %H:%M", time.localtime(r[1])))
+    check("「昨天」是昨天一整天",
+          rng("昨天") == (M.parse_time_range("昨天")[0], M.parse_time_range("昨天")[1]))
+    check("「明天」不触发（还没发生）", rng("明天") is None)
+    check("「刚才」不触发（上下文里就有）", rng("刚才") is None)
+    check("没有时间词返回 None", rng("在吗") is None)
+
+    # 造归档：昨天 23:00 一条、两小时前一条
+    bot, tmp = new_bot()
+    try:
+        now = time.time()
+        yst = now - 12 * 3600
+        p = os.path.join(bot.mem.archive_dir(), "private_111.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("[%s] 测试甲(111): 昨晚我们说的那个事\n"
+                    % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(yst)))
+            f.write("[%s] 我: 嗯，我记着呢\n"
+                    % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(yst + 60)))
+        bot.mem.recent.clear()
+        bot.mem._restore_context()
+        bot.mem._build_search_index()
+        has_t, rows = bot.mem.time_records("u111", "我昨晚干了啥")
+        check("能定位到昨晚那段", has_t and len(rows) >= 1, "%d 条" % len(rows))
+        check("记录带完整时间戳",
+              bool(rows) and rows[0].startswith("["), rows[0][:40] if rows else "")
+        check("记录内容对",
+              bool(rows) and "昨晚我们说的那个事" in rows[0])
+        # prompt 里要真的注进去
+        pr, _ = bot._prompt("u111", "我昨晚干了啥", uid=111)
+        check("prompt 里注入了那段时间的记录",
+              "【对方说的那段时间的聊天记录" in pr and "昨晚我们说的那个事" in pr)
+        # 没时间词就不注入
+        pr2, _ = bot._prompt("u111", "在吗", uid=111)
+        check("没时间词就不注入", "【对方说的那段时间" not in pr2)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 26. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -962,7 +1027,7 @@ def main():
                test_memory_isolated, test_cli_fallback, test_qq_sweep,
                test_rate_gate, test_rate_minute_cap, test_split_policy,
                test_owner, test_restore_segments, test_last_night_dates,
-               test_pure):
+               test_time_words, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

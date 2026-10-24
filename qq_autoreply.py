@@ -39,7 +39,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
 from qq_mcp_server import OneBotWS, flatten_message  # noqa: E402
-from memory import BotMemory  # noqa: E402
+from memory import BotMemory, parse_time_range  # noqa: E402
 
 CONFIG_PATH = os.path.join(BASE, "qq_autoreply_config.json")
 LOG_PATH = os.path.join(BASE, "qq_autoreply.log")
@@ -1179,6 +1179,24 @@ class AutoReply:
             lines.append("（行末的「N 小时前 / N 天前」= 这条是很久以前说的，"
                          "别当成当前话题；对方现在说什么就回什么，别翻旧账追问。）")
             lines.append("")
+        # 对方说了「昨晚 / 今天 / 前天」这类模糊时间 → 把那段时间的记录
+        # 连**完整时间戳**一起给它，让它自己对上号（语义检索找不到这种问句，
+        # 但时间范围是确定的）。只看当前这条消息里的时间词——去上下文里找
+        # 容易误触发（上下文里常有「今天」「刚才」这类词）。
+        tq = user_text or ""
+        if tq:
+            has_t, trows = self.mem.time_records(conv_key, tq)
+            if has_t:
+                if trows:
+                    lines.append("【对方说的那段时间的聊天记录"
+                                 "（时间戳是真实发送时间，按时间顺序；"
+                                 "可能和上面的「最近对话」有重叠）】")
+                    lines.extend(trows)
+                    lines.append("（对方说的模糊时间指的就是上面这一段，"
+                                 "别去别的时间找，也别把这段当成刚刚才发生。）")
+                else:
+                    lines.append("（对方提到的那段时间里没有聊天记录。）")
+                lines.append("")
         # 离线/补回的消息是「之前」发来的，别再写成「刚」
         when = "之前" if stale else "刚"
         if bare:

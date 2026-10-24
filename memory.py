@@ -210,6 +210,89 @@ def parse_dates(text, today=None):
     return out or None
 
 
+def parse_time_range(text, now=None):
+    """把模糊时间词变成**具体时间范围**，返回 (开始时间戳, 结束时间戳, 说明)。
+
+    比 parse_dates 更细：parse_dates 只给日期，这里给到小时——
+    「昨晚」不是一整天，是昨天傍晚到今天凌晨。
+
+    认得：2026-10-06 / 10月6日 / 今天 / 今晚 / 今天晚上 / 昨天 / 昨晚 /
+    昨天晚上 / 大前天 / 前天 / 前天晚上 / N天前。
+    将来时间（明天/明晚）不认——那段时间还没发生，没有记录可查。
+
+    没有时间词返回 None。
+    """
+    if not text:
+        return None
+    now = now or time.time()
+    today = datetime.date.fromtimestamp(now)
+
+    def ts(d, h=0, mi=0):
+        return time.mktime((d.year, d.month, d.day, h, mi, 0, 0, 0, -1))
+
+    def day(d):
+        return ts(d), ts(d + datetime.timedelta(days=1))
+
+    def span(d, a_h, a_m, b_d, b_h, b_m):
+        return ts(d, a_h, a_m), ts(b_d, b_h, b_m)
+
+    y = today - datetime.timedelta(days=1)
+    y2 = today - datetime.timedelta(days=2)
+    y3 = today - datetime.timedelta(days=3)
+
+    # 具体日期优先
+    for y_, m, d in re.findall(r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})", text):
+        try:
+            dd = datetime.date(int(y_), int(m), int(d))
+        except ValueError:
+            continue
+        s, e = day(dd)
+        return s, e, "%s（%s 全天）" % (dd.isoformat(), dd.strftime("%m-%d"))
+    for m, d in re.findall(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[号日]", text):
+        try:
+            dd = datetime.date(today.year, int(m), int(d))
+        except ValueError:
+            continue
+        if dd > today:
+            dd = datetime.date(today.year - 1, int(m), int(d))
+        s, e = day(dd)
+        return s, e, "%s（%s 全天）" % (dd.isoformat(), dd.strftime("%m-%d"))
+
+    if "大前天" in text:
+        s, e = day(y3)
+        return s, e, "大前天（%s）" % y3.strftime("%m-%d")
+    if "前天晚上" in text or "前天夜里" in text:
+        s, e = span(y2, 18, 0, y, 6, 0)
+        return s, e, "前天晚上（%s 18:00 ~ %s 06:00）" % (y2.strftime("%m-%d"),
+                                                           y.strftime("%m-%d"))
+    if "昨晚" in text or "昨天晚上" in text or "昨天夜里" in text \
+            or "昨天凌晨" in text:
+        s, e = span(y, 18, 0, today, 6, 0)
+        return s, e, "昨晚（%s 18:00 ~ %s 06:00）" % (y.strftime("%m-%d"),
+                                                       today.strftime("%m-%d"))
+    if "今天晚上" in text or "今晚" in text or "今天夜里" in text:
+        s = ts(today, 18, 0)
+        if now < s:
+            s = ts(today)
+        return s, now, "今天晚上（%s 18:00 至今）" % today.strftime("%m-%d")
+    if "前天" in text:
+        s, e = day(y2)
+        return s, e, "前天（%s）" % y2.strftime("%m-%d")
+    if "昨天" in text:
+        s, e = day(y)
+        return s, e, "昨天（%s）" % y.strftime("%m-%d")
+    if "今天" in text or "今早" in text:
+        s = ts(today)
+        return s, now, "今天（%s 00:00 至今）" % today.strftime("%m-%d")
+    for s_ in re.findall(r"([0-9]+|[一二两三四五六七八九十]+)\s*天前", text):
+        n = _cn_int(s_)
+        if n:
+            d = today - datetime.timedelta(days=n)
+            a, b = day(d)
+            return a, b, "%d 天前（%s）" % (n, d.strftime("%m-%d"))
+    return None
+
+
 def preview_around(body, query_toks, before=36, after=76):
     """长行围绕最先出现的命中词截取（固定截开头会让模型误判"词碰上内容没对"）。"""
     if len(body) <= SEARCH_PREVIEW_MAX:
@@ -1586,6 +1669,41 @@ class BotMemory:
             self._search.build_vectors(emb, vec)
         except Exception as e:
             log("向量检索初始化失败，回退关键词检索: %s" % e)
+
+    def time_records(self, conv, query, limit=40):
+        """按模糊时间词定位那段时间的聊天记录，**带完整时间戳**。
+
+        「我昨晚干了啥」这种问句，语义检索是找不到的（问句和内容对不上），
+        但时间范围是确定的——把那个时间段的记录连时间戳一起给模型，
+        让它自己对上「昨晚」说的是哪一段，比我们猜「最近几段」准得多。
+
+        返回 (有没有识别出时间词, 记录行列表)。
+        """
+        rng = parse_time_range(query)
+        if not rng:
+            return False, []
+        start, end, label = rng
+        rows = []
+        with self._search.lock:
+            recs = list(self._search.recs)
+        for c, ts, nick, body in recs:
+            if c != conv:
+                continue
+            t = self._parse_ts(ts)
+            if t is None or t < start or t > end:
+                continue
+            rows.append((t, ts, nick, body))
+        rows.sort(key=lambda x: x[0])
+        if len(rows) > limit:
+            # 均匀采样、首尾必含：那段时间可能很长，只取最近的一段
+            # 会把开头（「你睡了吗」这种开场）漏掉
+            if limit <= 1:
+                rows = rows[-1:]
+            else:
+                step = (len(rows) - 1) / float(limit - 1)
+                rows = [rows[int(round(j * step))] for j in range(limit)]
+        return True, ["[%s] %s: %s" % (ts, nick, body)
+                      for _t, ts, nick, body in rows]
 
     def related(self, conv, text, k=SEARCH_TOPK):
         """搜本条会话的归档，返回可直接注入 prompt 的行（无命中返回 []）。"""

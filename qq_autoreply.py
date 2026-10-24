@@ -1738,7 +1738,8 @@ class AutoReply:
                         _scope = None                      # 主人私聊：全套
                     else:
                         _scope = self.mem.shared_groups(uid, _target)   # 私聊：共同群
-                    _brief = self.mem.person_brief(_target, _scope)
+                    _brief = self.mem.person_brief(
+                        _target, _scope, viewer=uid)
                     if _brief:
                         _who = (_label, _brief, _scope)
             except Exception:

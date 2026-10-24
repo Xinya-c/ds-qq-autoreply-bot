@@ -601,6 +601,8 @@ class BotMemory:
         self._name_key = None
         self._gm_cache = None             # group_members 缓存
         self._gm_key = None
+        self._sm_cache = None             # social_map 缓存
+        self._sm_key = None
         self.samples = []                # 手挑的风格样本（self_samples.md，可选）
         self.style = ""                  # 长期养成的说话风格（全局，跨会话）
         self.sent_since_style = 0        # 距上次提炼风格累计说过多少句
@@ -1480,7 +1482,77 @@ class BotMemory:
         return [gid for gid, s in self.group_members().items()
                 if a in s and b in s]
 
-    def person_brief(self, uid, scope=None, max_msgs=4):
+    def social_map(self):
+        """uid -> {peer: {"g": {群号}, "at": 次数}}：谁跟谁有交集。
+
+        两条边，都从归档现算（不扫文件、不花额度）：
+          同在群   — 从群消息 nick 里的 (QQ号) 推，这是**事实**
+          @ 互动   — 从群消息正文里的 @QQ号 推，这是**行为**
+
+        为什么要这张图：光看「有没有共同群」太粗——两个人可能在一个大群里
+        从没说过话。有了 @ 次数，认人时能多说一句「那个老 @ 我的」，
+        而不是干巴巴一句「我知道有这么个人」。
+        """
+        key = len(self._search.recs)
+        if self._sm_cache is not None and self._sm_key == key:
+            return self._sm_cache
+        pat_nick = re.compile(r"[(（]\s*(\d{5,12})\s*[)）]\s*$")
+        pat_at = re.compile(r"@(\d{5,12})")
+        gmem = {}                      # gid -> {uid}
+        edges = {}                     # (a,b) -> {"g": set(), "at": n}
+        for conv, _ts, nick, body in self._search.recs:
+            if not conv.startswith("g"):
+                continue
+            gid = conv[1:]
+            m = pat_nick.search(nick or "")
+            if not m:
+                continue
+            a = int(m.group(1))
+            gmem.setdefault(gid, set()).add(a)
+            for t in pat_at.findall(body or ""):
+                b = int(t)
+                if a == b or b == self.self_id:
+                    continue           # 自己 @ 自己、@ 机器人都不算人际互动
+                k = (min(a, b), max(a, b))
+                e = edges.setdefault(k, {"g": set(), "at": 0})
+                e["g"].add(gid)
+                e["at"] += 1
+        out = {}
+        for gid, ids in gmem.items():
+            for a in ids:
+                for b in ids:
+                    if a != b:
+                        out.setdefault(a, {}).setdefault(
+                            b, {"g": set(), "at": 0})["g"].add(gid)
+        for (a, b), e in edges.items():
+            for x, y in ((a, b), (b, a)):
+                d = out.setdefault(x, {}).setdefault(y, {"g": set(), "at": 0})
+                d["g"] |= e["g"]
+                d["at"] += e["at"]
+        self._sm_cache = out
+        self._sm_key = key
+        return out
+
+    def tie_line(self, viewer, uid):
+        """给 prompt 用：viewer 和 uid 之间是什么关系（没交集返回空）。
+
+        这个是「关系」，不是「内容」——只描述他们怎么认识的、互动过几次，
+        不含任何一方的私密信息，所以哪个场景都能说。
+        """
+        try:
+            d = (self.social_map().get(int(viewer)) or {}).get(int(uid)) or {}
+        except (TypeError, ValueError):
+            return ""
+        gs = sorted(d.get("g") or [])
+        at = int(d.get("at") or 0)
+        parts = []
+        if gs:
+            parts.append("你们都在 %s 群" % "、".join(gs[:2]))
+        if at:
+            parts.append("互相 @ 过 %d 次" % at)
+        return ("你跟他的关系：" + "，".join(parts)) if parts else ""
+
+    def person_brief(self, uid, scope=None, viewer=None, max_msgs=4):
         """按 QQ 号取一个人的概况。
 
         **scope 决定能说多少**（隐私分级，不是性能参数）：
@@ -1497,9 +1569,15 @@ class BotMemory:
         except (TypeError, ValueError):
             return []
         conv = "u%d" % uid
-        out = []
         if scope is not None and not scope:
             return []                          # 没有共同场合
+        out = []
+        # 关系行放最前面：它是「怎么认识的」（同群 + @ 次数），不含任何一方
+        # 的私密内容，所以哪个场景都能说。模型看到这行才知道该用哪种口气接。
+        if viewer is not None and str(viewer) != str(uid):
+            _tie = self.tie_line(viewer, uid)
+            if _tie:
+                out.append(_tie)
         # ① 私聊关系档案：只有主人能看
         if scope is None:
             prof = " ".join((self.profile.get(conv) or "").split())

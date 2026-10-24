@@ -2583,6 +2583,23 @@ def test_person_brief():
         pr_g3 = bot._prompt("g222", "还记得 55555 吗", uid=111)[0]
         check("认人：主人在群里问也不给私聊档案（场景优先于身份）",
               "私聊里的关系" not in pr_g3)
+
+        # 社交关系：谁和谁在同群、互相 @ 过几次
+        m._search.recs.extend([
+            ("g222", "2026-10-22 10:00:00", "小王(55555)", "@66666 来打球"),
+            ("g222", "2026-10-22 10:01:00", "小李(66666)", "@55555 来"),
+        ])
+        m._gm_cache = m._sm_cache = m._name_cache = None
+        check("社交：同群就有边",
+              "663611925" not in str(m.social_map().get(55555, {}).get(66666))
+              and bool(m.tie_line(55555, 66666)),
+              m.tie_line(55555, 66666))
+        check("社交：统计互相 @ 的次数", "2 次" in m.tie_line(55555, 66666),
+              m.tie_line(55555, 66666))
+        check("社交：没交集的人没有关系行", m.tie_line(55555, 77777) == "")
+        brief = m.person_brief(66666, ["222"], viewer=55555)
+        check("社交：认人时带上关系行",
+              any("你跟他的关系" in x for x in brief), str(brief)[:100])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -72,12 +72,22 @@ def port_open(port, timeout=1.0):
         s.close()
 
 
-def procs_matching(keyword):
-    """返回命令行里含 keyword 的进程 PID 列表。"""
+def procs_matching(keyword, exe_names=None):
+    """返回命令行里含 keyword 的进程 PID 列表。
+
+    exe_names：只认这些可执行文件名（小写，如 {"python.exe"}）。
+    **判「守护进程是否在跑」时必须传**——踩过的坑：不限定 exe 时，
+    任何命令行里出现过 "qq_autoreply.py" 的进程都会被算进去（编辑器打开
+    这个文件、grep 搜它、甚至我跑的一次性 python 检查脚本），
+    一键启动于是以为「已在运行」直接跳过，守护进程根本起不来，
+    表现成「戳了没反应、日志一动不动」——而这个坑极难查，因为
+    pid 文件、进程表看着都「正常」。
+    """
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | "
+             "Get-CimInstance Win32_Process | "
+             "Select-Object ProcessId,Name,CommandLine | "
              "ConvertTo-Json -Compress"],
             capture_output=True, text=True, timeout=30,
             encoding="utf-8", errors="replace",   # 中文命令行会是 GBK 字节，别崩
@@ -87,8 +97,23 @@ def procs_matching(keyword):
         return []
     if isinstance(data, dict):
         data = [data]
-    return [p["ProcessId"] for p in data
-            if keyword.lower() in (p.get("CommandLine") or "").lower()]
+    want = {e.lower() for e in exe_names} if exe_names else None
+    pids = []
+    for p in data:
+        cmd = p.get("CommandLine") or ""
+        if keyword.lower() not in cmd.lower():
+            continue
+        if want is not None and (p.get("Name") or "").lower() not in want:
+            continue
+        # `python -c "...qq_autoreply.py..."` 这种内联脚本不算——它只是在
+        # 代码/字符串里提到这个文件名，并没有真的在跑那个脚本
+        if " -c " in (" " + cmd + " ") and keyword.lower() in cmd:
+            low = cmd.lower()
+            i = low.find(" -c ")
+            if i >= 0 and low.find(keyword.lower()) > i:
+                continue
+        pids.append(p["ProcessId"])
+    return pids
 
 
 def napcat_pids():
@@ -225,7 +250,10 @@ def main():
             log("配置 OneBot 失败：%s" % e)
 
     # ---------- 自动回复 ----------
-    existing = daemon_pid() or procs_matching("qq_autoreply.py")
+    # 只认 python 进程：不限定的话，编辑器/搜索/一次性脚本提到这个文件名
+    # 都会被当成「已在运行」，守护进程就起不来（踩过，极难查）
+    existing = daemon_pid() or procs_matching(
+        "qq_autoreply.py", exe_names={"python.exe", "pythonw.exe"})
     if existing:
         pids = existing if isinstance(existing, list) else [existing]
         log("自动回复已在运行（PID %s），跳过启动" % ", ".join(map(str, pids)))

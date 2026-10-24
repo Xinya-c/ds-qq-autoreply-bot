@@ -1889,7 +1889,14 @@ class AutoReply:
                 self.mem.archive_incoming(evt2)
         except Exception as e:
             log("  戳一戳的记忆/归档失败（不影响回复）: %s" % e)
-        self._handle(evt2)
+        # 关键：必须入队，**不能在这里直接 _handle**。
+        # 这个函数跑在 WebSocket 接收线程里（_on_message → on_event），
+        # 直接 _handle 会同步调模型（一次 20-60 秒）——这期间接收线程被
+        # 完全堵死，所有 send_* 的响应都收不到，表现成
+        # 「回复生成出来了，但发送全部 {'ok': False, 'error': 'timeout'}」。
+        # （今天实测：戳一戳触发后，13 条回复全发送失败，用户什么都收不到）
+        # 正常消息走 _schedule → 队列 → 独立 worker 线程，才不会被堵。
+        self._schedule(evt2)
 
     # 噪音事件：心跳、输入状态、这类高频又没信息量的，日志里不记。
     # 判断依据是「处理过它」或「它天然每几秒来一次」。

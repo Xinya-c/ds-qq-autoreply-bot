@@ -575,7 +575,15 @@ class OneBotWS:
                 fut["event"].set()
         else:
             if self._on_event:
-                self._on_event(msg)
+                # 必须包住：这个回调跑在**接收线程**里，它一抛异常就会
+                # 一路冒到 _recv_loop，接收线程直接退出（finally 里置
+                # _stop=True）。之后 socket 还连着、call() 还能 send，
+                # 但**永远收不到响应** → 所有动作都 timeout，
+                # 表现为「进程活着、消息发不出去」。
+                try:
+                    self._on_event(msg)
+                except Exception:
+                    pass
 
     # ---- 调用 OneBot action 并等待响应 ----
     def call(self, action, params=None, timeout=15):

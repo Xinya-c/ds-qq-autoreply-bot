@@ -1463,7 +1463,58 @@ def test_sweep_no_repeat():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 32. 纯函数
+# ------------------------------------------------------------ 32. 戳一戳不阻塞接收线程
+def test_poke_not_blocking():
+    """戳一戳必须入队处理，不能在 WebSocket 接收线程里同步调模型。
+
+    踩过的坑：_handle_notice 最后直接 self._handle(evt2)，那是同步的。
+    它跑在接收线程里（_on_message → on_event），一次模型调用 20-60 秒，
+    这期间接收线程被完全堵死——**所有 send_* 的响应都收不到**，
+    表现成「回复生成出来了，但发送全部 timeout，用户什么都收不到」。
+    （实测：戳一戳触发后 13 条回复全发送失败。）
+    """
+    bot, tmp = new_bot()
+    try:
+        bot.cfg["allowed_private"] = [111]
+        bot.cfg["merge_window_sec"] = 0      # 直接入队，不起定时器
+        bot.self_id = 999
+        bot.mem.self_id = 999
+
+        queued = []
+
+        def fake_enqueue(conv, evt):
+            queued.append((conv, evt))
+        bot._enqueue = fake_enqueue
+
+        # 万一还是走了 _handle，让它变慢——能测出「有没有阻塞」
+        def slow_reply(*a, **k):
+            time.sleep(2)
+            return "回复"
+        bot.llm_reply = slow_reply
+
+        t0 = time.time()
+        bot._handle_notice({
+            "post_type": "notice", "notice_type": "notify",
+            "sub_type": "poke", "user_id": 111, "target_id": 999,
+            "time": int(time.time())})
+        elapsed = time.time() - t0
+        check("戳一戳：处理立刻返回，不阻塞接收线程", elapsed < 0.5,
+              "用时 %.3fs" % elapsed)
+        check("戳一戳：进了队列（走独立 worker，不占接收线程）",
+              len(queued) == 1, "入队 %d 条" % len(queued))
+
+        # 重建的事件要能被 _handle 正常消费（字段齐全）
+        if queued:
+            evt = queued[0][1]
+            check("戳一戳：合成事件字段齐全",
+                  evt.get("message_type") == "private"
+                  and evt.get("user_id") == 111
+                  and evt.get("message"), str(evt)[:80])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 33. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1502,7 +1553,7 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_sweep_no_repeat, test_pure):
+               test_sweep_no_repeat, test_poke_not_blocking, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

@@ -2083,6 +2083,13 @@ class BotMemory:
         t = (text or "").strip()
         if len(t) < SEARCH_MIN_QUERY_CHARS:
             return []
+        # 向量没建好时不要退到关键词匹配：口语查询（"那个""我家那只猫"）字面
+        # 重叠太少，实测 6 个查询只召回 1 个还全是噪音（"我昨天跟你说的事"
+        # 召回"3207399168？这人我真没印象"）。宁可不注入，也别塞垃圾。
+        # 放在这里而不是调用处：related() 有三个调用方（正常回复 / 直连 API /
+        # 主动搭话），挂在调用处就得写三遍，漏一处就是一个漏洞。
+        if not self._search.vec_ready():
+            return []
         if not t:
             return []
         qtoks = tokenize(t)

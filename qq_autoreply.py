@@ -1736,8 +1736,11 @@ class AutoReply:
             lines.append("【对方现在的状态】" + mem["mood"])
             lines.append("")
         if mem["related"]:
-            lines.append("【相关旧记忆（更早的聊天记录，仅供参考，对方没问起就不要主动提）】")
+            lines.append("【搜到的旧记录（更早的聊天里提过，可能跟这句有关）】")
             lines.extend(mem["related"])
+            lines.append("（这些是检索出来的，**不一定真相关**。用得上就自然接一句，"
+                         "用不上就当没看见——别硬扯，也别原样复述。"
+                         "对方没问起的时候，别主动翻这些旧账。）")
             lines.append("")
         ctx = mem["context"]
         if ctx and conv_key.startswith("g"):
@@ -1826,25 +1829,17 @@ class AutoReply:
         # 还全是噪音。宁可不注入，也别往上下文里塞不相干的东西。
         # 观测用：记录了这次到底注入了什么。没注入就一行都不写（避免刷屏）。
         # 加这个是因为「跑两天再看好不好」这种验证方式不可靠——不看数据只能靠感觉，
-        # 而感觉会被最近一条回复带偏。有这一行，看日志就能判断检索是没命中、
-        # 命中了没用上、还是塞了噪音带偏了回复。
+        # 而感觉会被最近一条回复带偏。
+        #
+        # 向量检索的旧记忆在 mem["related"] 里（recall 已经算过一次），这里**不再
+        # 算第二遍**：原来两处都注入，同一批旧记录在 prompt 里出现两次，白占
+        # 一百多字，还会让模型以为那件事被提过很多次。
         _inj_rel, _inj_g, _inj_head = 0, 0, ""
         if user_text:
-            rel = []
-            try:
-                if self.mem._search.vec_ready():
-                    rel = self.mem.related(conv_key, user_text, k=2)
-            except Exception as e:
-                log("  相关记忆检索失败（不影响回复）: %s" % e)
+            rel = mem["related"] or []
+            _inj_rel = len(rel)
             if rel:
-                _inj_rel = len(rel)
                 _inj_head = re.sub(r"^\[[^\]]*\]\s*[^:：]*[:：]\s*", "", str(rel[0]))[:26]
-                lines.append("【搜到的旧记录（更早的聊天里提过，可能跟这句有关）】")
-                lines.extend(rel)
-                lines.append("（这些是检索出来的，**不一定真相关**。用得上就自然接一句，"
-                             "用不上就当没看见——别硬扯，也别原样复述。"
-                             "对方没问起的时候，别主动翻这些旧账。）")
-                lines.append("")
             # 关系图联想：从「他提到的东西」顺着关系网跳一两步。
             # 跟上面的向量检索是两件事——向量找的是「说过的原话」，
             # 这里找的是「那些东西之间有什么关系」（他说到豆豆，能顺出

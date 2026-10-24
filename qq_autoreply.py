@@ -1771,6 +1771,11 @@ class AutoReply:
         # 只在**向量就绪**时才检索：向量没建好时会退化到关键词匹配，而口语
         # 查询（"那个""我家那只猫"）字面重叠很少，实测 6 个查询只召回 1 个
         # 还全是噪音。宁可不注入，也别往上下文里塞不相干的东西。
+        # 观测用：记录了这次到底注入了什么。没注入就一行都不写（避免刷屏）。
+        # 加这个是因为「跑两天再看好不好」这种验证方式不可靠——不看数据只能靠感觉，
+        # 而感觉会被最近一条回复带偏。有这一行，看日志就能判断检索是没命中、
+        # 命中了没用上、还是塞了噪音带偏了回复。
+        _inj_rel, _inj_g, _inj_head = 0, 0, ""
         if user_text:
             rel = []
             try:
@@ -1779,6 +1784,8 @@ class AutoReply:
             except Exception as e:
                 log("  相关记忆检索失败（不影响回复）: %s" % e)
             if rel:
+                _inj_rel = len(rel)
+                _inj_head = re.sub(r"^\[[^\]]*\]\s*[^:：]*[:：]\s*", "", str(rel[0]))[:26]
                 lines.append("【搜到的旧记录（更早的聊天里提过，可能跟这句有关）】")
                 lines.extend(rel)
                 lines.append("（这些是检索出来的，**不一定真相关**。用得上就自然接一句，"
@@ -1795,6 +1802,7 @@ class AutoReply:
                 g = []
                 log("  关系图检索失败（不影响回复）: %s" % e)
             if g:
+                _inj_g = len(g)
                 lines.append("【顺着关系想到的（他提到的东西，你还知道这些）】")
                 lines.extend(g)
                 lines.append("（这是从你记得的关系里顺出来的。能自然接上就用，"
@@ -1824,7 +1832,13 @@ class AutoReply:
         # 早被稀释了（实测中位数 18 字，真人 5 字）。
         lines.append("（现在这条：说完就停。超过 20 个字就删到 20 字以内再发。"
                      "别补充解释，别收尾客套。）")
-        return "\n".join(lines), hist
+        out = "\n".join(lines)
+        if _inj_rel or _inj_g:
+            log("  召回：旧记忆 %d 条 / 关系边 %d 条 → prompt %d 字 · %s · 问「%s」%s"
+                % (_inj_rel, _inj_g, len(out), conv_key,
+                   (user_text or "")[:16],
+                   (" · 首条「%s」" % _inj_head) if _inj_head else ""))
+        return out, hist
 
     # ---------- 模型链：额度耗尽时自动换下一个 ----------
     def _cli_models(self):

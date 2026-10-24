@@ -1282,10 +1282,20 @@ def test_cli_auth_and_lock():
                 os.remove(lock)
         except Exception:
             pass
+        made = False
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_RDWR)
             os.write(fd, b"1")
             os.close(fd)
+            made = True
+        except FileExistsError:
+            # 守护进程正在跑、正占着这个锁（真实环境常见）。
+            # 这时没法造测试用的锁文件，跳过这两条断言——
+            # 不能让「测试跟生产抢资源」变成误报。
+            pass
+        if not made:
+            check("CLI 锁：跨进程互斥（跳过：守护进程正占用锁）", True)
+        else:
             got = None
             try:
                 with bot._cli_process_lock(timeout=2):
@@ -1296,7 +1306,6 @@ def test_cli_auth_and_lock():
                 got = False
             check("CLI 锁：别的进程持锁时不删掉别人的锁", got is True,
                   "锁还在=%s" % got)
-        finally:
             try:
                 os.remove(lock)
             except Exception:
@@ -1399,7 +1408,62 @@ def test_cli_auth_and_lock():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 31. 纯函数
+# ------------------------------------------------------------ 31. 补捞不重复
+def test_sweep_no_repeat():
+    """QQ 侧补捞的消息要写进归档，否则每次重启都会重复补、重复回复。
+
+    用户实测踩到：同一条历史消息被回复了三次，对方连着收到复读。
+    根因：_qq_replay 只把消息塞进队列，**没写归档**；而判定「漏回」的
+    依据正是「归档里附近没有这条消息的时间戳」——不写就永远判定没进过
+    系统，每次启动都补一遍。
+    """
+    tmp = tempfile.mkdtemp(prefix="qqsweep_")
+    try:
+        cfg = qa.load_config()
+        cfg = dict(cfg)
+        cfg["archive"] = dict(cfg.get("archive") or {})
+        cfg["archive"]["dir"] = tmp
+        cfg["sweep"] = dict(cfg.get("sweep") or {})
+
+        def mkbot():
+            b = qa.AutoReply(cfg)
+            b.self_id = 999
+            b.mem.self_id = 999
+            return b
+
+        now = int(time.time())
+        p = os.path.join(tmp, "private_111.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("[%s] 测试甲(111): 之前的话\n" % time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(now - 86400)))
+
+        hist = [{"time": now - 72000, "user_id": 111,
+                 "message": [{"type": "text", "data": {"text": "你还在吗"}}],
+                 "sender": {"nickname": "测试甲"}}]
+
+        n1 = mkbot()._qq_replay("u111", "private", 111, hist,
+                                168 * 3600, now, 5)
+        check("补捞：第一次能补到", n1 == 1, "%d 条" % n1)
+
+        arch = open(p, encoding="utf-8").read()
+        check("补捞：消息写进了归档", "你还在吗" in arch)
+        check("补捞：归档用的是原始时间戳（不是「现在」）",
+              time.strftime("%Y-%m-%d", time.localtime(now - 72000)) in arch,
+              arch.strip().splitlines()[-1][:40] if arch.strip() else "")
+
+        # 模拟重启：新实例、同一份归档
+        n2 = mkbot()._qq_replay("u111", "private", 111, hist,
+                                168 * 3600, now + 60, 5)
+        check("补捞：重启后不再重复补（用户踩过的 bug）", n2 == 0,
+              "%d 条" % n2)
+        n3 = mkbot()._qq_replay("u111", "private", 111, hist,
+                                168 * 3600, now + 120, 5)
+        check("补捞：再重启一次也不重复", n3 == 0, "%d 条" % n3)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 32. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1438,7 +1502,7 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_pure):
+               test_sweep_no_repeat, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

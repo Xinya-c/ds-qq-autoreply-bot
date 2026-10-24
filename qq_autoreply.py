@@ -2277,6 +2277,25 @@ class AutoReply:
             log("  %s 有 %d 条漏回消息，只补最近 %d 条"
                 % (conv, len(pend), cap))
             pend = pend[-cap:]
+        # 关键：补捞到的消息**必须先写进归档**。
+        # 判定「漏回」的依据就是「归档里附近没有这条消息的时间戳」——
+        # 不写的话下次启动还是判定「从没进过系统」，又补一遍、又回一遍。
+        # （用户实测踩到：同一条历史消息被回复了三次，对方连着收到复读）
+        for m in pend:
+            try:
+                self.mem.archive_incoming({
+                    "message_type": mtype,
+                    "user_id": m.get("user_id"),
+                    "group_id": ident if mtype == "group" else None,
+                    "time": m.get("time"),
+                    "message": m.get("message"),
+                    "sender": m.get("sender") or {},
+                })
+            except Exception as e:
+                log("  补捞消息写归档失败（下次可能重复补）: %s" % e)
+        # 归档时间戳有缓存（_archive_times），刚写进去的要让缓存失效——
+        # 不清的话同一次运行里再补一遍时读到的还是旧集合，照样重复补
+        self._arch_times.pop("times:" + conv, None)
         texts = []
         for m in pend:
             t = flatten_message(m.get("message")).strip()

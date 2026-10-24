@@ -100,7 +100,8 @@
     "restore_max_hours": 24,
     "mood_enabled": true,
     "samples": 0,
-    "backlog_per_run": 0
+    "backlog_per_run": 0,
+    "intimacy_enabled": true
   },
   "reply_images": {
     "enabled": true,
@@ -148,6 +149,16 @@
     "max_msgs": 15,
     "cooldown_sec": 600,
     "max_per_hour": 3,
-    "context_msgs": 12
+    "context_msgs": 12,
+    "score_threshold": 0.6,
+    "score_hit_prob": 0.75
+  },
+  "quiet": {
+    "enabled": true,
+    "windows_per_day": 2
+  },
+  "guard": {
+    "enabled": true,
+    "cooldown_sec": 900
   }
 }

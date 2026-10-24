@@ -136,6 +136,18 @@ DEFAULTS = {
         "cooldown_sec": 600,           # 同一个群两次主动发言之间至少隔这么久
         "max_per_hour": 3,             # 同一个群每小时最多主动发言几次（硬闸）
         "context_msgs": 12,            # 给模型的群内最近消息条数（含我自己说的）
+        # 打分发言：除了「攒够条数」这条老下限，再加一条「这条值不值得接」。
+        # 两个条件是「或」——打分只负责提前，条数保证不会彻底沉默。
+        "score_threshold": 0.6,        # 分数超过它才可能提前接话
+        "score_hit_prob": 0.75,        # 过阈值后再掷一次骰子，防连续抢话
+    },
+    "quiet": {                         # 潜水：每天有几段「不想说话」的时间
+        "enabled": True,
+        "windows_per_day": 2,          # 每天几段（每段 1~3 小时，按日期种子生成）
+    },
+    "guard": {                         # 防编造：回复里引用旧事但查不到出处 → 重生成
+        "enabled": True,
+        "cooldown_sec": 900,           # 同一会话多久内最多重生成一次
     },
     "cli_cooldown_sec": 600,    # 遇到 429 后，多久内不再尝试 CLI（秒）    # CLI 失败/额度用尽时，自动改用直连 API
     "merge_window_sec": 3,      # 同一会话连发消息的合并窗口（0=不合并）
@@ -212,6 +224,7 @@ DEFAULTS = {
         "max_chars": 600,    # 风格档案长度上限（太长了会挤占上下文）
     },
     "memory": {
+        "intimacy_enabled": True,   # 亲密度：记跟每个人聊过多少轮、认识多久
         "stage_enabled": True,   # 中期记忆：每 N 条压成一段「阶段回顾」
         "stage_every": 200,
         "stage_max": 0,          # 0=压缩结果全部累积，永不丢弃；>0 则最多保留 N 段
@@ -652,6 +665,9 @@ class AutoReply:
         # 打分发言：上一条群消息时间 / 名字缓存
         self._p_last_msg = {}
         self._p_name_cache = None
+        # 潜水：当天的安静时段缓存、每个群今天是否已记过日志
+        self._quiet_cache = {}
+        self._quiet_logged = {}
         # 好友 ID 缓存：(拉取时间, {uid,...})。判断「是不是好友」要在每条
         # 陌生人消息上做，每次现拉一遍太浪费。
         self._friend_cache = None
@@ -3710,12 +3726,68 @@ class AutoReply:
             s -= 0.50
         return max(0.0, min(1.0, s))
 
+    def _quiet_windows(self, day=None):
+        """当天不想说话的时间窗（小时为单位）。
+
+        按日期当种子生成，所以同一天重启用同一份窗口——不会出现「刚才安静、
+        重启后又活跃」这种精神分裂。每天 2 段左右，每段 1~3 小时。
+
+        为什么不用固定时段（比如凌晨 2-7 点）：那是作息表，不是状态。
+        真人今天是下午犯困，明天是睡前不想说话，随机才像活的。
+        """
+        cfg = self.cfg.get("quiet") or {}
+        day = day or time.strftime("%Y-%m-%d")
+        c = self._quiet_cache
+        if c.get("day") == day:
+            return c.get("wins") or []
+        n = max(0, int(cfg.get("windows_per_day", 2) or 0))
+        seed = sum((i + 1) * ord(ch) for i, ch in enumerate(day))
+        rnd = random.Random(seed)              # 不用 hash(day)：每个进程的哈希种子不同
+        # 按 n 等分一天，每段只在自己的区间里取起点。不这么切的话两段会重叠，
+        # 叠起来可能变成连续 5 小时不说话，太长（实测过 5.97~11.11）。
+        step = 24.0 / n if n else 24.0
+        wins = []
+        for i in range(n):
+            lo = i * step + 1.0
+            hi = max(lo, (i + 1) * step - 3.5)
+            a = rnd.uniform(lo, hi)
+            wins.append((a, min(23.5, a + rnd.uniform(1.0, 3.0))))
+        self._quiet_cache = {"day": day, "wins": wins}
+        return wins
+
+    def _quiet_now(self, now=None):
+        """现在是不是在「不想说话」的时段。
+
+        **只影响群聊的主动搭话。** 私聊永远照常回、@ 也要回——「叫它不理」
+        是最容易被当成坏了的情况，这个底线不能碰。
+        """
+        cfg = self.cfg.get("quiet") or {}
+        if not cfg.get("enabled", False):
+            return False
+        now = now or time.time()
+        lt = time.localtime(now)
+        cur = lt.tm_hour + lt.tm_min / 60.0
+        for a, b in self._quiet_windows(time.strftime("%Y-%m-%d", lt)):
+            if a <= cur < b:
+                return True
+        return False
+
     def _proactive_note(self, conv, evt=None):
         """群里每来一条他人消息调一次；攒满本轮目标或打分够格就安排主动接话。"""
         cfg = self.cfg.get("proactive") or {}
         if not cfg.get("enabled", True):
             return
         if not self.cfg.get("reply_in_group_when_at", True):
+            return
+        # 安静期：这次不接话，但计数照常攒——安静期过了不会因为它「欠了 20 条」
+        # 就一口气说好几句。
+        if self._quiet_now():
+            self.pmsg[conv] = min(self.pmsg.get(conv, 0) + 1,
+                                  self._p_target(conv))
+            if not self._quiet_logged.get(conv):
+                self._quiet_logged[conv] = time.strftime("%Y-%m-%d")
+                log("群%s 现在是我的安静时段，这会儿不主动接话（私聊和 @ 照常回）"
+                    % conv)
             return
         now = time.time()
         text = ""

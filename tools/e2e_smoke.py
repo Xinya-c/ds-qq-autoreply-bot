@@ -2291,6 +2291,129 @@ def test_humanize_batch():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_batch23():
+    """第二、三批：亲密度 / 防编造 / 打分发言 / 按人聚合 / 潜水。"""
+    bot, tmp = new_bot()
+    try:
+        m = bot.mem
+
+        # ---------- ① 亲密度：纯本地计数 ----------
+        for i in range(30):
+            ev = {"message_type": "private", "user_id": 111, "message_id": "i%d" % i,
+                  "time": 1700000000 + i * 60,
+                  "message": [{"type": "text", "data": {"text": "哈哈太好了"}}],
+                  "sender": {"nickname": "甲", "user_id": 111}}
+            m.remember_incoming(ev)
+        d = m.intimacy.get("u111") or {}
+        check("亲密度：累计轮数", int(d.get("n") or 0) == 30, str(d.get("n")))
+        check("亲密度：正面情绪有计数", int(d.get("pos") or 0) == 30, str(d.get("pos")))
+        check("亲密度：档位随轮数变化", "聊过几回" in m.intimacy_line("u111"),
+              m.intimacy_line("u111"))
+        m._save_intimacy()
+        m2 = G.build_bot(tmp).mem            # 重载看有没有落盘
+        m2._load_intimacy()
+        check("亲密度：落盘重载一致",
+              int((m2.intimacy.get("u111") or {}).get("n") or 0) == 30)
+        check("亲密度：没数据时不注入", m.intimacy_line("u999") == "")
+
+        # ---------- ② 防编造 ----------
+        for t, exp in [("你说过你要养猫的", True), ("你上次说过想换工作", True),
+                       ("你之前提过那家店", True), ("我觉得挺好的", False),
+                       ("你说呢", False), ("我也说过这话", False)]:
+            check("防编造：识别「%s」" % t[:6],
+                  bool(bot.CLAIM_RE.search(t)) == exp, t)
+        calls = []
+        fake = lambda *a, **k: (calls.append(1) or
+                                ("你说过你想养猫啊，怎么又不养了" if len(calls) % 2
+                                 else "养就养呗，你想清楚"))
+        bot._llm_reply_raw = fake
+        bot.mem.related = lambda *a, **k: []
+        bot.cfg["guard"] = {"enabled": True, "cooldown_sec": 900}
+        bot._fab_at.clear()
+        out = bot.llm_reply("u111", "我想养宠物", uid=111)
+        check("防编造：查不到出处就重生成", len(calls) == 2, str(len(calls)))
+        check("防编造：用的是重生成后的回复", "养就养呗" in (out or ""), str(out))
+        calls.clear()
+        bot.llm_reply("u111", "我想养宠物", uid=111)
+        check("防编造：冷却期内不重复烧调用", len(calls) == 1, str(len(calls)))
+        calls.clear()
+        bot._fab_at.clear()
+        bot.cfg["guard"]["enabled"] = False
+        bot.llm_reply("u111", "我想养宠物", uid=111)
+        check("防编造：开关能关掉", len(calls) == 1, str(len(calls)))
+        bot.cfg["guard"]["enabled"] = True
+
+        # ---------- ③ 打分发言 ----------
+        bot.cfg["proactive"] = {"enabled": True, "min_msgs": 10, "max_msgs": 10,
+                                "score_threshold": 0.6, "score_hit_prob": 1.0,
+                                "cooldown_sec": 0, "max_per_hour": 99}
+        bot._p_last_msg.clear(); bot._p_name_cache = None
+        check("打分：闲聊 0 分", bot._p_score("g222", "今天天气不错") == 0.0)
+        check("打分：问句 +0.30", abs(bot._p_score("g222", "这个怎么弄啊") - 0.30) < 1e-6)
+        check("打分：叫名字 + 问句过阈值",
+              bot._p_score("g222", "大肥鱼你咋不说话") >= 0.6,
+              "%.2f" % bot._p_score("g222", "大肥鱼你咋不说话"))
+        bot.plast["g222"] = time.time()
+        check("打分：刚说过话要扣分",
+              bot._p_score("g222", "大肥鱼你咋不说话") < 0.6,
+              "%.2f" % bot._p_score("g222", "大肥鱼你咋不说话"))
+        bot.plast.clear()
+        # 下限还在：普通闲聊攒够 10 条必须触发
+        fired = []
+        bot._enqueue = lambda conv, evt: fired.append(evt)
+        bot.pmsg.clear(); bot.ptarget.clear()
+        gm = lambda t: {"message_type": "group", "group_id": 222, "message_id": "g",
+                        "time": int(time.time()),
+                        "message": [{"type": "text", "data": {"text": t}}],
+                        "sender": {"nickname": "甲", "user_id": 333}}
+        for _ in range(9):
+            bot._proactive_note("g222", gm("今天天气不错"))
+        check("打分：闲聊 9 条不触发", len(fired) == 0, str(len(fired)))
+        bot._proactive_note("g222", gm("嗯嗯"))
+        check("打分：攒够下限必须触发（不会彻底沉默）", len(fired) == 1, str(len(fired)))
+        # 提前触发：第 3 条就叫名字
+        fired.clear(); bot.pmsg.clear(); bot.ptarget.clear(); bot.plast.clear()
+        bot._proactive_note("g222", gm("随便聊聊"))
+        bot._proactive_note("g222", gm("今天好热"))
+        bot._proactive_note("g222", gm("大肥鱼你咋不说话"))
+        check("打分：叫名字能提前触发", len(fired) == 1, str(len(fired)))
+
+        # ---------- ④ 按人聚合 ----------
+        m.user_profile["g999|u111"] = "爱开玩笑，能直接损，养了只猫叫豆豆"
+        from collections import deque as _dq
+        m.recent["g999"] = _dq(maxlen=12)
+        m.recent["g999"].append({"uid": 111, "text": "豆豆又把沙发抓烂了", "nick": "甲"})
+        cross = m.cross_context(111)
+        check("聚合：能捞到他在别处说过的事",
+              any("豆豆" in x for x in cross), str(cross)[:80])
+        # 用绝对不存在的 uid：build_bot 的预置数据里 g 会话有 uid=999 的发言，
+        # 拿 999 测会捞到真数据，误判成串台
+        check("聚合：查不存在的用户返回空", m.cross_context(88888888) == [],
+              str(m.cross_context(88888888))[:90])
+        m.recent["g888"] = None               # 脏数据
+        check("聚合：recent 是 None 也不炸", m.cross_context(111) is not None)
+
+        # ---------- ⑤ 潜水 ----------
+        bot.cfg["quiet"] = {"enabled": True, "windows_per_day": 2}
+        ws = bot._quiet_windows("2026-10-25")
+        check("潜水：每天生成 2 段", len(ws) == 2, str(len(ws)))
+        check("潜水：两段不重叠",
+              not any(ws[i][1] > ws[i + 1][0] for i in range(len(ws) - 1)), str(ws))
+        check("潜水：同时段结果稳定（重启不会精神分裂）",
+              bot._quiet_windows("2026-10-25") == ws)
+        bot.cfg["quiet"]["enabled"] = False
+        check("潜水：开关能关掉", bot._quiet_now() is False)
+        bot.cfg["quiet"]["enabled"] = True
+        # 安静期只影响群主动搭话，私聊和 @ 必须照常
+        bot._quiet_now = lambda now=None: True
+        fired.clear(); bot.pmsg.clear(); bot.ptarget.clear()
+        for _ in range(6):
+            bot._proactive_note("g222", gm("大肥鱼在吗"))
+        check("潜水：安静期不主动接话", len(fired) == 0, str(len(fired)))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_face_text():
     """QQ 自带表情要带上名字，不能只留个「[表情]」。
 
@@ -2394,7 +2517,7 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_tools_fallback, test_humanize_batch,
+               test_tools_fallback, test_humanize_batch, test_batch23,
                test_nonfriend_msg,
                test_scan_new_friends,
                test_stranger_flow,

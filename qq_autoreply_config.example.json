@@ -35,6 +35,8 @@
       "minimax-m3"
     ],
     "tools": "WebSearch,WebFetch",
+    "timeout_tools": 45,
+    "tools_cooldown_sec": 600,
     "cli_parallel": 3,
     "cli_bg_parallel": 1,
     "auto_port": true

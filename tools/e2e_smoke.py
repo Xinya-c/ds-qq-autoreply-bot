@@ -1260,30 +1260,6 @@ def test_cli_auth_and_lock():
         #    旧版是全局互斥（=1），多人聊天被压成一队，后说话的人要等前面
         #    每个人各 60 秒——这正是用户反馈「人多就变慢」的根因。
         slots = bot._cli_slots
-        marks = []
-        barrier = threading.Barrier(slots + 1)
-
-        def worker():
-            barrier.wait()
-            with bot._cli_process_lock(timeout=10):
-                marks.append(time.time())
-                time.sleep(0.6)
-
-        ths = [threading.Thread(target=worker) for _ in range(slots + 1)]
-        for t in ths:
-            t.start()
-        for t in ths:
-            t.join()
-        marks.sort()
-        parallel = [m for m in marks if m - marks[0] < 0.25]
-        check("CLI 锁：允许 %d 个并发（不再全局串行）" % slots,
-              len(parallel) == slots,
-              "并行进了 %d 个，期望 %d" % (len(parallel), slots))
-        check("CLI 锁：超过并发上限要排队",
-              len(marks) == slots + 1 and marks[-1] - marks[0] >= 0.5,
-              "第 %d 个等了 %.2fs" % (len(marks), marks[-1] - marks[0]))
-
-        # ② 槽位文件生命周期（占用即建、释放即删）
         adir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
         def slot_files():
@@ -1291,6 +1267,40 @@ def test_cli_auth_and_lock():
                     for i in range(slots)
                     if os.path.exists(os.path.join(adir, ".cli.lock.%d" % i))]
 
+        # 槽位文件已经存在 = 守护进程正在跑、占着槽位。
+        # **这时候不能测并发度**：测试线程一个槽位都拿不到，会全部走到
+        # 「槽位全满 → 降级并发执行」那条路，5 个线程同一时刻放行，
+        # 看起来像「并行进了 5 个」（实测踩过，误报成功能坏了）。
+        # 这是测试的环境依赖，不是代码问题。
+        busy = slot_files()
+        if busy:
+            check("CLI 锁：并发度（跳过：守护进程正占用 %d/%d 个槽位）"
+                  % (len(busy), slots), True)
+        else:
+            marks = []
+            barrier = threading.Barrier(slots + 1)
+
+            def worker():
+                barrier.wait()
+                with bot._cli_process_lock(timeout=10):
+                    marks.append(time.time())
+                    time.sleep(0.6)
+
+            ths = [threading.Thread(target=worker) for _ in range(slots + 1)]
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join()
+            marks.sort()
+            parallel = [m for m in marks if m - marks[0] < 0.25]
+            check("CLI 锁：允许 %d 个并发（不再全局串行）" % slots,
+                  len(parallel) == slots,
+                  "并行进了 %d 个，期望 %d" % (len(parallel), slots))
+            check("CLI 锁：超过并发上限要排队",
+                  len(marks) == slots + 1 and marks[-1] - marks[0] >= 0.5,
+                  "第 %d 个等了 %.2fs" % (len(marks), marks[-1] - marks[0]))
+
+        # ② 槽位文件生命周期（占用即建、释放即删）
         if slot_files():
             # 守护进程正在跑、占着槽位。测试不该跟生产抢资源。
             check("CLI 锁：槽位文件生命周期（跳过：守护进程正占用）", True)
@@ -1733,7 +1743,89 @@ def test_cli_parallel():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 36. 纯函数
+# ------------------------------------------------------------ 36. 带工具卡死的降级
+def test_tools_fallback():
+    """带工具那次超时要能自动降级成不带工具，并冷却一段时间。
+
+    真踩过：CLI 启动时要初始化 WebSearch/WebFetch（toolRefresh 阶段），
+    这一步**依赖网络且没有超时保护**——网络一抖动就永远挂着，直到
+    subprocess 的 180 秒超时被 kill。日志实证：
+      20:10:03 图片下载 SSL 握手超时
+      20:10:05 CLI 启动 → 20:10:10 卡在 PluginManager 之后
+      → 只剩内存心跳，永远没出现 run phase breakdown → 20:13:03 超时
+    三次超时都是这个原因，每次白等 3 分钟。
+
+    改法：带工具给更短的超时（45s），超时即判定「卡在工具初始化」
+    → 立刻不带工具重试（不会卡），并冷却 10 分钟不再试带工具。
+    这样搜索能力保留（网络正常时照样带工具），卡死时 1 分钟内出话。
+    """
+    bot, tmp = new_bot()
+    try:
+        bot.cfg["codebuddy"]["tools"] = "WebSearch,WebFetch"
+        bot.cfg["codebuddy"]["timeout_tools"] = 45
+        bot.cfg["codebuddy"]["tools_cooldown_sec"] = 600
+        bot._cli_ready_models = lambda: ["m1"]
+        bot._tools_cool_until = 0
+
+        calls = []
+
+        def stuck_with_tools(prompt, image=None, model=None, tools=None,
+                             timeout=None):
+            calls.append((tools, timeout))
+            if tools:
+                bot._cli_last_timeout_with_tools = True
+                return None
+            return "不带工具的成功回复"
+
+        bot._cli_invoke = stuck_with_tools
+        r = bot._cli_reply_locked("p", [], None, "x")
+        check("带工具卡住 → 自动降级不带工具并成功",
+              r == "不带工具的成功回复", repr(r))
+        check("降级时确实先试了带工具（短超时），再试不带工具",
+              len(calls) == 2 and calls[0][0] == "WebSearch,WebFetch"
+              and calls[1][0] == "", str(calls))
+        check("带工具那次用的是 timeout_tools（45s）而不是 180s",
+              calls[0][1] == 45, str(calls[0][1]))
+        check("卡住后进入冷却", bot._tools_cool_until > time.time())
+
+        # 冷却期内：直接不带工具，不再白白等 45 秒
+        calls.clear()
+        r = bot._cli_reply_locked("p", [], None, "x")
+        check("冷却期内直接不带工具（省掉那次白等）",
+              len(calls) == 1 and calls[0][0] == "", str(calls))
+
+        # 冷却过期后：恢复带工具（保住搜索能力）
+        calls.clear()
+        bot._tools_cool_until = time.time() - 1
+        r = bot._cli_reply_locked("p", [], None, "x")
+        check("冷却过期后恢复带工具",
+              len(calls) >= 1 and calls[0][0] == "WebSearch,WebFetch",
+              str(calls[:2]))
+
+        # 正常情况：带工具直接成功，不该多调用一次
+        calls.clear()
+
+        def ok(prompt, image=None, model=None, tools=None, timeout=None):
+            calls.append(tools)
+            return "带工具的结果"
+
+        bot._cli_invoke = ok
+        bot._tools_cool_until = 0
+        r = bot._cli_reply_locked("p", [], None, "x")
+        check("正常情况下带工具一次成功，不降级",
+              r == "带工具的结果" and len(calls) == 1, str(calls))
+
+        # 没配工具时不该试带工具
+        bot.cfg["codebuddy"]["tools"] = ""
+        calls.clear()
+        r = bot._cli_reply_locked("p", [], None, "x")
+        check("没配工具就直接不带工具调用",
+              len(calls) == 1 and calls[0] == "", str(calls))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 37. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1772,6 +1864,7 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke, test_image_limits, test_cli_auth_and_lock,
+               test_tools_fallback,
                test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_cli_parallel, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()

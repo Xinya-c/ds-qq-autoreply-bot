@@ -58,6 +58,19 @@ DEFAULTS = {
         "timeout": 180,
         # 工具白名单：空 = 全禁（最安全）；想联网可填 "WebSearch"（只读网页，不能执行/读写文件）
         "tools": "",
+        # 带工具的那次尝试单独给一个**更短**的超时。
+        # 为什么：CLI 启动时要初始化工具（toolRefresh / interceptors），
+        # 这一步**依赖网络且没有超时保护**——网络一抖动就永远等下去，
+        # 直到 timeout（180s）被 kill。实测日志：
+        #   20:10:03 图片下载 SSL 握手超时
+        #   20:10:05 CLI 启动 → 20:10:10 卡在 PluginManager 之后
+        #   → 只剩内存心跳，永远没出现 run phase breakdown → 20:13:03 超时
+        # 正常情况带工具只要 10-25s，所以 45s 还不出结果就是卡住了，
+        # 立刻降级成「不带工具」重试（不带工具不会卡），并冷却一段时间。
+        "timeout_tools": 45,
+        # 工具卡住后，多少秒内不再尝试带工具（直接不带工具，省掉 45s 白等）。
+        # 网络抖动是暂时的，过了这段时间自动恢复搜索能力。
+        "tools_cooldown_sec": 600,
         # 留空 = 用 CodeBuddy 的 Auto（由账号侧自动选模型）
         # 可固定为：fast-model / balanced-model / deep-model / deepseek-v4.1-flash /
         #          glm-5.3 / glm-5.3-flash / kimi-k3-1 / minimax-m3 / hy3 / hy4-preview 等
@@ -538,6 +551,10 @@ class AutoReply:
         # CLI 登录态是否失效（失效 = 换模型也没用，只能重新登录或降级）
         self._cli_auth_failed = False
         self._auth_warned = False           # 登录失效只提醒一次，别刷屏
+        # 带工具的尝试是否超时过（= 卡在工具初始化，不是模型慢）
+        self._cli_last_timeout_with_tools = False
+        # 工具卡住后的冷却截止时间（这之前不带工具，避免反复白等）
+        self._tools_cool_until = 0.0
         # 进程内的 CLI 互斥锁（Windows 的 msvcrt.locking 是进程级的，
         # 同进程多线程会一起拿到锁，所以这层必须自己加）
         self._cli_file_lock = threading.Lock()
@@ -1576,7 +1593,7 @@ class AutoReply:
             except Exception:
                 pass
 
-    def _cli_invoke(self, prompt, image=None, model=None, tools=None):
+    def _cli_invoke(self, prompt, image=None, model=None, tools=None, timeout=None):
         cb = self.cfg["codebuddy"]
         args = [cb["node"], cb["cli"]]
         if model:
@@ -1623,10 +1640,14 @@ class AutoReply:
                     args, cwd=cb.get("cwd") or ".", env=self._cli_env(),
                     input=stdin_data, capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
-                    timeout=float(cb["timeout"]))
+                    timeout=float(timeout or cb["timeout"]))
         except subprocess.TimeoutExpired:
-            log("CodeBuddy CLI 超时（>%ss，prompt %d 字）"
-                % (cb["timeout"], len(prompt)))
+            log("CodeBuddy CLI 超时（>%ss%s，prompt %d 字）"
+                % (timeout or cb["timeout"],
+                   "，带工具" if tools else "", len(prompt)))
+            # 打上标记供调用方判断：带工具时超时 = 大概率卡在工具初始化
+            if tools:
+                self._cli_last_timeout_with_tools = True
             return None
         except Exception as e:
             # 路径写错、权限、以及 prompt 过长触发的 [WinError 206] 都会走这里。
@@ -1698,14 +1719,48 @@ class AutoReply:
         text = None
         # 登录态失效是全局问题：整个模型链都用不了，碰到一次就别试第二、第三个
         self._cli_auth_failed = False
+        cb = self.cfg["codebuddy"]
+        tools_cfg = (cb.get("tools") or "").strip()
+        # 带工具那次给更短的超时：CLI 初始化工具时依赖网络且没有超时保护，
+        # 网络一抖动就会一直挂着直到被 kill（实测卡满 180 秒）。
+        to_tools = float(cb.get("timeout_tools", 45) or 45)
+        cool = float(cb.get("tools_cooldown_sec", 600) or 0)
+        # 冷却期内直接用「不带工具」，省掉那次必然白等的 45 秒
+        in_cooldown = time.time() < getattr(self, "_tools_cool_until", 0)
         for idx, m in enumerate(self._cli_ready_models()):
+            # ① 先带工具试一次（要搜索能力）：结果正常就直接用
+            if tools_cfg and not in_cooldown:
+                self._cli_last_timeout_with_tools = False
+                if image:
+                    text = self._cli_invoke(prompt, image, m,
+                                            tools=tools_cfg, timeout=to_tools)
+                else:
+                    text = self._cli_invoke(prompt, None, m,
+                                            tools=tools_cfg, timeout=to_tools)
+                if text:
+                    if idx:
+                        log("  已切换到备选模型 %s，回复成功" % (m or "Auto"))
+                    break
+                if self._cli_last_timeout_with_tools:
+                    # 带工具超时 = 卡在工具初始化，不是模型慢。
+                    # 立刻降级，并冷却一段时间——网络抖动是暂时的，
+                    # 过一会儿会自动恢复带工具（保住搜索能力）。
+                    self._tools_cool_until = time.time() + cool
+                    log("  带工具调用卡住（工具初始化没超时保护），"
+                        "改为不带工具重试；%d 分钟内先不带工具"
+                        % int(cool / 60))
+                    in_cooldown = True
+                elif self._cli_auth_failed:
+                    log("  CLI 登录态失效，不再试其他模型，直接降级")
+                    break
+            # ② 不带工具（不会被工具初始化卡住）
             if image:
-                text = self._cli_invoke(prompt, image, m)
+                text = self._cli_invoke(prompt, image, m, tools="")
                 if not text:
                     log("  带图调用失败，回退纯文本")
-                    text = self._cli_invoke(prompt, None, m)
+                    text = self._cli_invoke(prompt, None, m, tools="")
             else:
-                text = self._cli_invoke(prompt, None, m)
+                text = self._cli_invoke(prompt, None, m, tools="")
             if text:
                 if idx:
                     log("  已切换到备选模型 %s，回复成功" % (m or "Auto"))

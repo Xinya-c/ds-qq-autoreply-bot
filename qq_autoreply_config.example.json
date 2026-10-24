@@ -135,7 +135,7 @@
     "from_qq": true,
     "qq_count": 50,
     "max_replay_per_conv": 5,
-    "replay_gap_sec": 600
+    "replay_gap_sec": 60
   },
   "proactive": {
     "enabled": true,

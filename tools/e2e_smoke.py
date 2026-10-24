@@ -1500,6 +1500,38 @@ def test_sweep_no_repeat():
             n5 = mk2()._qq_replay("g222", "group", 222, ghist2,
                                   168 * 3600, now + 5, 5)
             check("补捞：群里没 @ 我的离线消息不补", n5 == 0, "%d 条" % n5)
+
+            # 归档里的「离得近但不同」的消息不能被当成同一条。
+            # 踩过的坑：判定窗口是 300 秒，19:05:02 的「@机器人 嘻嘻」
+            # 因为归档里 19:04:50 有我方回复（差 12 秒），就被判定
+            # 「到过系统」，永远补不回来。窗口收到 5 秒才对。
+            tmp3 = tempfile.mkdtemp(prefix="qqsweep3_")
+            try:
+                cfg3 = dict(cfg)
+                cfg3["archive"] = dict(cfg.get("archive") or {})
+                cfg3["archive"]["dir"] = tmp3
+
+                def mk3():
+                    b = qa.AutoReply(cfg3)
+                    b.self_id = 999
+                    b.mem.self_id = 999
+                    return b
+
+                g3 = os.path.join(tmp3, "group_222.md")
+                with open(g3, "w", encoding="utf-8") as f:
+                    # 归档里有一条 12 秒前的我方回复（跟待补消息不是同一条）
+                    f.write("[%s] 我: 回过了\n" % time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(now - 12)))
+                hist3 = [{"time": now, "user_id": 333,
+                          "message": [{"type": "at", "data": {"qq": "999"}},
+                                      {"type": "text", "data": {"text": "嘻嘻"}}],
+                          "sender": {"nickname": "测试乙"}}]
+                n6 = mk3()._qq_replay("g222", "group", 222, hist3,
+                                      168 * 3600, now + 120, 5)
+                check("补捞：归档里 12 秒前的记录不遮蔽这条（窗口 5 秒）",
+                      n6 == 1, "%d 条" % n6)
+            finally:
+                shutil.rmtree(tmp3, ignore_errors=True)
         finally:
             shutil.rmtree(tmp2, ignore_errors=True)
     finally:

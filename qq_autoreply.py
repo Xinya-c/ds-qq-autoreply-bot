@@ -2250,7 +2250,7 @@ class AutoReply:
             return 0        # 新会话：不补（否则一次性把人家几十条历史全回一遍）
         arch = self._archive_times(conv)
         gap_limit = float((self.cfg.get("sweep") or {}).get(
-            "replay_gap_sec", 600) or 600)
+            "replay_gap_sec", 60) or 60)
         seq = sorted([m for m in hist if int(m.get("time") or 0)],
                      key=lambda m: m.get("time") or 0)
         pend = []
@@ -2289,8 +2289,16 @@ class AutoReply:
             gap = (nxt - t) if nxt else (now - t)
             if gap <= gap_limit:
                 continue
-            # 归档里附近有记录 → 它到过守护进程，交给本地补回
-            if any(abs(t - a) <= 300 for a in arch):
+            # 归档里附近有记录 → 它到过守护进程，交给本地补回。
+            #
+            # 窗口必须**很窄**（5 秒）：archive_incoming 写的是事件自带的
+            # time，跟 QQ 历史里同一条消息的 time 完全一致，本来可以精确
+            # 匹配，留 5 秒只是容错。
+            # 以前这里是 300 秒——太宽，把同一时段的多条消息混成一条：
+            # 实测 19:05:02 的「@机器人 嘻嘻」因为归档里 19:04:50 有一条
+            # 我方的回复（只差 12 秒），就被判定「到过系统」，再也没补过，
+            # 用户以为「@它不回」。
+            if any(abs(t - a) <= 5 for a in arch):
                 continue
             pend.append(m)
         if not pend:

@@ -2553,7 +2553,7 @@ def test_person_brief():
               m.find_person("小猪佩奇在吗") == (666, "小猪佩奇"),
               str(m.find_person("小猪佩奇在吗")))
 
-        # 隐私边界：只在主人私聊里认人
+        # 隐私分级：认人可以，爆料不行——按「是否在同一个场合」定
         bot.cfg["owner_qq"] = "111"
         bot.cfg["reply_images"]["enabled"] = False
         # 用 5 位号：正则要求 5~12 位（真实 QQ 号都是这个长度），
@@ -2564,7 +2564,25 @@ def test_person_brief():
         pr_other = bot._prompt("u333", "还记得 55555 吗", uid=333)[0]
         check("认人：非主人问起不注入（隐私）", "55555 是你认识的人" not in pr_other)
         pr_group = bot._prompt("g222", "还记得 55555 吗", uid=111)[0]
-        check("认人：群聊里不注入（旁边有人在看）", "55555 是你认识的人" not in pr_group)
+        check("认人：群聊里不认没在这个群出现过的人",
+              "55555 是你认识的人" not in pr_group)
+
+        # 群里出现过的人：群里任何人都能问出「本群公开」的部分
+        m._search.recs.extend([
+            ("g222", "2026-10-21 10:00:00", "小王(55555)", "今天谁迟到"),
+            ("g222", "2026-10-21 10:01:00", "小王(55555)", "我又睡过头了"),
+        ])
+        m._gm_cache = None      # 群成员索引要重建
+        m._name_cache = None
+        pr_g2 = bot._prompt("g222", "还记得小王吗", uid=333)[0]
+        check("认人：群聊里能认本群的人（群友问也行）",
+              "55555" in pr_g2 or "小王" in pr_g2, pr_g2[-200:])
+        check("认人：群聊只给本群内容，不给私聊档案",
+              "私聊里的关系" not in pr_g2)
+        # 主人在群里问也一样，只看本群——旁边一堆人看得见
+        pr_g3 = bot._prompt("g222", "还记得 55555 吗", uid=111)[0]
+        check("认人：主人在群里问也不给私聊档案（场景优先于身份）",
+              "私聊里的关系" not in pr_g3)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

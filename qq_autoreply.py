@@ -1695,39 +1695,52 @@ class AutoReply:
                 lines.append("")
         except Exception:
             pass
-        # 「你记得 123456 吗」——他问的是**另一个人**，那个人的资料在
-        # u<123456> 那个会话里：related() 只搜当前会话，结构上搜不到；
-        # 用整句话做语义检索也匹配不上（"现在想起来…了吗" vs "你会背出师吗"）。
-        # 所以这里按 QQ 号直接取档案，不走检索。
+        # 「你记得 123456 吗」「你还记得康程锦吗」——他点名了一个人。
         #
-        # **只在主人私聊里认人**：别人问「你记得 123456 吗」不能把那个人的
-        # 档案念出来——那是隐私。
+        # 原则：**认人可以，爆料不行。** 谁能问出谁的多少事，按「是否在
+        # 同一个场合」定：
+        #   主人私聊   → 全套（私聊档案 + 群档案 + 发言）
+        #   群聊       → 只给本群里他说过的话（当时在场的人都听得见）
+        #   非主人私聊 → 只给「共同群」里的公开内容；没共同群就不认
+        # 这样别人问起来不会显得一无所知，也不会把第三人的私聊抖出来。
         #
         # 先只算好、不立刻写进 prompt：这个信息要放在**靠后**的位置（贴着
         # 「对方刚说」），中间隔两千多字的话模型根本看不见。实测过：放在
         # 人设后面时，模型仍然回「没印象，这人到底是谁」。
         _who = None
-        if not conv_key.startswith("g") and user_text:
+        if user_text:
             try:
                 _owner = str(self.cfg.get("owner_qq") or "").strip()
-                if _owner and str(uid or "") == _owner:
-                    # ① 先按 QQ 号：最准，「你记得 3207399168 吗」
-                    for _num in re.findall(r"\d{5,12}", user_text):
-                        if _num in (_owner, str(uid)):
-                            continue
-                        _brief = self.mem.person_brief(_num)
-                        if _brief:
-                            _who = (_num, _brief)
-                            break
-                    # ② 再按名字/备注：「你记得康程锦吗」——主人平时用的是
-                    #    他给的备注，而对方本人叫「Changin丶Lin」。取命中最长的
-                    #    那个名字，避免「小猪佩奇」被认成「小猪」。
-                    if not _who:
-                        _hit = self.mem.find_person(user_text)
-                        if _hit and str(_hit[0]) != str(uid):
-                            _brief = self.mem.person_brief(_hit[0])
-                            if _brief:
-                                _who = ("%s（%s）" % (_hit[1], _hit[0]), _brief)
+                _is_owner = bool(_owner) and str(uid or "") == _owner
+                # ① 先定位他问的是谁：QQ 号最准
+                _target, _label = None, ""
+                for _num in re.findall(r"\d{5,12}", user_text):
+                    if _num in (_owner, str(uid)):
+                        continue
+                    _target, _label = int(_num), _num
+                    break
+                # ② 再按名字/备注：「你记得康程锦吗」——主人平时用的是他给的
+                #    备注，而对方本人叫「Changin丶Lin」。取命中最长的那个名字，
+                #    避免「小猪佩奇」被认成「小猪」。
+                if _target is None:
+                    _hit = self.mem.find_person(user_text)
+                    if _hit and str(_hit[0]) != str(uid):
+                        _target, _label = _hit[0], "%s（%s）" % (_hit[1], _hit[0])
+                # ③ 再定能说多少
+                #
+                # **场景优先于身份**：主人在群里问，也只能说群里公开的——
+                # 群里其他人都看得见，不能因为问的人是主人就把他人的私聊
+                # 内容抖在群里。
+                if _target:
+                    if conv_key.startswith("g"):
+                        _scope = [conv_key[1:]]            # 群聊：只本群
+                    elif _is_owner:
+                        _scope = None                      # 主人私聊：全套
+                    else:
+                        _scope = self.mem.shared_groups(uid, _target)   # 私聊：共同群
+                    _brief = self.mem.person_brief(_target, _scope)
+                    if _brief:
+                        _who = (_label, _brief, _scope)
             except Exception:
                 pass
         recent_kao = list(self.kaomoji_hist.get(conv_key) or [])
@@ -1805,9 +1818,15 @@ class AutoReply:
         # 而不是人设后面——实测放在前面时模型照样回「没印象，这人到底是谁」，
         # 因为隔了两千多字早被稀释了。
         if _who:
-            lines.append("【%s 是你认识的人，**不是陌生人**】" % _who[0])
-            lines.append("他问这句就是在考你记不记得。你确实跟他聊过：")
-            lines.extend(_who[1])
+            _label, _brief, _scope = _who
+            if _scope is None:
+                lines.append("【%s 是你认识的人，**不是陌生人**】" % _label)
+                lines.append("他问这句就是在考你记不记得。你确实跟他聊过：")
+            else:
+                _where = "这个群" if conv_key.startswith("g") else "你们都在的群"
+                lines.append("【%s 是你认识的人，他在%s里出现过】" % (_label, _where))
+                lines.append("你们在同一个场合，所以你知道他说过什么：")
+            lines.extend(_brief)
             lines.append("（顺着接一句就行，别把上面的话原样念出来。"
                          "但**绝对不能说「没印象」「不认识」**——你认识他。）")
             lines.append("")

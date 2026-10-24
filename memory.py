@@ -599,6 +599,8 @@ class BotMemory:
         self._aliases = {}                # 名字 -> uid（好友备注/昵称，扫好友列表时填）
         self._name_cache = None           # name_index 的缓存
         self._name_key = None
+        self._gm_cache = None             # group_members 缓存
+        self._gm_key = None
         self.samples = []                # 手挑的风格样本（self_samples.md，可选）
         self.style = ""                  # 长期养成的说话风格（全局，跨会话）
         self.sent_since_style = 0        # 距上次提炼风格累计说过多少句
@@ -1448,16 +1450,47 @@ class BotMemory:
                 best = (uid, name)
         return best
 
-    def person_brief(self, uid, max_msgs=4):
-        """按 QQ 号取一个人的概况：关系档案 + 群档案 + 最近说过的话。
+    def group_members(self):
+        """g<群号> -> {uid, ...}。从归档 nick 里的「(QQ号)」解析。
 
-        为什么需要：主人在自己私聊里问「你记得 3207399168 吗」，那个人的
-        资料全在 u<3207399168> 那个会话里。related() 只搜当前会话，结构上
-        搜不到；而且「现在想起来3207399168了吗」这句话跟那个人说过的
-        「你会背出师吗」语义上也不相似，拿整句去检索一样空手。
+        用途：判断 A 和 B 是否有共同场合，决定 A 能问出 B 的多少事。
+        """
+        key = len(self._search.recs)
+        if self._gm_cache is not None and self._gm_key == key:
+            return self._gm_cache
+        pat = re.compile(r"[(（]\s*(\d{5,12})\s*[)）]\s*$")
+        out = {}
+        for conv, _ts, nick, _body in self._search.recs:
+            if not conv.startswith("g"):
+                continue
+            m = pat.search(nick or "")
+            if not m:
+                continue
+            out.setdefault(conv[1:], set()).add(int(m.group(1)))
+        self._gm_cache = out
+        self._gm_key = key
+        return out
 
-        所以这里不用语义检索，直接按 QQ 号定位——用户点名了谁，就去取谁的
-        档案。三处来源都从内存读，不扫文件。
+    def shared_groups(self, uid_a, uid_b):
+        """两人都在的群号列表（空 = 没有共同场合）。"""
+        try:
+            a, b = int(uid_a), int(uid_b)
+        except (TypeError, ValueError):
+            return []
+        return [gid for gid, s in self.group_members().items()
+                if a in s and b in s]
+
+    def person_brief(self, uid, scope=None, max_msgs=4):
+        """按 QQ 号取一个人的概况。
+
+        **scope 决定能说多少**（隐私分级，不是性能参数）：
+          scope is None   → 全套：私聊档案 + 群档案 + 私聊/群里的发言（主人）
+          scope = [gid..] → 只看这些群：群内档案 + 该群里的发言，**不碰私聊归档**
+          scope = []      → 什么都不给（没有共同场合，不该假装认识）
+
+        为什么这样分：群里说过的话，当时在场的人都听得见，重复一遍不算泄露；
+        私聊内容只有本人和机器人知道，谁问都不能说。所以「认人」可以放开，
+        「爆料」必须按场合卡。
         """
         try:
             uid = int(uid)
@@ -1465,47 +1498,68 @@ class BotMemory:
             return []
         conv = "u%d" % uid
         out = []
-        prof = " ".join((self.profile.get(conv) or "").split())
-        if prof:
-            out.append("你跟他在私聊里的关系：%s" % prof[:180])
+        if scope is not None and not scope:
+            return []                          # 没有共同场合
+        # ① 私聊关系档案：只有主人能看
+        if scope is None:
+            prof = " ".join((self.profile.get(conv) or "").split())
+            if prof:
+                out.append("你跟他在私聊里的关系：%s" % prof[:180])
+        # ② 群内个人档案：只给 scope 内的群
         for k, v in self.user_profile.items():
-            if k.endswith("|u%d" % uid):
-                body = " ".join(str(v or "").split())
-                if body:
-                    out.append("他在群里是这样的：%s" % body[:140])
-                break
+            if not k.endswith("|u%d" % uid):
+                continue
+            gid = k.split("|", 1)[0][1:]
+            if scope is not None and gid not in scope:
+                continue
+            body = " ".join(str(v or "").split())
+            if body:
+                out.append("他在群里是这样的：%s" % body[:140])
+            break
+        # ③ 最近说过的话（私聊的只有主人能看；群里的按 scope）
         d = self.recent.get(conv)
-        if d:
+        if d and scope is None:
             said = []
             for m in list(d)[-10:]:
                 t = (m.get("text") or "").strip()
-                if len(t) < 3:
+                if len(t) < 3 or is_placeholder(t):
                     continue
-                if is_placeholder(t):
-                    continue                  # （图片）（空消息）这类占位
                 said.append(t)
             if said:
                 out.append("他最近跟你说过：%s" % " / ".join(said[-max_msgs:])[:200])
-        # 最早那几条最能说明「这人是谁」——开场通常就是问候、自我介绍、
-        # 让你背诗这类。只靠最近几句的话，模型只知道「他抱怨过什么」，
-        # 认不出人（实测：只给最近 4 句时，它回「好像有点影子」）。
+        # ④ 群体发言 + 最早那几句
         try:
-            recs = [(r[2], r[3].strip()) for r in self._search.recs if r[0] == conv]
+            recs = [(r[0], r[2], r[3].strip()) for r in self._search.recs]
         except Exception:
             recs = []
-        early = []
-        for nick, body in recs[:20]:
-            if nick == "我":
-                continue                      # 自己的话不算「他说过什么」
-            if len(body) < 3 or body in early:
+        if scope is None:
+            want = {conv}
+        else:
+            want = {"g%s" % g for g in scope}
+
+        def ok(c):
+            return c in want
+
+        early, last, seen = [], [], set()
+        for c, nick, body in recs:
+            if not ok(c) or nick == "我":
                 continue
-            if is_placeholder(body):
+            if len(body) < 3 or is_placeholder(body) or body in seen:
                 continue
-            early.append(body)
-            if len(early) >= 4:
-                break
+            # 群里的消息要确认是这个人说的：nick 尾部的 (QQ号)
+            if c.startswith("g"):
+                mm = re.search(r"[(（]\s*(\d{5,12})\s*[)）]\s*$", nick or "")
+                if not mm or int(mm.group(1)) != uid:
+                    continue
+                body = (nick[:mm.start()] + ": " + body) if mm.start() > 0 else body
+            seen.add(body)
+            if len(early) < 4:
+                early.append(body)
+            last.append(body)
+        if last and scope is not None:
+            out.append("他最近在群里说过：%s" % " / ".join(last[-max_msgs:])[:200])
         if early:
-            out.append("他最开始来找你时说的是：%s" % " / ".join(early)[:180])
+            out.append("他最开始跟你聊时说的是：%s" % " / ".join(early)[:180])
         return out
 
     # ---------- 关系档案 ----------

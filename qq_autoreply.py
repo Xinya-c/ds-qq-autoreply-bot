@@ -1645,6 +1645,41 @@ class AutoReply:
             how="当时没回上，是现在补回的。" if replay
                 else "你当时不在线，是现在才看到的。")
 
+    # 「你想起来他是谁了没」——本条没点名，但上文点过。这些词说明他在考你
+    # 记不记得某个人，才值得回看前面几条；否则随口提到一个名字也会触发认人。
+    RECALL_CUES = ("记得", "认识", "想起来", "是谁", "谁啊", "他是", "她是",
+                   "那人", "这人", "啥人", "哪位")
+
+    def _find_person_in_recent(self, conv_key, limit=3):
+        """在最近几条**对方**的消息里找被点名的人。
+
+        为什么需要：真实对话里很少一上来就复述名字。
+            你：姚明希啊
+            我：哦——盒子里有糖那个啊，记得了
+            你：你想起来他是谁了没      ← 这句没名字，旧版就认不出
+        只看对方说的话（nick == "我" 是机器人自己），从最近往前找。
+        """
+        try:
+            d = self.mem.recent.get(conv_key)
+        except Exception:
+            return None
+        if not d:
+            return None
+        msgs = [m for m in list(d)[-10:] if (m.get("nick") or "") != "我"]
+        for m in reversed(msgs[-limit:]):
+            txt = (m.get("text") or "").strip()
+            if not txt:
+                continue
+            for num in re.findall(r"\d{5,12}", txt):
+                try:
+                    return (int(num), num)
+                except (TypeError, ValueError):
+                    continue
+            hit = self.mem.find_person(txt)
+            if hit:
+                return hit
+        return None
+
     def _prompt(self, conv_key, user_text, has_image=False, mid=None, bare=False,
                 excludes=None, uid=None, stale=0, replay=False, proactive=False,
                 sticker=False):
@@ -1726,13 +1761,20 @@ class AutoReply:
                     _hit = self.mem.find_person(user_text)
                     if not _hit:
                         # 认不出来 → 可能是备注刚改、或者启动时没扫过好友列表
-                        # （别名只在拿到 get_friend_list 时才记）。刷一次再试，
-                        # 代价是一次本地 API 调用（几十毫秒），只在这条路上花。
+                        # （别名只在拿到 get_friend_list 时才记）。刷一次再试。
+                        # 但列表要节流：每条带「记得」又没点名的消息都刷，等于
+                        # 每句话打一次 API。60 秒内刷过就不再刷。
                         try:
-                            self._friend_ids(refresh=True)
+                            _c = getattr(self, "_friend_cache", None)
+                            if not _c or time.time() - _c[0] > 60:
+                                self._friend_ids(refresh=True)
                             _hit = self.mem.find_person(user_text)
                         except Exception:
                             _hit = None
+                    if not _hit and any(k in user_text
+                                        for k in self.RECALL_CUES):
+                        # 本条没点名，但上文点过（「你想起来他是谁了没」）
+                        _hit = self._find_person_in_recent(conv_key)
                     if _hit and str(_hit[0]) != str(uid):
                         _target, _label = _hit[0], "%s（%s）" % (_hit[1], _hit[0])
                 # ③ 再定能说多少

@@ -1511,6 +1511,11 @@ class BotMemory:
     #   → 0.45 以下算 0，0.75 以上算 1
     VEC_SIM_LO = 0.45
     VEC_SIM_SPAN = 0.30
+    # 回声过滤：命中如果只是「对方刚刚说过的那句」的复述，不算旧记忆。
+    # 实测「你想起来他是谁了没」召回「你想起来他是谁了不」——那是我自己上一句，
+    # 注入进去只会让模型把话重说一遍。
+    ECHO_SIM = 0.55
+    ECHO_SEC = 600
 
     # 关系语用词表（LIWC 的中文近似）。依据 ACL 2012《Self-Disclosure and
     # Relationship Strength》：强关系里脏话频率接近弱关系的 7 倍，而正面客套话
@@ -2818,12 +2823,15 @@ class BotMemory:
         if not t:
             return []
         qtoks = tokenize(t)
+        qset = {x for x, _k in qtoks}
         hits = self._search.search(conv, t, k)
         out, seen = [], set()
         for _sc, _m, i in hits:
             _c, ts, nick, body = self._search.recs[i]
             if body.strip() == t:
                 continue                      # 当前消息自己，跳过
+            if self._is_echo(ts, body, qset):
+                continue                      # 刚说过的那句，复述一遍没意义
             key = re.sub(r"\s+", "", body)[:40]
             if key in seen:
                 continue
@@ -2831,6 +2839,24 @@ class BotMemory:
             out.append("[%s] %s: %s"
                        % (ts[:10], nick, preview_around(body, qtoks)))
         return out
+
+    def _is_echo(self, ts, body, qset):
+        """这条命中是不是「刚说过的那句」的复述。
+
+        两个条件同时成立才算：
+          1. 时间很近（ECHO_SEC 内）——旧事重提是有价值的，刚说的话没有
+          2. 字面高度相似（ECHO_SIM 以上）
+        只满足一个都不算：三天前问过一模一样的问题值得提醒；刚才那句换个说法
+        问同一件事，检索回来也是废话。
+        """
+        try:
+            age = time.time() - time.mktime(
+                time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            return False
+        if age > self.ECHO_SEC:
+            return False
+        return self._jaccard(qset, {x for x, _k in tokenize(body)}) >= self.ECHO_SIM
 
     # ================= 事实过滤：两次命中才提升 =================
     @staticmethod

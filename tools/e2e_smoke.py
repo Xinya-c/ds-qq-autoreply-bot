@@ -2775,6 +2775,67 @@ def test_social_v2():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_recall_recent():
+    """认人的两个补充：上文点过名也能认；刚说过的话不当旧记忆。
+
+    现场（2026-10-25 凌晨）：
+        你：姚明希啊
+        我：哦——盒子里有糖那个啊，记得了
+        你：你想起来他是谁了没     ← 这句没名字，旧版就认不出，只能回「没印象」
+    反过来，顺口提到一个名字（"姚明希刚才说他要睡了"）不该触发认人，
+    否则每句话都要翻别人档案。
+    """
+    from collections import deque
+    import memory as M
+    bot, tmp = new_bot(owner_qq="111")
+    try:
+        m = bot.mem
+        bot.cfg["reply_images"]["enabled"] = False
+        m.add_alias("姚明希", 9990001)
+        m._search.recs = [
+            ("u9990001", "2026-10-20 10:00:00", "姚明希", "你会背出师吗"),
+            ("u9990001", "2026-10-20 10:01:00", "姚明希",
+             "水浴后颜色差别不大，是哪里出问题了"),
+        ]
+        m._name_cache = None
+
+        m.recent["u111"] = deque(maxlen=20)
+        m.recent["u111"].append({"uid": 111, "nick": "主人", "text": "姚明希啊"})
+        m.recent["u111"].append({"uid": 0, "nick": "我",
+                                 "text": "哦——盒子里有糖那个啊"})
+        pr = bot._prompt("u111", "你想起来他是谁了没", uid=111)[0]
+        check("认人：本条没点名、上文点过也能认", "是你认识的人" in pr)
+
+        m.recent["u111"].clear()
+        m.recent["u111"].append({"uid": 111, "nick": "主人", "text": "今天好热"})
+        pr = bot._prompt("u111", "你想起来他是谁了没", uid=111)[0]
+        check("认人：上文没有名字就不认", "是你认识的人" not in pr)
+
+        m.recent["u111"].clear()
+        m.recent["u111"].append({"uid": 111, "nick": "主人",
+                                 "text": "姚明希刚才说他要睡了"})
+        pr = bot._prompt("u111", "今天吃啥呢", uid=111)[0]
+        check("认人：顺口提到名字（没有考记性的意思）不触发",
+              "是你认识的人" not in pr)
+
+        pr = bot._prompt("u111", "你还记得姚明希吗", uid=111)[0]
+        check("认人：本条直接点名照旧生效", "是你认识的人" in pr)
+
+        # 回声过滤：刚说过的那句复述，不该当旧记忆返回
+        import time as _t
+        q = "你想起来他是谁了没"
+        qset = {x for x, _k in M.tokenize(q)}
+        now = _t.strftime("%Y-%m-%d %H:%M:%S")
+        check("召回：刚说过的近似句被过滤",
+              m._is_echo(now, "你想起来他是谁了不", qset))
+        check("召回：刚说过但内容不同不过滤",
+              not m._is_echo(now, "你会背出师吗", qset))
+        check("召回：很久以前同样的话不过滤（旧事重提有用）",
+              not m._is_echo("2026-10-20 10:00:00", q, qset))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_social_vec():
     """向量相似度通路：有编码器走向量，没有就退字面，编码器报错也不能炸。"""
     import numpy as _np
@@ -2942,7 +3003,7 @@ def main():
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
                test_tools_fallback, test_humanize_batch, test_batch23,
                test_ws_event_isolation, test_download_timeout,
-               test_social_v2, test_social_vec,
+               test_social_v2, test_social_vec, test_recall_recent,
                test_person_brief,
                test_nonfriend_msg,
                test_scan_new_friends,

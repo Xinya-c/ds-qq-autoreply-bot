@@ -88,6 +88,7 @@
     "mark_after_min": 15,
     "restore_gap_hours": 3,
       "restore_segments": 3,
+      "group_restore_segments": 3,
       "restore_max_hours": 24,
     "mood_enabled": true,
     "samples": 0,
@@ -110,6 +111,7 @@
     "backend": "cli"
   },
   "reply_max_chars": 800,
+  "group_focus_messages": 10,
   "reply": {
     "split_multiline": true,
     "max_parts": 12,

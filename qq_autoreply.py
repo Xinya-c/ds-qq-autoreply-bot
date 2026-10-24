@@ -84,6 +84,7 @@ DEFAULTS = {
         "qq_count": 50,                # 每个会话问 QQ 要多少条历史
         "max_replay_per_conv": 5,      # 每个会话最多补几条（防一次性刷屏）
     },
+    "group_focus_messages": 10,      # 群里「现在的聊天现场」取几条（接话依据这个）
     "proactive": {                     # 群聊主动搭话：没人 @ 它也偶尔插一句
         "enabled": True,
         "min_msgs": 10,                # 群里攒够多少条别人的消息，开始考虑主动接话
@@ -166,6 +167,7 @@ DEFAULTS = {
         "mark_after_min": 15,    # 上下文里超过多少分钟的消息要标「N 小时前」
         "restore_gap_hours": 3,  # 相邻消息间隔超过这个小时数 = 断了一段对话
         "restore_segments": 3,   # 私聊保留最近几段（隔夜也要记得）
+        "group_restore_segments": 3,  # 群聊保留最近几段（更早的进「背景参考」层）
         "restore_max_hours": 24, # 群聊的时间上限（群里久远的不是当前话题）
         "mood_enabled": True,    # 情绪轨迹（关键词粗判，不消耗额度）
         "samples": 0,            # Few-shot 风格样本条数（0=关闭；归档里是旧语气样本，开会把风格往回拽）
@@ -489,7 +491,9 @@ class AutoReply:
         self.kaomoji_hist = {}            # conv_key -> deque 最近用过的颜文字
         self.next_gap = {}                # conv_key -> 本轮要求的间隔（区间配置时随机）
         self.last_reply_at = {}           # conv_key -> ts
-        self.minute_window = deque()      # 最近一分钟的回复时间
+        # 每分钟回复数按**会话**分别算：以前是全局共享的，一个活跃私聊
+        # 刷屏会把群聊的额度一起吃掉，群里就发不出话来了
+        self.minute_windows = {}          # conv_key -> deque 最近一分钟的回复时间
         self.seen = deque(maxlen=2000)    # 已处理 message_id
         self._swept = set()               # 启动补回已入队的 key（防重复补）
         self._arch_times = {}             # conv -> 归档里的时间戳集合（QQ 侧补捞用）
@@ -531,9 +535,10 @@ class AutoReply:
         gap = now - self.last_reply_at.get(key, 0)
         if gap < mi:
             return False, mi - gap, "间隔"
-        while self.minute_window and now - self.minute_window[0] > 60:
-            self.minute_window.popleft()
-        if len(self.minute_window) >= int(self.cfg["max_replies_per_minute"]):
+        win = self.minute_windows.setdefault(key, deque())
+        while win and now - win[0] > 60:
+            win.popleft()
+        if len(win) >= int(self.cfg["max_replies_per_minute"]):
             return False, 0.0, "每分钟上限"
         return True, 0.0, ""
 
@@ -559,7 +564,7 @@ class AutoReply:
     def _mark(self, key):
         now = time.time()
         self.last_reply_at[key] = now
-        self.minute_window.append(now)
+        self.minute_windows.setdefault(key, deque()).append(now)
 
     def _ask_summary(self, prompt):
         """用较短路径生成摘要：默认直连 API（快），没 Key 就退到 CLI。"""
@@ -1119,15 +1124,19 @@ class AutoReply:
     def _prompt(self, conv_key, user_text, has_image=False, mid=None, bare=False,
                 excludes=None, uid=None, stale=0, replay=False, proactive=False):
         if proactive:
-            # 主动接话是另一套拼法：系统段 + 「群里最近聊了啥」+ 接话指令，
-            # 没有「对方刚说：X」，别让模型以为有人在跟它说话
+            # 主动接话是另一套拼法：系统段 + 「群里现在在聊啥」+ 接话指令，
+            # 没有「对方刚说：X」，别让模型以为有人在跟它说话。
+            # 群记录也分两层：现场（现在在聊啥）+ 背景（更早的，知道就行）
             n = int((self.cfg.get("proactive") or {}).get("context_msgs", 12) or 12)
-            lines = self._p_lines(conv_key, n)
-            last = lines[-1].split(": ", 1)[-1] if lines else ""
+            bg_n = int((self.cfg.get("proactive") or {}).get("bg_msgs", 20) or 20)
+            focus, bg = self._p_slice(conv_key, n, bg_n)
+            last = focus[-1].split(": ", 1)[-1] if focus else ""
             sys_part = self._proactive_sys(conv_key, last)
             hist = self.mem.history.setdefault(
                 conv_key, deque(maxlen=int(self.cfg["context_size"]) * 2))
-            return sys_part + "\n\n" + user_text + "\n\n" + self.PROACTIVE_TASK, hist
+            chat = self._chat_block(focus, bg)
+            return (sys_part + "\n\n" + chat + "\n\n" + user_text
+                    + "\n\n" + self.PROACTIVE_TASK), hist
         mem = self.mem.recall(conv_key, uid, user_text or "", mid, excludes)
         hist = mem["history"]
         lines = [self.cfg["system_prompt"], self.HARDEN, ""]
@@ -1173,7 +1182,26 @@ class AutoReply:
             lines.extend(mem["related"])
             lines.append("")
         ctx = mem["context"]
-        if ctx:
+        if ctx and conv_key.startswith("g"):
+            # 群聊分两层：**现场**决定接什么话，**背景**只用来了解情况。
+            # 之前是一个大平铺，模型会把三小时前的话题当成现在在聊的
+            # （真踩过：隔了一天还在追问"你买的到底是哪把雷霆"）。
+            focus_n = int(self.cfg.get("group_focus_messages", 10) or 10)
+            focus, bg = (ctx[-focus_n:], ctx[:-focus_n]) if focus_n > 0 \
+                else (ctx, [])
+            if focus:
+                lines.append("【现在的聊天现场（最近 %d 条）】" % len(focus))
+                lines.extend(focus)
+                lines.append("（这就是现在在聊什么，接话要顺着这里来。）")
+                lines.append("")
+            if bg:
+                lines.append("【更早的聊天记录（背景参考，不用主动提）】")
+                lines.extend(bg)
+                lines.append("（这些是以前聊的，你知道就行，别当成现在的话题——"
+                             "对方现在说什么就回什么，别翻旧账追问。"
+                             "行末的「N 小时前 / N 天前」就是提醒你这事有多久之前。）")
+                lines.append("")
+        elif ctx:
             lines.append("最近的对话（按时间顺序，可能包含别人之间的聊天，仅作理解上下文用）：")
             lines.extend(ctx)
             lines.append("（行末的「N 小时前 / N 天前」= 这条是很久以前说的，"
@@ -1391,10 +1419,12 @@ class AutoReply:
             # 直连 API 后端不走 _prompt，这里得自己拼主动接话那套
             # （否则模型收到群聊记录却不知道自己要干什么，也没有「跳过」这个选项）
             n = int((self.cfg.get("proactive") or {}).get("context_msgs", 12) or 12)
-            plines = self._p_lines(conv_key, n)
-            last = plines[-1].split(": ", 1)[-1] if plines else ""
+            bg_n = int((self.cfg.get("proactive") or {}).get("bg_msgs", 20) or 20)
+            focus, bg = self._p_slice(conv_key, n, bg_n)
+            last = focus[-1].split(": ", 1)[-1] if focus else ""
             sys_msg = self._proactive_sys(conv_key, last)
-            user_text = user_text + "\n\n" + self.PROACTIVE_TASK
+            user_text = (self._chat_block(focus, bg) + "\n\n" + user_text
+                         + "\n\n" + self.PROACTIVE_TASK)
             msgs = [{"role": "system", "content": sys_msg}]
             msgs.extend(list(hist))
             msgs.append({"role": "user", "content": user_text})
@@ -2094,16 +2124,47 @@ class AutoReply:
             "_proactive": True,
         })
 
+    def _chat_block(self, focus, bg):
+        """群聊记录拼成两段：现场（现在在聊啥）+ 背景（更早的，知道就行）。
+
+        以前是一个大平铺，模型会把几小时前的话题当成现在在聊的——真踩过：
+        隔了一天还在追问"你买的到底是哪把雷霆"。分开说清楚就没这问题。
+        """
+        out = []
+        if focus:
+            out.append("【现在的聊天现场（最近 %d 条）】" % len(focus))
+            out.extend(focus)
+            out.append("（这就是现在在聊什么，接话要顺着这里来。）")
+        if bg:
+            out.append("【更早的聊天记录（背景参考，不用主动提）】")
+            out.extend(bg)
+            out.append("（这些是以前聊的，你知道就行，别当成现在的话题——"
+                       "对方现在说什么就回什么，别翻旧账追问。）")
+        return "\n".join(out)
+
     def _p_lines(self, conv, n):
         """群里最近 n 条消息（含我自己说的），一行一条，旧的标出距今多久。"""
+        return self._p_slice(conv, n, 0)[0]
+
+    def _p_slice(self, conv, focus_n, bg_n):
+        """切出 (现场, 背景) 两段。
+
+        现场 = 最近 focus_n 条（现在在聊什么，决定接什么话）
+        背景 = 现场之前再往前 bg_n 条（知道就行，别当成当前话题）
+        """
         out = []
         now = time.time()
-        for m in list(self.mem.recent.get(conv) or [])[-max(1, n):]:
+        for m in (self.mem.recent.get(conv) or []):
             who = "我" if m.get("nick") == "我" else (m.get("nick") or "?")
             t = re.sub(r"\s+", " ", str(m.get("text") or "")).strip()
             if t:
                 out.append("%s: %s%s" % (who, t, self.mem.age_mark(m.get("ts"), now)))
-        return out
+        focus_n = max(1, int(focus_n or 1))
+        focus = out[-focus_n:]
+        head = out[:-len(focus)] if focus else out
+        bg_n = max(0, int(bg_n or 0))
+        bg = head[-bg_n:] if bg_n else []
+        return focus, bg
 
     def _proactive_sys(self, conv, last_text):
         """主动接话的系统段：人设 + 群记忆 + 风格 + 相关旧记忆（不含群聊记录）。"""
@@ -2163,11 +2224,12 @@ class AutoReply:
         gid = int(conv[1:])
         cfg = self.cfg.get("proactive") or {}
         n = int(cfg.get("context_msgs", 12) or 12)
-        lines = self._p_lines(conv, n)
-        if not lines:
+        bg_n = int(cfg.get("bg_msgs", 20) or 20)
+        focus, bg = self._p_slice(conv, n, bg_n)
+        if not focus:
             log("  主动接话放弃：群%s 没有可用的群聊上下文" % conv)
             return
-        ptext = "\n".join(lines)
+        ptext = self._chat_block(focus, bg)
         reply = self.llm_reply(conv, ptext, proactive=True)
         if not reply:
             log("  主动接话失败：没拿到回复（不计入发言次数，下次攒满再试）")
@@ -2209,7 +2271,8 @@ class AutoReply:
                 time.sleep(self._split_delay())
         if sent:
             # 让风格提炼和摘要也吃到这次接话（q 用群里最后一句充数）
-            self.mem.remember(conv, None, lines[-1], body)
+            last_line = focus[-1].split(": ", 1)[-1] if focus else ""
+            self.mem.remember(conv, None, last_line, body)
 
     def _grab_file(self, evt):
         """下载并保存文件（已存过则复用），返回 (name, ext, raw)。"""

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -990,7 +991,71 @@ def test_time_words():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 26. 纯函数
+# ------------------------------------------------------------ 26. 限流按会话
+def test_rate_per_session():
+    """每分钟上限按**会话**分别算。
+
+    以前是全局共享的：一个活跃私聊刷屏会把群聊的额度一起吃掉，
+    群里就发不出话来了。
+    """
+    bot, tmp = new_bot()
+    try:
+        bot.cfg["min_interval_sec"] = 0
+        bot.cfg["max_replies_per_minute"] = 2
+        bot.llm_reply = FakeLLM("一", "二", "三", "四")
+        # 私聊 111 回两条（用满它的额度）
+        bot.on_event(priv(mid="rp1"))
+        wait_for(lambda: len(bot.ob.sent["private"]) >= 1)
+        bot.on_event(priv(mid="rp2"))
+        wait_for(lambda: len(bot.ob.sent["private"]) >= 2)
+        # 第三次 → 私聊自己超限
+        bot.on_event(priv(mid="rp3"))
+        time.sleep(0.4)
+        check("本会话用满额度后不再发", len(bot.ob.sent["private"]) == 2,
+              "实发 %d 条" % len(bot.ob.sent["private"]))
+        # 另一个会话不受影响
+        bot2, tmp2 = new_bot()
+        bot2.cfg["min_interval_sec"] = 0
+        bot2.cfg["max_replies_per_minute"] = 2
+        bot2.cfg["allowed_groups"] = [222]
+        bot2.llm_reply = FakeLLM("群里的回复")
+        bot2.on_event(grp(mid="rg1"))
+        check("别的会话额度独立，不被连累",
+              wait_for(lambda: bot2.ob.sent["group"], 3.0),
+              "群发出 %d 条" % len(bot2.ob.sent["group"]))
+        shutil.rmtree(tmp2, ignore_errors=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 27. 群聊分层
+def test_group_layers():
+    """群里分两层：最近 N 条是「现场」（接话依据），更早的是「背景参考」。"""
+    bot, tmp = new_bot()
+    try:
+        bot.cfg["group_focus_messages"] = 3
+        rows = deque(maxlen=50)
+        for i in range(8):
+            rows.append({"mid": "m%d" % i, "nick": "群友", "uid": 333,
+                         "text": "第%d条" % i, "at_me": False,
+                         "ts": time.time() - (8 - i) * 600})
+        bot.mem.recent["g222"] = rows
+        p, _ = bot._prompt("g222", "在吗", uid=333)
+        check("有「现在的聊天现场」这一层", "【现在的聊天现场" in p)
+        check("有「更早的聊天记录（背景参考」这一层",
+              "【更早的聊天记录（背景参考" in p)
+        focus = p[p.find("【现在的聊天现场"):p.find("【更早的聊天记录")]
+        check("现场只取最近 N 条",
+              "第5条" in focus and "第7条" in focus and "第4条" not in focus,
+              focus[focus.find("第"):focus.find("第") + 40].replace("\n", " "))
+        bg = p[p.find("【更早的聊天记录"):]
+        check("更早的进背景层", "第0条" in bg and "第1条" in bg)
+        check("背景层交代「别当成现在的话题」", "别当成现在的话题" in bg)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 28. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1027,7 +1092,8 @@ def main():
                test_memory_isolated, test_cli_fallback, test_qq_sweep,
                test_rate_gate, test_rate_minute_cap, test_split_policy,
                test_owner, test_restore_segments, test_last_night_dates,
-               test_time_words, test_pure):
+               test_time_words, test_rate_per_session, test_group_layers,
+               test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

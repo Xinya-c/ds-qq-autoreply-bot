@@ -835,7 +835,12 @@ class BotMemory:
             mcfg = self.cfg.get("memory") or {}
             gap = float(mcfg.get("restore_gap_hours", 3) or 3) * 3600
             is_priv = conv.startswith("u")
-            keep_segs = int(mcfg.get("restore_segments", 3) or 3) if is_priv else 1
+            if is_priv:
+                keep_segs = int(mcfg.get("restore_segments", 3) or 3)
+            else:
+                # 群聊也保留几段：更早的内容进「背景参考」层，
+                # 模型知道就行，接话还是按「现场」那几条来
+                keep_segs = int(mcfg.get("group_restore_segments", 3) or 3)
             segs = []
             cur = []
             prev_ts = None

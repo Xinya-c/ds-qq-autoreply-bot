@@ -161,6 +161,17 @@ def scenarios(bot):
     m.recent["g222"] = deque(list(RECENT_G) + [old],
                              maxlen=int(bot.cfg["context_messages"]))
     out.append(("群-旧消息带时间标记", bot._prompt("g222", "在吗", uid=333)[0]))
+    # 群里分两层：最近 N 条是「现场」（接话依据），更早的是「背景参考」。
+    # 不分层的话模型会把几小时前的话题当成现在在聊的。
+    many = deque(maxlen=int(bot.cfg["context_messages"]))
+    for i in range(14):
+        r = dict(RECENT_G[i % len(RECENT_G)])
+        r["text"] = "现场第%d条" % i
+        many.append(r)
+    m.recent["g222"] = many
+    out.append(("群-现场与背景分层", bot._prompt("g222", "在吗", uid=333)[0]))
+    m.recent["g222"] = deque(list(RECENT_G),
+                             maxlen=int(bot.cfg["context_messages"]))
     # 「主人是谁」要明确告诉模型，否则它只能靠上下文猜谁在指挥它
     bot.cfg["owner_qq"] = "999000111"
     out.append(("私聊-主人段", bot._prompt("u111", "在吗", uid=111)[0]))
@@ -171,14 +182,15 @@ def scenarios(bot):
 # 基线哈希（2026-10-23 搬迁前冻结；改动 Prompt 拼装必须有意识地更新这里）
 EXPECTED = {
     "私聊+画像": "f280b5bbc11a96e5",
-    "群+个人档案+群档案": "09435d7bd3d17c32",
-    "群-无uid": "a23e7ae6101e2ff0",
+    "群+个人档案+群档案": "4cf8292bd1df1040",
+    "群-无uid": "7d58f06d9ee6a943",
     "私聊-裸@": "2f2a0677f28c97e5",
     "私聊-带图": "9fd8a6201b046f8f",
     "私聊-上下文排除": "bcaad43478e0a155",
     "私聊-离线30分钟": "86a2c3df2a9f2a08",
     "私聊-补回2天前": "d7e93a65d70742c5",
-    "群-旧消息带时间标记": "5d140296a7d4da9e",
+    "群-旧消息带时间标记": "5abe84b98b49b86f",
+    "群-现场与背景分层": "53502607429e14c9",
     "私聊-主人段": "2abc4936ad6d3ea4",
 }
 
@@ -224,16 +236,27 @@ def main():
     # 行为断言：旧消息必须带时间标记，且提示词要交代「别翻旧账」
     texts = dict(rows)
     marked = texts.get("群-旧消息带时间标记", "")
+    layer = texts.get("群-现场与背景分层", "")
     if "（3 天前）" not in marked:
         print("行为断言：旧消息没带「3 天前」标记")
         ok = False
     else:
         print("行为断言：旧消息带「3 天前」标记              OK")
-    if "别翻旧账追问" not in marked:
+    if "别翻旧账追问" not in marked and "别当成现在的话题" not in layer:
         print("行为断言：提示词没交代「别翻旧账」")
         ok = False
     else:
         print("行为断言：提示词交代「别翻旧账」              OK")
+    if "【现在的聊天现场" not in layer:
+        print("行为断言：群里没有「现在的聊天现场」这一层")
+        ok = False
+    else:
+        print("行为断言：群里有「现在的聊天现场」这一层      OK")
+    if "【更早的聊天记录（背景参考" not in layer:
+        print("行为断言：群里没有「背景参考」这一层")
+        ok = False
+    else:
+        print("行为断言：群里有「背景参考」这一层            OK")
     owner = texts.get("私聊-主人段", "")
     if "【你的主人】" not in owner or "999000111" not in owner:
         print("行为断言：主人段没带上 QQ 号")

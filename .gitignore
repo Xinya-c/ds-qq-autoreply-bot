@@ -14,7 +14,10 @@ _backup_login_*/
 # ===== 第三方工具（可重新下载）=====
 NapCat.Shell.Windows.Node/
 NapCat.Shell.Windows.Node.zip
-dist/
+# dist 里只保留要发出去的成品，中间产物（_doc.html）不进库
+dist/*
+!dist/*.zip
+!dist/*.pdf
 
 # ===== 本地记忆（含从聊天记录分析出的私人信息）=====
 .workbuddy/

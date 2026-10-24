@@ -545,6 +545,9 @@ class AutoReply:
         self.minute_windows = {}          # conv_key -> deque 最近一分钟的回复时间
         self.seen = deque(maxlen=2000)    # 已处理 message_id
         self._swept = set()               # 启动补回已入队的 key（防重复补）
+        # 本轮启动已经被「本地补回」补过的会话：QQ 侧补捞要跳过，
+        # 否则同一个人会被两套逻辑各补一遍（实测 19:16 就是这么刷屏的）
+        self._swept_convs = set()
         self._arch_times = {}             # conv -> 归档里的时间戳集合（QQ 侧补捞用）
         self.seen_set = set()
         # 群聊主动搭话：计数从「本次上线」开始，不翻旧账
@@ -1208,6 +1211,22 @@ class AutoReply:
                 continue
             segs.append({"type": "image", "data": {"file": "base64://" + b64}})
         return segs
+
+    def _parts_of(self, evt, body):
+        """决定这条回复拆成几条发出去。
+
+        补捞/补回的历史消息**不拆**。理由：它们本来就是「补一条漏掉的
+        旧消息」，拆成 3-4 条毫无意义；而补捞往往一次好几条，几条叠在
+        一起就变成刷屏。
+
+        实测事故：19:16 启动补捞，本地补回 1 条 + QQ 侧补捞 2 条（同一个
+        人），3 条各拆 2-4 段 → **2 分钟内对同一个人发了 11 条**，内容
+        还都重复（都在解释「我这儿看不到时间」），群里直接有人说
+        「死机了」「在乱发消息」。
+        """
+        if evt.get("_replay"):
+            return [body] if body else []
+        return self._split_parts(body)
 
     def _split_parts(self, text, max_parts=None):
         """把一条回复切成若干条短消息发出去。
@@ -2211,6 +2230,9 @@ class AutoReply:
             % (len(allowed_p), len(allowed_g), max_age / 3600.0, cap))
         total = 0
         for uid in allowed_p:
+            if "u%d" % uid in self._swept_convs:
+                log("  QQ 侧补捞：跳过 u%d（本地补回已补过）" % uid)
+                continue
             try:
                 hist = self._qq_history("get_friend_msg_history", uid, count)
             except Exception as e:
@@ -2219,6 +2241,9 @@ class AutoReply:
             total += self._qq_replay("u%d" % uid, "private", uid, hist,
                                      max_age, now, cap)
         for gid in allowed_g:
+            if "g%d" % gid in self._swept_convs:
+                log("  QQ 侧补捞：跳过 g%d（本地补回已补过）" % gid)
+                continue
             try:
                 hist = self._qq_history("get_group_msg_history", gid, count)
             except Exception as e:
@@ -2324,6 +2349,7 @@ class AutoReply:
         # 判定「漏回」的依据就是「归档里附近没有这条消息的时间戳」——
         # 不写的话下次启动还是判定「从没进过系统」，又补一遍、又回一遍。
         # （用户实测踩到：同一条历史消息被回复了三次，对方连着收到复读）
+        self._swept_convs.add(conv)          # 这个会话已补，别处别重复
         for m in pend:
             try:
                 self.mem.archive_incoming({
@@ -2473,6 +2499,7 @@ class AutoReply:
                 "_stale": now - newest,
             })
             total += len(pend)
+            self._swept_convs.add("u%d" % uid)   # 这个会话本地已补，QQ 侧别重复
             log("启动补回：%s(%d) 有 %d 条漏回消息（最新 %.0f 分钟前），已入队"
                 % (nick, uid, len(pend), (now - newest) / 60.0))
         if total:
@@ -2878,7 +2905,7 @@ class AutoReply:
             if imgs:
                 self._mark_img(conv)
             self.mem.remember_bot(conv, body or "[图片]")
-            parts = self._split_parts(body)
+            parts = self._parts_of(evt, body)
             nick = evt.get("sender", {}).get("nickname")
             sent = False
             # 模型只输出 [[img:xxx]] 时正文是空的，别让图片跟着一起被丢掉
@@ -2960,7 +2987,7 @@ class AutoReply:
             if imgs:
                 self._mark_img(conv)
             self.mem.remember_bot(conv, body or "[图片]")
-            parts = self._split_parts(body)
+            parts = self._parts_of(evt, body)
             nick = evt.get("sender", {}).get("nickname")
             sent = False
             # 同私聊：只发表情包时正文是空的，别连图一起丢

@@ -1641,7 +1641,57 @@ def test_at_message_archive():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 34. 纯函数
+# ------------------------------------------------------------ 34. 补捞不刷屏
+def test_replay_no_flood():
+    """补捞的历史消息不能刷屏。
+
+    实测事故：19:16 启动，本地补回补了 1 条 + QQ 侧补捞补了 2 条（同一个
+    人），3 条各拆 2-4 段 → 2 分钟内对同一个人发了 **11 条**，内容还都
+    重复（都在解释「我这儿看不到时间」），群里直接有人说「死机了」。
+
+    两道闸：
+      ① 补捞消息不拆分（_parts_of 对 _replay 返回整条）
+      ② 本地补回补过的会话，QQ 侧补捞跳过（_swept_convs）
+    """
+    bot, tmp = new_bot()
+    try:
+        # ① 正常消息照常拆
+        long_text = "第一句说的是这个。" + "第二句补充一下。" * 6
+        normal = bot._parts_of({}, long_text)
+        check("拆分：正常消息仍然会拆成多条", len(normal) > 1,
+              "%d 条" % len(normal))
+
+        # ② 补捞消息不拆
+        replay = bot._parts_of({"_replay": True}, long_text)
+        check("拆分：补捞消息不拆（避免刷屏）",
+              replay == [long_text], "%d 条" % len(replay))
+
+        # ③ 空正文不炸
+        check("拆分：补捞空正文返回空列表",
+              bot._parts_of({"_replay": True}, "") == [])
+
+        # ④ 两套补捞互斥
+        bot._swept_convs.add("u111")
+        check("补捞：本地补回补过的会话会被记录下来",
+              "u111" in bot._swept_convs)
+        # 把它从 _swept_convs 拿掉，验证 _qq_replay 补完也会登记
+        bot._swept_convs.discard("u111")
+        now = int(time.time())
+        p = os.path.join(bot.mem.archive_dir(), "private_111.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("[%s] 测试甲(111): 之前的话\n" % time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(now - 3600)))
+        hist = [{"time": now - 1800, "user_id": 111,
+                 "message": [{"type": "text", "data": {"text": "补我一条"}}],
+                 "sender": {"nickname": "测试甲"}}]
+        n = bot._qq_replay("u111", "private", 111, hist, 6 * 3600, now, 5)
+        check("补捞：QQ 侧补完会登记会话（供互斥用）",
+              "u111" in bot._swept_convs, "%d 条" % n)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 35. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1680,7 +1730,7 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_pure):
+               test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

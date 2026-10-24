@@ -1483,6 +1483,9 @@ class BotMemory:
                 if a in s and b in s]
 
     THREAD_GAP = 300               # 线程内两条消息最长间隔（秒）
+    # 判断「这条是接上一条」的窗口。比 THREAD_GAP 短得多：
+    # 5 分钟内都算同一段对话太松，90 秒内接话才更像在聊同一个话题。
+    REPLY_WINDOW = 90
 
     def social_map(self):
         """uid -> {peer: {...}}：谁跟谁真的有来往。
@@ -1532,6 +1535,7 @@ class BotMemory:
             rows.sort(key=lambda r: r[0])
             gmem = {r[1] for r in rows}
             active = []
+            threads = []               # 建过的全部线程（含已过期的）
             seq = 0
             for t, sender, body in rows:
                 ats = [int(x) for x in pat_at.findall(body)
@@ -1555,29 +1559,71 @@ class BotMemory:
                             break
                     if target is None:
                         seq += 1
-                        target = {"members": set(), "last": t, "turns": 0,
-                                  "tid": (gid, seq)}
+                        target = {"members": set(), "last": t, "counts": {},
+                                  "ats": [], "tid": (gid, seq),
+                                  "speaker": sender}
                         active.append(target)
+                        threads.append(target)
                     target["members"] |= {sender} | set(ats)
                 else:
+                    # 无 @：很多对话根本不是 @ 起来的——有人抛话题，其他人
+                    # 陆续加入。所以这里要能「接上」，不能像以前那样当成
+                    # 冷场独白丢掉。
                     for a in active:
                         if sender in a["members"]:
                             target = a
                             break
+                    if target is None:
+                        # 自己不在任何线程：判断是「接了别人刚说的话」还是
+                        # 「自己抛了个新话题」。
+                        # 判据：最近一段线程还在 REPLY_WINDOW 内，
+                        #       且它的最后发言人不是我（交替 = 在对话）。
+                        # 短消息放宽窗口：3 个字以内的回复几乎一定是在接话。
+                        recent = max(active, key=lambda a: a["last"], default=None)
+                        win = self.REPLY_WINDOW
+                        if len(body) <= 6:
+                            win = self.REPLY_WINDOW * 2
+                        if (recent is not None and recent.get("speaker") != sender
+                                and t - recent["last"] <= win):
+                            target = recent
+                        else:
+                            # 自己抛新话题：先开线程，成员暂时只有自己。
+                            # 别人接话时会走上面那条路加进来——这就是
+                            # 「陆续加入」。
+                            seq += 1
+                            target = {"members": {sender}, "last": t, "counts": {},
+                                      "ats": [], "tid": (gid, seq),
+                                      "speaker": sender}
+                            active.append(target)
+                            threads.append(target)
+                    target["members"].add(sender)
                 if target is None:
-                    continue              # 冷场里的一句独白，不构成关系
+                    continue
                 target["last"] = t
-                target["turns"] += 1
-                for other in target["members"]:
-                    if other == sender:
-                        continue
-                    e = edge(sender, other)
-                    e["g"].add(gid)
-                    e["threads"].add(target["tid"])
-                    e["turns"] += 1
-                    e["last"] = max(e["last"], t)
-                    if other in ats:
-                        e["at"] += 1
+                target["speaker"] = sender
+                target["counts"][sender] = target["counts"].get(sender, 0) + 1
+                if ats:
+                    target["ats"].append((sender, list(ats)))
+            # 线程结束后统一结算。
+            # 为什么不边处理边记：中途才加入的人，拿不到他进来之前的轮次，
+            # 会让「一起说了几句」严重偏低（实测 4 句只记 2 句）。
+            # 现在按线程走完后的发言次数算：a 和 b 在这段对话里各说了几句，相加。
+            for th in threads:
+                mem = th["members"]
+                for a in mem:
+                    for b in mem:
+                        if a == b:
+                            continue
+                        e = edge(a, b)
+                        e["g"].add(gid)
+                        e["threads"].add(th["tid"])
+                        e["turns"] += (th["counts"].get(a, 0)
+                                       + th["counts"].get(b, 0))
+                        e["last"] = max(e["last"], th["last"])
+                for src, tgs in th["ats"]:
+                    for b in tgs:
+                        if src != b:
+                            edge(src, b)["at"] += 1
             # 同群补全（最弱的边：只是在一个群里）
             for a in gmem:
                 for b in gmem:

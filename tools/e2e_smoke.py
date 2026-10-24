@@ -1888,6 +1888,81 @@ def test_tools_fallback():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_scan_new_friends():
+    """扫好友列表，补处理「已经加上但没登记」的人。
+
+    为什么需要：NapCat 没有查询待处理申请的 API（实测
+    get_friend_add_request / get_pending_friend_requests / get_requests
+    全返回「不支持的API」），set_friend_add_request 又必须要 flag，而
+    flag 只在 request 事件里。所以离线期间来的申请事件直接丢了，事后
+    查不到；你在手机 QQ 上手动同意的人，系统也完全不知道。
+
+    只能反查好友列表兜底：跟白名单 + strangers.json 对一遍，对不上的
+    就是新朋友，补打招呼、补问主人。
+    """
+    bot, tmp = new_bot(owner_qq="111")
+    try:
+        cfgp = os.path.join(tmp, "cfg.json")
+        with open(cfgp, "w", encoding="utf-8") as f:
+            json.dump({"allowed_private": [111], "owner_qq": "111"}, f)
+        bot._cfg_path = cfgp
+        bot.self_id = 999                       # 机器人自己
+        bot.cfg["stranger"] = {"enabled": True, "auto_accept": True,
+                               "greet": True, "notify_owner": True,
+                               "notify_cooldown_sec": 3600, "max_pending": 20}
+        bot._schedule = lambda e: None
+
+        class FriendOB(OB):
+            def __init__(self, friends):
+                super().__init__()
+                self.friends = friends
+
+            def call(self, action, params, timeout=15):
+                if action == "get_friend_list":
+                    return {"ok": True, "data": list(self.friends)}
+                return super().call(action, params, timeout)
+
+        # 好友列表：自己 + 主人 + 一个白名单里的人 + 两个没登记的
+        bot.ob = FriendOB([
+            {"user_id": 999, "nickname": "我自己"},
+            {"user_id": 111, "nickname": "主人"},
+            {"user_id": 222, "nickname": "老熟人"},          # 在白名单
+            {"user_id": 333, "nickname": "新来的甲"},
+            {"user_id": 444, "nickname": "新来的乙", "remark": "加我的是他"},
+        ])
+        bot.cfg["allowed_private"] = [111, 222]
+
+        n = bot.scan_new_friends(notify=True, greet=True)
+        check("扫新朋友：只挑出没登记的两个（自己/主人/白名单都排除）",
+              n == 2, "扫出 %d 个" % n)
+        check("扫新朋友：登记成待批准",
+              bot._stranger_get(333).get("status") == "pending"
+              and bot._stranger_get(444).get("status") == "pending")
+        sent_to = set(p.get("user_id") for p in bot.ob.sent["private"])
+        check("扫新朋友：给他们打了招呼", {333, 444} <= sent_to, str(sent_to))
+        check("扫新朋友：没给白名单里的人打招呼", 222 not in sent_to, str(sent_to))
+        check("扫新朋友：也没给机器人自己发消息", 999 not in sent_to, str(sent_to))
+        own = [p["message"][0]["data"]["text"] for p in bot.ob.sent["private"]
+               if p.get("user_id") == 111]
+        check("扫新朋友：通知了主人问白名单",
+              any("白名单" in t for t in own), str(own)[:80])
+        check("扫新朋友：备注也带给主人了",
+              any("加我的是他" in t for t in own), str(own)[:100])
+
+        # 再扫一次：已经登记过的不能重复打招呼
+        bot.ob = FriendOB(bot.ob.friends)
+        n2 = bot.scan_new_friends(notify=True, greet=True)
+        check("扫新朋友：重复扫不会重复登记", n2 == 0, "又扫出 %d 个" % n2)
+
+        # 已经批准过的人也不该再被扫出来
+        bot._stranger_set(555, status="approved", nick="已批准的")
+        bot.ob = FriendOB([{"user_id": 555, "nickname": "已批准的"}])
+        check("扫新朋友：已批准的不再打扰",
+              bot.scan_new_friends(notify=False, greet=False) == 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_stranger_flow():
     """陌生人加好友 → 问主人 → 批准/拒绝 的完整链路。
 
@@ -2163,7 +2238,8 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_tools_fallback, test_stranger_flow,
+               test_tools_fallback, test_scan_new_friends,
+               test_stranger_flow,
                test_sticker_understanding,
                test_face_text, test_ai_boilerplate,
                test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_cli_parallel, test_pure):

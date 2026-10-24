@@ -108,6 +108,12 @@ DEFAULTS = {
         "notify_owner": True,        # 陌生人首次发媒体时通知主人
         "notify_cooldown_sec": 3600, # 同一陌生人多久内不重复烦主人
         "max_pending": 20,           # 待处理申请上限，超过就停止自动同意（防刷）
+        # 启动时扫一遍好友列表，补处理「已经加上但没登记」的人。
+        # 为什么必须有：NapCat 没有「查询待处理申请」的 API（实测三个候选
+        # 接口全返回"不支持的API"），所以离线期间来的申请事件直接丢了、
+        # 事后查不到；而你在手机 QQ 上手动同意的人，系统也完全不知道。
+        # 只能反查好友列表来兜底。
+        "scan_on_start": True,
     },
     "sweep": {                         # 启动补回：扫漏回的私聊消息并补回复
         "enabled": True,
@@ -2507,6 +2513,78 @@ class AutoReply:
             log("  陌生人归档失败: %s" % e)
         self._schedule(evt)
 
+    def scan_new_friends(self, notify=True, greet=True):
+        """扫好友列表，把「已经是好友、但系统里没登记」的人补走一遍流程。
+
+        为什么需要这个（前情）：
+        NapCat **没有**查询「待处理好友申请」的 API——实测
+        get_friend_add_request / get_pending_friend_requests / get_requests
+        全部返回「不支持的API」，而 set_friend_add_request 又必须要 flag，
+        flag 只在 request 事件里带着。所以：
+
+        - 守护进程没运行时来的申请 → 事件直接丢了，事后**永远查不到**
+          （好友申请还挂在 QQ 服务端，但没有任何接口能列出它）
+        - 你在手机 QQ 上手动点了同意 → 系统一无所知，不会打招呼也不会
+          问主人要不要给权限
+
+        能补救的只有后者：反向查好友列表，跟白名单 + strangers.json 对一遍，
+        对不上的就是「新加进来但没走过流程的人」，补打招呼、补问主人。
+
+        so 补不了「还没被同意的申请」，只能补「已经变成好友但没登记」的。
+        要处理前者，只能去手机 QQ 上手动点同意，然后跑一次这个扫描。
+
+        返回新登记的人数。
+        """
+        try:
+            r = self.ob.call("get_friend_list", {}, timeout=20)
+        except Exception as e:
+            log("扫好友列表失败: %s" % e)
+            return 0
+        friends = r.get("data") or []
+        if not isinstance(friends, list):
+            log("扫好友列表返回格式不对: %s" % str(friends)[:120])
+            return 0
+        wl = set(int(x) for x in self.cfg.get("allowed_private") or [])
+        owners = set(self._owner_uids())
+        try:
+            me = int(self.self_id or 0)
+        except (TypeError, ValueError):
+            me = 0
+        known = set(int(k) for k in self._strangers().keys())
+        newbies = []
+        for f in friends:
+            try:
+                uid = int(f.get("user_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not uid or uid == me or uid in wl or uid in owners or uid in known:
+                continue
+            newbies.append((uid, str(f.get("nickname") or uid),
+                            str(f.get("remark") or "")))
+        if not newbies:
+            log("扫好友列表：%d 个好友，没有未登记的新朋友" % len(friends))
+            return 0
+
+        for uid, nick, remark in newbies:
+            log("扫到新朋友：%s(%s)%s —— 补登记"
+                % (nick, uid, ("，备注：" + remark) if remark else ""))
+            self._stranger_set(uid, status="pending", nick=nick,
+                               source="scan", approved_at=0)
+            if greet:
+                self._greet_stranger(uid, nick)
+            if notify:
+                self._notify_owner(
+                    "好友列表里多了个没登记的人：%s（%s）%s\n"
+                    "应该是申请我没收到（守护进程没开时来的），或者你手动同意过。\n"
+                    "我已经跟他打过招呼了。要不要把他加入白名单？\n"
+                    "· 回「同意 %s」→ 加进白名单，以后他发的文件图片我能看\n"
+                    "· 回「拒绝 %s」→ 不进白名单，只能聊天"
+                    % (nick, uid,
+                       ("（你给的备注：" + remark + "）") if remark else "（没写附言）",
+                       uid, uid))
+        log("扫好友列表完成：补登记 %d 个新朋友" % len(newbies))
+        return len(newbies)
+
     def _handle_notice(self, evt):
         """处理 notice 事件，目前只管「戳一戳」。
 
@@ -2826,6 +2904,14 @@ class AutoReply:
             self._sweep_from_qq()
         except Exception as e:
             log("QQ 侧补捞异常: %s" % e)
+        # 扫好友列表：补处理「已经加上但系统没登记」的人（离线期间来的申请、
+        # 或你在手机 QQ 上手动点过同意的）。必须在补回之后——先把消息补齐，
+        # 再处理人，免得刚打完招呼又被补回的逻辑当成陌生人重来一遍。
+        try:
+            if (self._stranger_cfg() or {}).get("scan_on_start", True):
+                self.scan_new_friends()
+        except Exception as e:
+            log("扫好友列表异常: %s" % e)
 
     # ---------- 从 QQ 侧历史捞漏回消息 ----------
     def _qq_history(self, action, ident, count):
@@ -3897,7 +3983,52 @@ def acquire_lock():
     return True
 
 
+def scan_friends_cli():
+    """手动跑一次「扫好友列表补登记」。
+
+    用途：那个申请 NapCat 不会重推、也没有接口列出来，你只能在手机 QQ 上
+    手动点同意。同意完跑这条，机器人立刻就能发现在新朋友、补打招呼、
+    问你（主人）要不要给白名单——不用重启守护进程。
+
+        python qq_autoreply.py --scan-friends
+    """
+    cfg = load_config()
+    bot = AutoReply(cfg)
+    # ws 配置两种写法都出现过：字符串 "ws://..." 或 {"url":..., "token":...}
+    ws = cfg.get("ws")
+    if isinstance(ws, dict):
+        url, token = ws.get("url"), ws.get("token")
+    else:
+        url, token = (str(ws) if ws else "ws://127.0.0.1:3001"), None
+    ob = OneBotWS(url, token)
+    try:
+        info = ob.call("get_login_info", {}, timeout=10)
+        bot.self_id = int((info.get("data") or {}).get("user_id") or 0) or None
+    except Exception as e:
+        print("连不上 NapCat（%s）。先确认 NapCat 在跑、端口对。" % e)
+        return
+    bot.ob = ob
+    print("已连上，自己：%s" % bot.self_id)
+    n = bot.scan_new_friends(notify=True, greet=True)
+    if n == 0:
+        print("\n没有发现未登记的新朋友。")
+        print("如果你刚才同意了好友申请，可能是：")
+        print("  1) 还没同步到（等几秒再跑一次）")
+        print("  2) 那个申请还挂着没被同意——QQ 服务端不会把它推给我们，")
+        print("     因为 NapCat 没有「查询待处理申请」的接口，得在手机 QQ 上点")
+    else:
+        print("\n补登记 %d 人，已打招呼并通知主人。" % n)
+    try:
+        ob.close()
+    except Exception:
+        pass
+
+
 def main():
+    import sys as _sys
+    if "--scan-friends" in _sys.argv:
+        scan_friends_cli()
+        return
     if not acquire_lock():
         try:
             old = open(PID_FILE).read().strip()

@@ -1888,6 +1888,42 @@ def test_tools_fallback():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_face_text():
+    """QQ 自带表情要带上名字，不能只留个「[表情]」。
+
+    真踩过：face 段的 data 里**只有 id**，以前直接把整段压成「[表情]」，
+    信息全丢了——模型看不出这是偷笑还是大哭。用户连发三个哭脸，模型
+    当成在开玩笑。
+    """
+    f = qa.flatten_message
+    cases = [
+        ([{"type": "face", "data": {"id": "178"}}], "[表情:捂脸]"),
+        ([{"type": "face", "data": {"id": "9"}}], "[表情:大哭]"),
+        ([{"type": "face", "data": {"id": "20"}}], "[表情:偷笑]"),
+        # 不认识的 id 也要留着——同一个 id 稳定对应同一个符号，
+        # 模型至少能看出「他一直在发同一个表情」
+        ([{"type": "face", "data": {"id": "99999"}}], "[表情#99999]"),
+        # 段里自带名字时优先用现成的（不同 NapCat 版本字段不一样）
+        ([{"type": "face", "data": {"id": "13", "summary": "[呲牙]"}}], "[呲牙]"),
+        # 商城表情带 summary
+        ([{"type": "mface", "data": {"summary": "[表情/捂脸]"}}], "[表情/捂脸]"),
+        # summary 是没营养的「[表情]」时，退到 emoji_id
+        ([{"type": "mface", "data": {"summary": "[表情]",
+                                     "emoji_id": "abc"}}], "[表情包:abc]"),
+        # 混在文字里
+        ([{"type": "text", "data": {"text": "哈哈"}},
+          {"type": "face", "data": {"id": "20"}}], "哈哈[表情:偷笑]"),
+    ]
+    for msg, exp in cases:
+        got = f(msg)
+        check("表情：%s" % exp, got == exp, repr(got))
+    # 常见 id 都得在表里，别让高频表情退化成 [表情#id]
+    from qq_mcp_server import QQ_FACE_NAMES
+    missing = [i for i in ("0", "9", "13", "14", "20", "178", "179")
+               if i not in QQ_FACE_NAMES]
+    check("表情：常见 id 都有映射", not missing, str(missing))
+
+
 def test_ai_boilerplate():
     """AI 套话清洗：只删外壳，不碰正文。
 
@@ -1955,7 +1991,7 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_tools_fallback, test_ai_boilerplate,
+               test_tools_fallback, test_face_text, test_ai_boilerplate,
                test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_cli_parallel, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()

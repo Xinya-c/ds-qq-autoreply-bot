@@ -764,7 +764,42 @@ def test_rate_minute_cap():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 20. 纯函数
+# ------------------------------------------------------------ 20. 拆分别刷屏
+def test_split_policy():
+    """只拆「真正的碎句连发」，长段落一律整条发。
+
+    用户实测反馈：发一条消息它连着回 2~4 条，看着像卡了、像刷屏。
+    根因是拆分逻辑没有判据，把一整段完整的话按换行切成了好几条。
+    """
+    bot, tmp = new_bot()
+    try:
+        # 短句连发（主人自己的习惯）→ 仍然拆
+        p = bot._split_parts("睡了吗\n想你")
+        check("短句连发仍然拆开", len(p) == 2 and p == ["睡了吗", "想你"], str(p))
+        # 长段落 → 整条发
+        long3 = ("不觉得。懦弱的人不会把这话说出来，早就自己憋着或者装作没事了。\n"
+                 "你跟我说这个，反而是件挺费劲的事。都到这份上了还愿意开口，这不叫懦弱。\n"
+                 "真要说的话，我倒觉得你是撑得太久了，累的。你现在一个人待着吗？")
+        p = bot._split_parts(long3)
+        check("长段落整条发，不拆", len(p) == 1 and "\n" in p[0], "拆成 %d 条" % len(p))
+        # 只要有一段超长就都不拆（不拆一半）
+        mixed = "短句\n这是一段明显偏长的话，长到不该被切开单独发出去，否则看着就像刷屏了\n还是短句"
+        p = bot._split_parts(mixed)
+        check("有一段超长就整条不拆", len(p) == 1, "拆成 %d 条" % len(p))
+        # max_parts 仍是兜底
+        bot.cfg["reply"]["max_parts"] = 2
+        p = bot._split_parts("一\n二\n三\n四")
+        check("max_parts 兜底生效", len(p) == 2, "拆成 %d 条" % len(p))
+        check("超出的用换行并回最后一条", "\n" in p[-1], repr(p[-1][:40]))
+        # 关掉拆分 → 整条
+        bot.cfg["reply"]["split_multiline"] = False
+        p = bot._split_parts("睡了吗\n想你")
+        check("关掉拆分就整条发", len(p) == 1)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 21. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -799,7 +834,8 @@ def main():
                test_enrich, test_stale, test_sweep, test_no_reply,
                test_weird_input, test_sticker_only, test_merge_image,
                test_memory_isolated, test_cli_fallback, test_qq_sweep,
-               test_rate_gate, test_rate_minute_cap, test_pure):
+               test_rate_gate, test_rate_minute_cap, test_split_policy,
+               test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

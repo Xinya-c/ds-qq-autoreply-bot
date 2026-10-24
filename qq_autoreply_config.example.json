@@ -110,6 +110,7 @@
   "reply": {
     "split_multiline": true,
     "max_parts": 4,
+      "split_max_seg_chars": 25,
     "split_delay_sec": 0.6
   },
   "merge_window_sec": 3,

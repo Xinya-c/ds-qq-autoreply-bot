@@ -99,6 +99,7 @@ DEFAULTS = {
         # 小女孩聊天也常把一句话拆成好几条连发，所以按换行拆开分条发更自然
         "split_multiline": True,
         "max_parts": 4,             # 最多拆成几条，超出的并回最后一条
+        "split_max_seg_chars": 25,  # 每段超过这个字数就不拆了（长段落整条发，别刷屏）
         "split_delay_sec": 0.6,     # 两条之间的间隔（再加 0~0.4s 随机）
     },     # 给模型看的“最近消息”条数（含群里没@我的）
     "restore_context": True,    # 启动时从归档文档回读最近消息，恢复上下文
@@ -816,8 +817,10 @@ class AutoReply:
     def _split_parts(self, text, max_parts=None):
         """把一条回复按换行拆成几条分开发——主人本人就是「拆多条连发」的习惯。
 
-        模型常常输出「一句话\\n一句话」，一整条发出去看着就像一大段，
-        拆开才像真人打字。
+        但只拆「真正的碎句连发」：每段都得够短（默认 25 字以内）。
+        长段落一律不拆——把一段完整的话切成三条发出去，对方看到的是
+        「卡了」「刷屏」，而真人连发是「睡了吗」「想你」这种短句。
+        （实测踩过：一句 35+53 字的话被切成三条，4 条连发更夸张）
         """
         cfg = self.cfg.get("reply") or {}
         if not cfg.get("split_multiline", True):
@@ -826,9 +829,14 @@ class AutoReply:
         parts = [p for p in parts if p]
         if len(parts) <= 1:
             return [text] if text else []
+        # 只要有一段偏长就整条不拆：要么都拆，要么都不拆，不能拆一半
+        limit = int(cfg.get("split_max_seg_chars", 25) or 0)
+        if limit > 0 and any(len(p) > limit for p in parts):
+            return [text]
         mp = max_parts if max_parts is not None else int(cfg.get("max_parts", 4) or 0)
         if mp > 0 and len(parts) > mp:
-            parts = parts[:mp - 1] + [" ".join(parts[mp - 1:])]
+            # 超出的并到最后一条：用换行接，别拼成一坨
+            parts = parts[:mp - 1] + ["\n".join(parts[mp - 1:])]
         return parts
 
     def _split_delay(self):
@@ -1030,6 +1038,8 @@ class AutoReply:
                          "如果上文有没回答完的问题，可以一并回应。不要任何前缀、解释或引号。")
         else:
             lines.append("请只输出你要回复给对方的内容，不要任何前缀、解释或引号。")
+        lines.append("（写一句话或两段就够了，别写长篇大论——你是陪人聊天，不是写作文。"
+                     "也不管聊到多深，都用大肥鱼平时的口气，别突然变成在讲道理的客服。）")
         imgs = self._list_reply_images()
         if imgs:
             lines.append("想发表情包时，在回复末尾加一个 [[img:文件名]]（一次最多一个）。"
@@ -1804,6 +1814,7 @@ class AutoReply:
         "现在没人在跟你说话，你自己判断要不要插一句：\n"
         "- 有你能自然接上的话：就用平时的口吻说一句，像群里的人那样接话。"
         "别总结、别复读别人刚说的话、别用「大家好」式开场，也别 @ 任何人；\n"
+        "- 一句两句就够了，别写长篇大论；\n"
         "- 行末标了「N 小时前 / N 天前」的是以前说过的话，早就翻篇了，"
         "别接那个旧话题；\n"
         "- 话题你不懂、插不上嘴，或者群里在说正事／吵架／煽情、不适合你捣乱："

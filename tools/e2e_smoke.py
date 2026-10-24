@@ -2414,6 +2414,58 @@ def test_batch23():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_ws_event_isolation():
+    """WS 接收线程只入队、不跑业务。
+
+    2026-10-25 实测的事故：主人发「同意 2763731949」，这条指令在接收线程里
+    同步调 send_private_msg 等响应——而响应只能由接收线程读，它正卡在自己
+    身上。结果：20 秒超时 × 3 次 = 65 秒，日志报「发送失败」，对方实际收到
+    两条重复消息（写 socket 是通的，只是读不到回执）。
+
+    这个测试锁住修法：接收线程只 put 队列，业务在独立线程跑。改回同步调用
+    的话，下面第一条断言就会挂。
+    """
+    import queue as _q
+    from qq_mcp_server import OneBotWS
+
+    ob = OneBotWS.__new__(OneBotWS)        # 不走 __init__，不真连 socket
+    ob._evq = _q.Queue(maxsize=4)
+    ob._ev_dropped = 0
+    ob._ev_ready = threading.Event()
+    ob._ev_ready.set()
+    ob._stop = False
+    ob._on_event = None
+
+    got = []
+
+    def handler(m):
+        got.append(m.get("n"))
+        raise RuntimeError("业务异常")      # 故意抛：消费线程不能被它搞死
+
+    ob.set_event_handler(handler)
+    th = threading.Thread(target=ob._event_loop, daemon=True)
+    th.start()
+    for i in range(3):
+        ob._evq.put_nowait({"n": i})
+    time.sleep(0.4)
+    check("WS：事件在独立线程里按序处理", got == [0, 1, 2], str(got))
+    check("WS：业务抛异常不会让消费线程退出", th.is_alive())
+
+    # 队列满时必须丢弃而不是阻塞——阻塞接收线程 = 把所有 call() 一起拖死
+    ob.set_event_handler(lambda m: time.sleep(5))   # 卡住消费线程
+    ok = True
+    t0 = time.time()
+    for i in range(20):
+        try:
+            ob._evq.put_nowait({"n": 100 + i})
+        except _q.Full:
+            ok = False                              # 模拟接收线程那条路径
+            break
+    check("WS：队列满时能立刻返回（不阻塞接收线程）", time.time() - t0 < 1.0)
+    check("WS：队列有上限（满了会丢，不会无限涨）", ob._evq.maxsize == 4, str(ob._evq.maxsize))
+    ob._stop = True
+
+
 def test_face_text():
     """QQ 自带表情要带上名字，不能只留个「[表情]」。
 
@@ -2518,6 +2570,7 @@ def main():
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
                test_tools_fallback, test_humanize_batch, test_batch23,
+               test_ws_event_isolation,
                test_nonfriend_msg,
                test_scan_new_friends,
                test_stranger_flow,

@@ -2670,18 +2670,34 @@ class AutoReply:
         return getattr(self, "_cfg_path", "") or os.path.join(BASE, "qq_autoreply_config.json")
 
     def _send_private_text(self, uid, text, retries=2):
+        """发一条私聊文字。返回 True 表示确认送达。
+
+        **超时不重试**：超时说明请求已经发出去了，只是没收到回执——再发一次
+        对方就收到两条一样的。宁可少发一条（对方会催），也不能重复。
+
+        2026-10-25 实测过后果：主人发「同意 xxx」，死锁导致每次 20 秒超时，
+        重试 3 次，共 65 秒，对方收到两条重复消息，日志写「发送失败」——
+        三条信息全是错的（慢了、重复了、还报失败）。
+
+        只有「异常」（连接断了这种，请求可能压根没发出去）才值得重试。
+        """
         for i in range(retries + 1):
             try:
                 r = self.ob.call("send_private_msg",
                                  {"user_id": uid, "message": [
                                      {"type": "text", "data": {"text": text}}]},
-                                 timeout=20)
+                                 timeout=10)
                 if r.get("ok"):
                     return True
+                if (r.get("error") or "") == "timeout":
+                    log("  私聊发送超时 user=%s（大概率已送达，不重试以免重复）: %s"
+                        % (uid, text[:30]))
+                    return False
             except Exception as e:
                 log("  私聊发送异常(%s): %s" % (uid, e))
             time.sleep(0.8 * (i + 1))
         log("  私聊发送失败 user=%s: %s" % (uid, text[:40]))
+        return False
         return False
 
     def _handle_stranger_msg(self, evt):

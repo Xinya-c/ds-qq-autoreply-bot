@@ -82,6 +82,7 @@ import socket
 import threading
 import collections
 import itertools
+import queue
 import urllib.parse
 import urllib.request
 import datetime
@@ -523,6 +524,22 @@ class OneBotWS:
         self._send_lock = threading.Lock()
         self._on_event = None
         self._stop = False
+        # 事件队列 + 独立消费线程。接收线程只负责「读帧 / 分发响应 / 把事件
+        # 塞队列」，绝不在接收线程里跑业务。
+        #
+        # 为什么必须分开：on_event 里只要调了 self.call()（发消息、同意好友、
+        # 回戳一戳都会调），就会死锁——call() 等响应，而响应只能由接收线程读，
+        # 接收线程正卡在 on_event 里等这个响应。表现是：
+        #   20 秒超时 → 重试 3 次 → 耗时 65 秒 → 日志报「发送失败」，
+        #   但消息其实每次都发出去了（写 socket 是通的，只是读不到回执），
+        #   用户手机上看到重复消息。
+        # 2026-10-25 实测：主人发「同意 xxx」，对方收到两条、日志报失败。
+        self._evq = queue.Queue(maxsize=2000)
+        self._ev_dropped = 0
+        self._ev_ready = threading.Event()
+        self._ev_thread = threading.Thread(
+            target=self._event_loop, daemon=True, name="ob-events")
+        self._ev_thread.start()
 
         parsed = urllib.parse.urlparse(url)
         self.host = parsed.hostname
@@ -648,16 +665,38 @@ class OneBotWS:
                 fut["result"] = msg
                 fut["event"].set()
         else:
-            if self._on_event:
-                # 必须包住：这个回调跑在**接收线程**里，它一抛异常就会
-                # 一路冒到 _recv_loop，接收线程直接退出（finally 里置
-                # _stop=True）。之后 socket 还连着、call() 还能 send，
-                # 但**永远收不到响应** → 所有动作都 timeout，
-                # 表现为「进程活着、消息发不出去」。
-                try:
-                    self._on_event(msg)
-                except Exception:
-                    pass
+            # 只入队，**绝不**在接收线程里跑业务。
+            # 以前这里是直接 self._on_event(msg) —— 只要 on_event 里调了
+            # self.call()（发消息、同意好友、回戳一戳都会调），就会死锁：
+            # 响应要靠接收线程读，而接收线程正卡在 on_event 里等这个响应。
+            # 队列满说明业务处理远远跟不上（正常每秒几条事件，2000 条够缓冲
+            # 十几分钟）。满了就丢并计数，也不能阻塞接收线程——阻塞等于把
+            # 所有 call() 一起拖死。
+            try:
+                self._evq.put_nowait(msg)
+            except queue.Full:
+                self._ev_dropped += 1
+
+    def _event_loop(self):
+        """事件消费线程：单线程顺序处理，保证事件顺序不乱。"""
+        while not self._stop:
+            try:
+                msg = self._evq.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            # 回调可能还没注册（连接刚建好、主程序还在初始化）。等一会儿，
+            # 别直接丢——登录瞬间的事件里有 self_id，丢了后面判断会受影响。
+            if not self._ev_ready.wait(10):
+                continue
+            cb = self._on_event
+            if not cb:
+                continue
+            # 包住异常：这个回调一抛，线程就退出了，之后所有事件静默丢失
+            # （进程活着、日志没动静，最难查的那种）
+            try:
+                cb(msg)
+            except Exception:
+                pass
 
     # ---- 调用 OneBot action 并等待响应 ----
     def call(self, action, params=None, timeout=15):
@@ -680,6 +719,7 @@ class OneBotWS:
 
     def set_event_handler(self, cb):
         self._on_event = cb
+        self._ev_ready.set()
 
     def close(self):
         self._stop = True

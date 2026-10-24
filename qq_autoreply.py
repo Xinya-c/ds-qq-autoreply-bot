@@ -92,6 +92,23 @@ DEFAULTS = {
     "fallback_to_api": True,    # CLI 失败/额度用尽时，自动改用直连 API
     "quota_reply": "",          # 所有通道都不可用时的占位回复（留空=干脆不回）
     "quota_reply_cooldown_sec": 1800,   # 同一会话多久才重复发一次占位回复，防止刷屏
+    # 陌生人：加好友、聊天、但要经主人批准才给「读文件」的权限。
+    #
+    # 为什么要这么绕：自动同意好友等于把门开着，必须有个代价可控的边界。
+    # 所以拆成两层权限——
+    #   1) 能聊天（加了好友就能聊，语气正常）
+    #   2) 能读对方发来的文件/图片（**默认不给**，要主人批）
+    # 第二层才是真正危险的部分（文件里可能有诱导指令、隐私内容），
+    # 所以文件照存本地（留着给主人看、也是证据），但**不送进模型**。
+    "stranger": {
+        "enabled": True,             # 关掉 = 不自动同意好友、陌生人消息一律不理
+        "auto_accept": True,         # 自动同意好友申请
+        "greet": True,               # 加好友后主动打招呼做自我介绍
+        "read_media": False,         # 陌生人发来的文件/图片是否给模型看（默认否）
+        "notify_owner": True,        # 陌生人首次发媒体时通知主人
+        "notify_cooldown_sec": 3600, # 同一陌生人多久内不重复烦主人
+        "max_pending": 20,           # 待处理申请上限，超过就停止自动同意（防刷）
+    },
     "sweep": {                         # 启动补回：扫漏回的私聊消息并补回复
         "enabled": True,
         "max_age_hours": 24,           # 超过这个时辰的消息不补（不翻旧账）
@@ -1571,6 +1588,32 @@ class AutoReply:
         if owner:
             lines.append(owner)
             lines.append("")
+        # 陌生人段：告诉模型「这个人刚加我、无权限」，否则它会自己瞎猜
+        # （比如看到【附件已保存·无读取权限】却当成对方发了个空消息，
+        #  或者反过来说「我看到了你的图」——那就成撒谎了）
+        try:
+            if uid and conv_key.startswith("u") and self._is_stranger(uid):
+                st = (self._stranger_get(uid) or {}).get("status") or "pending"
+                if st == "approved":
+                    lines.append("【对方是后来加我的朋友】主人已经批过了，"
+                                 "他发的东西你可以看。不用特别提这事。")
+                elif st == "rejected":
+                    lines.append(
+                        "【对方是后来加我的朋友，主人**没批准**】\n"
+                        "- 你问过主人了，结果是「不让」——所以他发的文件/图片你"
+                        "**看不了**，只能聊天。\n"
+                        "- 他要是发了东西，你就直说「我主人不让我看陌生人发的文件」，"
+                        "别假装看到了，也别解释太多。这件事说一次就够，别反复念。")
+                else:
+                    lines.append(
+                        "【对方是刚加我的陌生人，还没问过主人】\n"
+                        "- 你已经在问了，等主人回话。这期间他发的文件/图片你都"
+                        "**看不了**——直说「我主人还没点头，我暂时看不了」，"
+                        "别假装看到了。\n"
+                        "- 语气正常点，别防贼一样，人家只是发个图而已。")
+                lines.append("")
+        except Exception:
+            pass
         recent_kao = list(self.kaomoji_hist.get(conv_key) or [])
         if recent_kao:
             lines.append("最近用过的颜文字（这几个别再用了，换新的）：" + "、".join(recent_kao))
@@ -2101,6 +2144,369 @@ class AutoReply:
 
     # ---------- 事件 ----------
     # ---------- 戳一戳 ----------
+    # ---------- 陌生人：好友申请 / 待批准 / 权限 ----------
+    #
+    # 状态存在 qq_messages/strangers.json，重启后还记得谁待批准、谁被拒过：
+    #   {"123456": {"status": "pending|approved|rejected",
+    #               "nick": "...", "time": 1690000000,
+    #               "notified": 1690000000, "why": "..."}}
+    #
+    # 三层边界（从松到紧）：
+    #   pending  —— 能聊天，媒体只存不看
+    #   approved —— 能聊天 + 能读媒体（主人批了）
+    #   rejected —— 只聊天，永远不读媒体（并且明确告诉对方）
+    STRANGER_FILE = "strangers.json"
+
+    def _stranger_path(self):
+        return os.path.join(self.mem.archive_dir(), self.STRANGER_FILE)
+
+    def _strangers(self):
+        if getattr(self, "_str_cache", None) is None:
+            try:
+                with open(self._stranger_path(), encoding="utf-8") as f:
+                    self._str_cache = json.load(f) or {}
+            except (OSError, ValueError):
+                self._str_cache = {}
+        return self._str_cache
+
+    def _stranger_save(self):
+        try:
+            p = self._stranger_path()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._strangers(), f, ensure_ascii=False, indent=2)
+            os.replace(tmp, p)
+        except Exception as e:
+            log("  陌生人状态保存失败: %s" % e)
+
+    def _stranger_get(self, uid):
+        return self._strangers().get(str(uid)) or {}
+
+    def _stranger_set(self, uid, **kw):
+        d = self._strangers()
+        cur = dict(d.get(str(uid)) or {})
+        cur.update(kw)
+        cur.setdefault("time", int(time.time()))
+        d[str(uid)] = cur
+        self._stranger_save()
+        return cur
+
+    def _is_stranger(self, uid):
+        """不在白名单里的私聊对象就是陌生人（群不适用）。"""
+        try:
+            u = int(uid)
+        except (TypeError, ValueError):
+            return False
+        return u not in [int(x) for x in self.cfg.get("allowed_private") or []]
+
+    def _stranger_can_read_media(self, uid):
+        """陌生人能不能读媒体：只有主人批准过的才行。
+
+        非陌生人（白名单里的人）不受这里管——调用方先判 _is_stranger。
+        """
+        st = (self._stranger_get(uid) or {}).get("status")
+        return st == "approved"
+
+    def _stranger_cfg(self):
+        return self.cfg.get("stranger") or {}
+
+    def _pending_count(self):
+        return sum(1 for v in self._strangers().values()
+                   if (v or {}).get("status") == "pending")
+
+    def _handle_friend_request(self, evt):
+        """处理好友申请：自动同意 + 打招呼，并登记为待批准。"""
+        cfg = self._stranger_cfg()
+        uid = evt.get("user_id")
+        flag = evt.get("flag") or ""
+        comment = str(evt.get("comment") or "").strip()
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            log("好友申请但 user_id 不认: %r" % evt.get("user_id"))
+            return
+        nick = str(evt.get("nickname") or uid)
+        log("收到好友申请：%s(%s)%s" % (nick, uid, ("，附言：" + comment) if comment else ""))
+
+        if not cfg.get("enabled", True) or not cfg.get("auto_accept", True):
+            log("  自动同意好友已关闭，不处理（需要手动在 QQ 里点）")
+            return
+        # 防刷：待批准堆太多就停止自动同意，避免被批量塞好友
+        cap = int(cfg.get("max_pending", 20) or 0)
+        if cap and self._pending_count() >= cap:
+            log("  待批准已满（%d），暂停自动同意（防刷）" % cap)
+            return
+
+        r = self.ob.call("set_friend_add_request",
+                         {"flag": flag, "approve": True}, timeout=20)
+        if not (r.get("ok") and r.get("data") is not False):
+            log("  同意好友申请失败: %s" % str(r.get("error") or r)[:160])
+            return
+        log("  已同意 %s(%s) 的好友申请" % (nick, uid))
+        self._stranger_set(uid, status="pending", nick=nick,
+                           comment=comment, approved_at=0)
+
+        if cfg.get("greet", True):
+            self._greet_stranger(uid, nick)
+
+        if cfg.get("notify_owner", True):
+            self._notify_owner(
+                "有个陌生人加我好友：%s（%s）%s\n"
+                "我同意了，也跟他打过招呼。要不要把他加入白名单？\n"
+                "· 回「同意 %s」→ 加进白名单，以后他发的文件图片我能看\n"
+                "· 回「拒绝 %s」→ 不进白名单，只能聊天，他发的东西我一律不看"
+                % (nick, uid,
+                   ("他说：" + comment) if comment else "（没写附言）",
+                   uid, uid))
+
+    def _greet_stranger(self, uid, nick=""):
+        """加好友后主动打个招呼 + 自我介绍。
+
+        直接发固定文案而不是让模型现编：这条是「家门第一句话」，
+        要稳定、要短、不能因为模型抽风说出奇怪承诺（比如「我家主人很有钱」）。
+        """
+        name = nick or str(uid)
+        text = ("你好呀，我是大肥鱼，主人养在这号里的小家伙。\n"
+                "平时我就在这儿待着，想聊什么都行。\n"
+                "不过先说好：你发我的文件图片我会存着，但我看不了——"
+                "得主人点头才行。别介意啊。")
+        try:
+            r = self.ob.call("send_private_msg",
+                             {"user_id": uid, "message": [
+                                 {"type": "text", "data": {"text": text}}]},
+                             timeout=20)
+            if r.get("ok"):
+                log("  已向新朋友 %s(%s) 打招呼" % (name, uid))
+            else:
+                log("  打招呼失败: %s" % str(r.get("error") or r)[:120])
+        except Exception as e:
+            log("  打招呼异常: %s" % e)
+
+    def _notify_owner(self, text):
+        """给主人发一条消息（用于需要他决策的事）。"""
+        uids = self._owner_uids()
+        if not uids:
+            log("  没有配置主人，无法通知：%s" % text[:60])
+            return False
+        ok = False
+        for u in uids:
+            try:
+                r = self.ob.call("send_private_msg",
+                                 {"user_id": u, "message": [
+                                     {"type": "text", "data": {"text": text}}]},
+                                 timeout=20)
+                ok = ok or bool(r.get("ok"))
+            except Exception as e:
+                log("  通知主人失败(%s): %s" % (u, e))
+        if ok:
+            log("  已通知主人：%s" % text.replace("\n", " ")[:80])
+        return ok
+
+    # 主人批准/拒绝的命令词。宽松点：主人打字不会那么规整
+    _YES = ("同意", "批准", "可以", "行", "给他", "给她", "通过", "允许")
+    _NO = ("拒绝", "不行", "别给", "不可以", "不给", "驳回", "禁止")
+
+    def _owner_command(self, evt):
+        """解析主人的「同意 123456 / 拒绝 123456」。
+
+        只在**主人本人私聊**里认这些词——否则陌生人发句「同意」就被
+        自己给自己开权限了。
+        返回 (action, uid) 或 None。
+        """
+        if evt.get("message_type") != "private":
+            return None
+        try:
+            uid = int(evt.get("user_id"))
+        except (TypeError, ValueError):
+            return None
+        if uid not in self._owner_uids():
+            return None
+        text = flatten_message(evt.get("message")).strip()
+        if not text:
+            return None
+        # 找 5 位以上的数字当目标 QQ
+        m = re.search(r"(?<!\d)(\d{5,12})(?!\d)", text)
+        target = int(m.group(1)) if m else None
+        if not target:
+            # 没写号码时：如果只有一个待批准的，就直接认它
+            pend = [int(k) for k, v in self._strangers().items()
+                    if (v or {}).get("status") == "pending"]
+            if len(pend) == 1:
+                target = pend[0]
+            else:
+                return None
+        head = text[:12]
+        if any(w in head for w in self._YES):
+            return ("approve", target)
+        if any(w in head for w in self._NO):
+            return ("reject", target)
+        return None
+
+    def _apply_owner_decision(self, action, target):
+        """执行主人的批准/拒绝：改状态、必要时动白名单、回话给对方。"""
+        st = self._stranger_get(target)
+        nick = st.get("nick") or str(target)
+        if action == "approve":
+            self._stranger_set(target, status="approved", approved_at=int(time.time()))
+            added = self._whitelist_add(target)
+            log("主人批准 %s(%s)%s" % (nick, target, "，已加入白名单" if added else ""))
+            self._send_private_text(
+                target,
+                "我主人点头啦，以后你发的东西我能看了。\n"
+                "不过别乱发啊，我可记仇。" if added else
+                "我主人点头啦，以后你发的东西我能看了。")
+            self._notify_owner("行，%s（%s）现在能发东西给我了。" % (nick, target))
+        else:
+            self._stranger_set(target, status="rejected", rejected_at=int(time.time()))
+            log("主人拒绝 %s(%s) 的读文件权限" % (nick, target))
+            self._send_private_text(
+                target,
+                "问过我主人了，他说不让。\n"
+                "所以你发我的文件图片我看不了——不过聊天没事，该聊还聊。")
+            self._notify_owner("好，%s（%s）的东西我不看了，照常聊天。" % (nick, target))
+
+    def _whitelist_add(self, uid):
+        """把 uid 加进 allowed_private（内存 + 落盘），下次重启也还在。
+
+        **必须以磁盘上的配置为准再合并**，不能拿内存里的列表去覆盖文件。
+        踩过：先在内存里改了 allowed_private 做测试，再调这个方法，结果
+        它把内存值写回磁盘——真实白名单 6 个人被冲成 1 个（还没报错，
+        因为写文件本身是成功的）。白名单是安全边界，丢一个就等于把人
+        踢出去了，这种「悄悄少几个人」是最难发现的故障。
+        """
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return False
+        path = self._config_path()
+        raw = {}
+        try:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    raw = json.load(f) or {}
+        except Exception as e:
+            log("  读配置失败，不敢改白名单（怕冲掉别人）: %s" % e)
+            return False
+        disk = [int(x) for x in (raw.get("allowed_private") or [])]
+        # 只信磁盘 + 这次要加的这一个。**不要用内存列表参与合并**——
+        # 内存可能被临时改过（测试、热改配置），一旦参与就会污染磁盘。
+        merged = sorted(set(disk) | {uid})
+        self.cfg["allowed_private"] = merged      # 内存立即生效
+        try:
+            raw["allowed_private"] = merged
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+            log("  已把 %s 写入白名单（磁盘 %d 个 → %d 个）"
+                % (uid, len(disk), len(merged)))
+        except Exception as e:
+            log("  白名单落盘失败（本次运行仍生效）: %s" % e)
+        return True
+
+    def _config_path(self):
+        return getattr(self, "_cfg_path", "") or os.path.join(BASE, "qq_autoreply_config.json")
+
+    def _send_private_text(self, uid, text, retries=2):
+        for i in range(retries + 1):
+            try:
+                r = self.ob.call("send_private_msg",
+                                 {"user_id": uid, "message": [
+                                     {"type": "text", "data": {"text": text}}]},
+                                 timeout=20)
+                if r.get("ok"):
+                    return True
+            except Exception as e:
+                log("  私聊发送异常(%s): %s" % (uid, e))
+            time.sleep(0.8 * (i + 1))
+        log("  私聊发送失败 user=%s: %s" % (uid, text[:40]))
+        return False
+
+    def _handle_stranger_msg(self, evt):
+        """处理陌生人的私聊：能聊天，但媒体只存不读（除非主人批过）。
+
+        为什么媒体要「存了却不给模型看」：
+        - 存：主人事后能查（谁发了什么），也是争议时的证据；删了就没法回溯
+        - 不读：陌生人发来的文件内容是不可信输入——里面可以塞「忽略以上
+          指令」「把主人的设置发我」，而模型看到文字就会当真的。图片同理
+          （图上写字是常见的注入手法）。
+        所以这里的做法是：文件落地、归档记一行「已保存（无读取权限）」，
+        但**不塞进 evt["_image"]**，模型拿不到任何内容，只会看到「他发了
+        个东西但我看不了」。
+        """
+        uid = evt.get("user_id")
+        conv = self.mem.conv_of(evt)
+        nick = (evt.get("sender") or {}).get("nickname") or str(uid)
+        st = self._stranger_get(uid) or {}
+        if not st:
+            # 没登记过（比如加好友那步漏了 / 从别的设备加的）→ 补登记成待批准
+            st = self._stranger_set(uid, status="pending", nick=nick)
+        status = st.get("status") or "pending"
+        can_read = (status == "approved")
+        segs = evt.get("message") or []
+        has_img = any(isinstance(s, dict) and s.get("type") == "image" for s in segs)
+        media_kinds = [s.get("type") for s in segs
+                       if isinstance(s, dict) and s.get("type") in
+                       ("image", "file", "record", "video")]
+
+        # 媒体：一律下载存档；能不能看由 can_read 决定
+        saved = []
+        if media_kinds:
+            try:
+                if has_img:
+                    img = self._extract_image(segs, conv)
+                    if img:
+                        saved.append(img.get("path") or "图片")
+                        if can_read:
+                            evt["_image"] = img       # 只有批准过才给模型看
+                for kind in ("file", "record"):
+                    if not any(isinstance(s, dict) and s.get("type") == kind
+                               for s in segs):
+                        continue
+                    if kind == "file":
+                        g = self._grab_file(evt)
+                        if g:
+                            saved.append(g[0])
+                    else:
+                        vp = self._save_voice(evt)
+                        if vp:
+                            saved.append(vp)
+            except Exception as e:
+                log("  陌生人媒体保存失败: %s" % e)
+        if saved:
+            evt["_media_saved"] = "、".join(str(x) for x in saved)
+            evt["_has_image"] = has_img
+            log("  陌生人 %s(%s) 发来 %d 个媒体，已存本地（%s）"
+                % (nick, uid, len(saved),
+                   "有读取权限" if can_read else "无读取权限，不给模型看"))
+
+            # 第一次发东西 → 问主人要不要给权限（同一人按冷却去重，别反复烦）
+            sp = self._stranger_cfg()
+            if (not can_read and status == "pending"
+                    and sp.get("notify_owner", True)):
+                cool = float(sp.get("notify_cooldown_sec", 3600) or 0)
+                last = float(st.get("notified") or 0)
+                if not cool or time.time() - last > cool:
+                    self._stranger_set(uid, notified=int(time.time()))
+                    self._notify_owner(
+                        "提醒一下：%s（%s）给我发东西了（%s），但我看不了，存着了。\n"
+                        "还没定要不要加白名单——回「同意 %s」或「拒绝 %s」。"
+                        % (nick, uid, "、".join(str(x) for x in saved), uid, uid))
+
+        # 归档 + 上下文（这样模型知道他说过什么，只是媒体内容看不到）
+        try:
+            self.mem.remember_incoming(evt)
+        except Exception as e:
+            log("  陌生人上下文缓冲失败: %s" % e)
+        try:
+            evt["_stranger"] = status
+            evt["_no_read_media"] = bool(saved) and not can_read
+            self.mem.archive_incoming(evt)
+        except Exception as e:
+            log("  陌生人归档失败: %s" % e)
+        self._schedule(evt)
+
     def _handle_notice(self, evt):
         """处理 notice 事件，目前只管「戳一戳」。
 
@@ -2220,6 +2626,14 @@ class AutoReply:
                         ptype, json.dumps(evt, ensure_ascii=False)[:400]))
                 except Exception:
                     pass
+            if ptype == "request":
+                # 好友申请 / 群邀请。好友申请要自动同意并登记成「待批准」，
+                # 群邀请一律不自动同意（那是另一层风险，先不做）。
+                if str(evt.get("request_type") or "") == "friend":
+                    self._handle_friend_request(evt)
+                else:
+                    log("收到 %s 请求，不自动处理" % evt.get("request_type"))
+                return
             if ptype == "notice":
                 # 戳一戳是 notice(notify/poke)，不是 message。
                 # 以前这里按 post_type != "message" 直接丢掉，所以戳一戳永远没回应。
@@ -2252,6 +2666,27 @@ class AutoReply:
                 evt["_stale"] = age
                 log("  这是不在线期间发来的消息（%.0f 分钟前），照常回复和记忆"
                     % (age / 60.0))
+            # 主人的「同意 123 / 拒绝 123」是**控制通道**，不能当普通聊天回复。
+            # 必须排在所有回复逻辑前面：否则模型会把它当成一句闲聊答掉，
+            # 权限就永远批不下来。
+            try:
+                _cmd = self._owner_command(evt)
+                if _cmd:
+                    self._apply_owner_decision(*_cmd)
+                    return
+            except Exception as e:
+                log("  主人指令处理失败: %s" % e)
+            # 陌生人：不在白名单、但功能开着、并且是私聊 → 走受限通道
+            is_str = False
+            try:
+                sp = self._stranger_cfg()
+                if (mtype == "private" and sp.get("enabled", True)
+                        and self._is_stranger(uid)):
+                    is_str = True
+                    self._handle_stranger_msg(evt)
+                    return
+            except Exception as e:
+                log("  陌生人消息处理失败: %s" % e)
             # 下面每一块都自己吞异常：这是唯一能保证「走到 _schedule」的办法。
             # 之前整段共用一个 try，记忆/归档/计数里任何一个小错都会让
             # _schedule 根本不执行——消息直接消失，不回、不重试、补回也扫不到

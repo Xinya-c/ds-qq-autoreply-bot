@@ -759,6 +759,10 @@ class BotMemory:
             size_txt = ("%.1fKB" % (size / 1024.0)) if size >= 1024 \
                 else ("%dB" % size)
             parts.append("【图片】%s (%s)" % (rel, size_txt))
+        elif evt.get("_no_read_media") and evt.get("_media_saved"):
+            # 陌生人发的东西：文件存了，但没给模型看。归档必须**明确写出来**，
+            # 否则模型看到空正文只会以为对方发了条空消息，答得莫名其妙。
+            parts.append("【附件已保存·无读取权限】%s" % evt["_media_saved"])
         elif evt.get("_has_image") and "[图片]" not in text:
             parts.append("【图片】")
         body = " ".join(parts) if parts else "（空消息）"

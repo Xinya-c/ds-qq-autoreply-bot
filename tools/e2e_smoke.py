@@ -1888,6 +1888,115 @@ def test_tools_fallback():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_stranger_flow():
+    """陌生人加好友 → 问主人 → 批准/拒绝 的完整链路。
+
+    核心安全点：陌生人**不能给自己批权限**。批准命令必须来自主人本人
+    的私聊，否则谁发一句「同意 123456」就能开自己的权限。
+    """
+    bot, tmp = new_bot(owner_qq="111")
+    try:
+        # 隔离配置路径：_whitelist_add 会写盘，绝不能碰真实配置
+        cfgp = os.path.join(tmp, "cfg.json")
+        with open(cfgp, "w", encoding="utf-8") as f:
+            json.dump({"allowed_private": [111], "owner_qq": "111"}, f)
+        bot._cfg_path = cfgp
+        bot.cfg["stranger"] = {"enabled": True, "auto_accept": True,
+                               "greet": True, "notify_owner": True,
+                               "notify_cooldown_sec": 3600, "max_pending": 20}
+        bot._schedule = lambda e: None
+
+        class RecOB(OB):
+            def __init__(self):
+                super().__init__()
+                self.actions = []
+
+            def call(self, action, params, timeout=15):
+                self.actions.append(action)
+                return super().call(action, params, timeout)
+
+        def texts(uid):
+            return [p["message"][0]["data"]["text"]
+                    for p in bot.ob.sent["private"]
+                    if p.get("user_id") == uid]
+
+        # ① 陌生人加好友
+        bot.ob = RecOB()
+        STR = 88888
+        bot._stranger_set(STR, status="pending", nick="路人甲")
+        bot._handle_friend_request({
+            "post_type": "request", "request_type": "friend",
+            "user_id": STR, "nickname": "路人甲",
+            "comment": "你好呀", "flag": "f1"})
+        check("陌生人：同意了申请", "set_friend_add_request" in bot.ob.actions,
+              str(bot.ob.actions))
+        check("陌生人：向对方做了自我介绍",
+              any("大肥鱼" in t for t in texts(STR)), str(texts(STR))[:80])
+        own = texts(111)
+        check("陌生人：加完好友立刻通知主人问白名单",
+              any("白名单" in t and str(STR) in t for t in own),
+              str(own)[:80])
+        check("陌生人：状态登记成待批准",
+              bot._stranger_get(STR).get("status") == "pending")
+
+        # ② 陌生人想给自己批权限 → 必须无效
+        bot.ob = RecOB()
+        evil = priv(uid=STR, text="同意 %d" % STR, mid="evil1")
+        check("陌生人：自己说「同意」不算数", bot._owner_command(evil) is None,
+              str(bot._owner_command(evil)))
+        check("陌生人：白名单没被偷偷加",
+              STR not in [int(x) for x in bot.cfg["allowed_private"]])
+
+        # ③ 主人批准
+        bot.ob = RecOB()
+        ok_evt = priv(uid=111, text="同意 %d" % STR, mid="ok1")
+        cmd = bot._owner_command(ok_evt)
+        check("主人：能解析「同意 QQ号」", cmd == ("approve", STR), str(cmd))
+        bot._apply_owner_decision(*cmd)
+        check("主人批准后状态变成 approved",
+              bot._stranger_get(STR).get("status") == "approved")
+        check("主人批准后进了白名单",
+              STR in [int(x) for x in bot.cfg["allowed_private"]],
+              str(bot.cfg["allowed_private"]))
+        with open(cfgp, encoding="utf-8") as f:
+            disk = json.load(f)["allowed_private"]
+        check("主人批准后白名单落盘", STR in disk, str(disk))
+        check("主人批准后告诉对方可以了",
+              any("点头" in t or "能看" in t for t in texts(STR)),
+              str(texts(STR))[:80])
+        check("批准后能读媒体", bot._stranger_can_read_media(STR))
+
+        # ④ 另一个陌生人，主人拒绝
+        S2 = 77777
+        bot._stranger_set(S2, status="pending", nick="路人乙")
+        bot.ob = RecOB()
+        no_evt = priv(uid=111, text="拒绝 %d" % S2, mid="no1")
+        cmd = bot._owner_command(no_evt)
+        check("主人：能解析「拒绝 QQ号」", cmd == ("reject", S2), str(cmd))
+        bot._apply_owner_decision(*cmd)
+        check("拒绝后状态是 rejected",
+              bot._stranger_get(S2).get("status") == "rejected")
+        check("拒绝后没进白名单",
+              S2 not in [int(x) for x in bot.cfg["allowed_private"]],
+              str(bot.cfg["allowed_private"]))
+        check("拒绝后不能读媒体", not bot._stranger_can_read_media(S2))
+        check("拒绝后告诉他「主人不让我看」",
+              any("不让" in t or "看不了" in t for t in texts(S2)),
+              str(texts(S2))[:80])
+
+        # ⑤ 白名单不能被内存值冲掉（真踩过：6 个被冲成 1 个）
+        with open(cfgp, "w", encoding="utf-8") as f:
+            json.dump({"allowed_private": [1, 2, 3, 4, 5, 6]}, f)
+        bot.cfg["allowed_private"] = [1]        # 内存被改坏
+        bot._whitelist_add(9)
+        with open(cfgp, encoding="utf-8") as f:
+            after = set(json.load(f)["allowed_private"])
+        check("白名单：以磁盘为准合并，不被内存冲掉",
+              after == {1, 2, 3, 4, 5, 6, 9}, str(sorted(after)))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_sticker_understanding():
     """表情包要能被「看懂」，而不是被当照片描述。
 
@@ -2054,7 +2163,8 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_tools_fallback, test_sticker_understanding,
+               test_tools_fallback, test_stranger_flow,
+               test_sticker_understanding,
                test_face_text, test_ai_boilerplate,
                test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_cli_parallel, test_pure):
         print("--- %s ---" % fn.__name__)

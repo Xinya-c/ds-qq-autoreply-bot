@@ -116,6 +116,11 @@ def build_bot(tmp):
     bot.self_id = 999
     # 主人段单独测：这里清空，免得本地配置（owner_qq）影响 prompt 基线
     bot.cfg["owner_qq"] = ""
+    # 私聊场景里的 uid 都是「熟人」，必须放进白名单——否则会被当成
+    # 陌生人，prompt 里多出一段「这人刚加我、看不了他发的文件」，
+    # 那测的就不是「正常私聊」这个场景了。陌生人段有专门的用例。
+    bot.cfg["allowed_private"] = [111, 333, 999]
+    bot.cfg["allowed_groups"] = [222]
     # 加载各层（兼容搬迁前后：搬迁后在 bot.mem 上）
     m = getattr(bot, "mem", bot)
     if hasattr(m, "load_all"):
@@ -176,6 +181,15 @@ def scenarios(bot):
     bot.cfg["owner_qq"] = "999000111"
     out.append(("私聊-主人段", bot._prompt("u111", "在吗", uid=111)[0]))
     bot.cfg["owner_qq"] = ""
+    # 陌生人：不在白名单的私聊，prompt 要交代「这人刚加我、他的东西你看不了」，
+    # 否则模型看到【附件已保存·无读取权限】会当成对方发了条空消息
+    bot._str_cache = {"555": {"status": "pending", "nick": "陌生甲"}}
+    out.append(("私聊-陌生人待批准", bot._prompt("u555", "在吗", uid=555)[0]))
+    bot._str_cache = {"555": {"status": "rejected", "nick": "陌生甲"}}
+    out.append(("私聊-陌生人被拒", bot._prompt("u555", "在吗", uid=555)[0]))
+    bot._str_cache = {"555": {"status": "approved", "nick": "陌生甲"}}
+    out.append(("私聊-陌生人已批准", bot._prompt("u555", "在吗", uid=555)[0]))
+    bot._str_cache = {}
     return out
 
 
@@ -192,6 +206,9 @@ EXPECTED = {
     "群-旧消息带时间标记": "695d77ce56529ce9",
     "群-现场与背景分层": "c3ef4567aa861e67",
     "私聊-主人段": "9818b2536491df3d",
+    "私聊-陌生人待批准": "c57b503f8f50bd57",
+    "私聊-陌生人被拒": "83f83cec9856ed63",
+    "私聊-陌生人已批准": "44c04129a3d002d4",
 }
 
 # human_age 的用例（秒 -> 期望文案），顺手钉住时间颗粒度

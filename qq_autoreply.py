@@ -1667,6 +1667,19 @@ class AutoReply:
                          else "【跟这个人的关系】")
             lines.append(mem["profile"])
             lines.append("")
+        # 亲密度：聊过多少轮 / 认识多久 / 整体情绪色调。
+        # 不塞进档案里——档案是模型提炼的文本（几十轮更新一次），亲密度是
+        # 本地计数（每条都变），两者混在一起会让档案看不出哪些是新信息。
+        # 作用不是"数据展示"，是让语气有依据：刚认识就别自来熟，很熟了
+        # 就不用客气——光靠人设里的「熟人/生人」两档太粗。
+        try:
+            il = self.mem.intimacy_line(
+                conv_key, "在这个群" if conv_key.startswith("g") else "跟他")
+        except Exception:
+            il = ""
+        if il:
+            lines.append("（%s）" % il)
+            lines.append("")
         if mem["stages"]:
             lines.append("【更早的阶段回顾（较早发生的事）】")
             lines.append(mem["stages"])

@@ -576,6 +576,7 @@ class BotMemory:
         self.profile = {}                # conv -> 关系档案（称呼/亲密度/禁忌）
         self.user_profile = {}           # "g<gid>|u<uid>" -> 群内个人档案（与群级并存）
         self.mood = {}                   # conv -> deque 最近情绪（情绪轨迹）
+        self.intimacy = {}                # conv -> {n,pos,neg,neu,first,last} 互动量
         self.samples = []                # 手挑的风格样本（self_samples.md，可选）
         self.style = ""                  # 长期养成的说话风格（全局，跨会话）
         self.sent_since_style = 0        # 距上次提炼风格累计说过多少句
@@ -595,6 +596,7 @@ class BotMemory:
         self._load_summaries()
         self._load_stages()
         self._load_profiles()
+        self._load_intimacy()
         self._load_style()
         self._load_samples()
         self._build_search_index()
@@ -640,6 +642,7 @@ class BotMemory:
         sender = evt.get("sender") or {}
         text = flatten_message(evt.get("message")).replace("@%s" % self.self_id, "").strip()
         self._note_mood(conv, text)
+        self.note_intimacy(conv, text)
         d = self.recent.get(conv)
         if d is None:
             d = deque(maxlen=int(self.cfg.get("context_messages", 12)))
@@ -1417,26 +1420,34 @@ class BotMemory:
             self._merge_profile(conv, "\n".join(plain).strip())
 
     # ---------- 情绪轨迹 ----------
+    @staticmethod
+    def classify_mood(text):
+        """按关键词粗判情绪，返回「愉快 / 不耐烦 / 低落 / 求助 / 平静」。
+
+        抽成静态方法是因为亲密度也要按它归色调——两处各写一份的话，
+        以后调关键词只改一处，两边就会给出不一样的判断。
+        """
+        t = text or ""
+        low = t.lower()
+        if any(k in t for k in ("哈哈", "233", "笑死", "开心", "太好了", "厉害",
+                                "牛", "谢谢", "感谢", "喜欢", "爱你", "棒")):
+            return "愉快"
+        if any(k in t for k in ("生气", "气死", "滚", "讨厌", "烦死", "有病",
+                                "毛病", "傻逼", "sb", "闭嘴")):
+            return "不耐烦"
+        if any(k in t for k in ("难过", "伤心", "哭", "emo", "累", "无聊",
+                               "孤独", "抑郁", "不想", "烦", "崩")):
+            return "低落"
+        if any(k in low for k in ("?", "？", "为什么", "怎么", "吗", "求", "帮")):
+            return "求助"
+        return "平静"
+
     def _note_mood(self, conv, text):
         """按关键词粗判对方情绪，存最近几条形成轨迹（不额外消耗额度）。"""
         cfg = self.cfg.get("memory") or {}
         if not cfg.get("mood_enabled", True):
             return
-        t = text or ""
-        low = t.lower()
-        if any(k in t for k in ("哈哈", "233", "笑死", "开心", "太好了", "厉害",
-                                "牛", "谢谢", "感谢", "喜欢", "爱你", "棒")):
-            m = "愉快"
-        elif any(k in t for k in ("生气", "气死", "滚", "讨厌", "烦死", "有病",
-                                  "毛病", "傻逼", "sb", "闭嘴")):
-            m = "不耐烦"
-        elif any(k in t for k in ("难过", "伤心", "哭", "emo", "累", "无聊",
-                                  "孤独", "抑郁", "不想", "烦", "崩")):
-            m = "低落"
-        elif any(k in low for k in ("?", "？", "为什么", "怎么", "吗", "求", "帮")):
-            m = "求助"
-        else:
-            m = "平静"
+        m = self.classify_mood(text)
         d = self.mood.get(conv)
         if d is None:
             d = deque(maxlen=6)
@@ -1454,6 +1465,91 @@ class BotMemory:
         # set 迭代顺序随进程哈希种子漂移，平局时"整体偏什么"每次重启都乱变。
         dom = Counter(seq).most_common(1)[0][0]
         return "最近几条的情绪：%s → 整体偏%s" % (tail, dom)
+
+    # ---------- 亲密度（跟每个人的互动量，纯本地计数不花额度） ----------
+    def _intimacy_path(self):
+        return os.path.join(self.archive_dir(), "intimacy.json")
+
+    def _load_intimacy(self):
+        try:
+            with open(self._intimacy_path(), encoding="utf-8") as f:
+                d = json.load(f) or {}
+            self.intimacy = {k: v for k, v in d.items() if isinstance(v, dict)}
+        except Exception:
+            self.intimacy = {}
+
+    def _save_intimacy(self):
+        """落盘失败不影响运行——亲密度只是锦上添花，不能因为它写不进去就不回话。"""
+        try:
+            p = self._intimacy_path()
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.intimacy, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, p)
+        except Exception as e:
+            log("  亲密度落盘失败（本次运行仍生效）: %s" % e)
+
+    def note_intimacy(self, conv, text):
+        """对方每说一句记一轮，顺带按情绪归一次色调。
+
+        为什么不复用 mood：mood 是最近 6 条的滑窗（看"刚才心情"），
+        亲密度是累计（看"认识多久、整体合不合得来"），两者生命周期不同。
+        每 20 轮才落一次盘——每条都写文件纯属浪费磁盘 IO。
+        """
+        if not (self.cfg.get("memory") or {}).get("intimacy_enabled", True):
+            return
+        d = self.intimacy.get(conv)
+        if d is None:
+            d = self.intimacy[conv] = {"n": 0, "pos": 0, "neg": 0, "neu": 0,
+                                       "first": time.time(), "last": 0}
+        d["n"] = int(d.get("n") or 0) + 1
+        d["last"] = time.time()
+        d.setdefault("first", time.time())
+        tone = self.classify_mood(text)
+        if tone == "愉快":
+            d["pos"] = int(d.get("pos") or 0) + 1
+        elif tone in ("不耐烦", "低落"):
+            d["neg"] = int(d.get("neg") or 0) + 1
+        else:
+            d["neu"] = int(d.get("neu") or 0) + 1
+        if int(d["n"]) % 20 == 0:
+            self._save_intimacy()
+
+    def intimacy_line(self, conv, subject="跟他"):
+        """给 prompt 用的一行。没有数据就返回空（不注入，别占地方）。
+
+        subject 由调用方给：私聊是「跟他」，群聊是「在这个群」——同一个计数
+        在两处的含义不一样（群聊里的 conv 是群，不是某个人）。
+        """
+        d = self.intimacy.get(conv)
+        if not d or not int(d.get("n") or 0):
+            return ""
+        n = int(d["n"])
+        if n < 15:
+            stage = "刚认识"
+        elif n < 60:
+            stage = "聊过几回"
+        elif n < 200:
+            stage = "挺熟的"
+        elif n < 600:
+            stage = "老熟人"
+        else:
+            stage = "认识很久了"
+        days = 0
+        try:
+            days = int((time.time() - float(d.get("first") or time.time())) / 86400)
+        except Exception:
+            days = 0
+        born = ("，认识 %d 天" % days) if days >= 1 else ""
+        pos, neg = int(d.get("pos") or 0), int(d.get("neg") or 0)
+        tone = ""
+        if pos + neg >= 10:                 # 样本太少不下结论，免得一次吵架就定性
+            r = pos / float(pos + neg)
+            if r >= 0.6:
+                tone = "，聊起来大多挺轻松"
+            elif r <= 0.3:
+                tone = "，最近几回情绪都不太好"
+        return "%s聊过 %d 轮%s，%s%s" % (subject, n, born, stage, tone)
 
     # ---------- Few-shot 风格样本 ----------
     def _load_samples(self):

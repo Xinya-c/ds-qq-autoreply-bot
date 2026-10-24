@@ -275,6 +275,9 @@ qq_messages\
 | `backend`              | codebuddy_cli       | `codebuddy_cli` 或 `deepseek` |
 | `codebuddy.model`      | deepseek-v4.1-flash | 留空为 Auto                     |
 | `codebuddy.tools`      | WebSearch,WebFetch  | 工具白名单，空字符串=全禁                |
+| `codebuddy.cli_parallel` | 3                 | 实时池并发（私聊/@我）；多人聊天不排队           |
+| `codebuddy.cli_bg_parallel` | 1              | 后台池并发（补捞/主动搭话/摘要），不占实时槽位       |
+| `codebuddy.auto_port`  | true                | 每次调用分配独立端口，并发不撞 `EADDRINUSE` |
 | `merge_window_sec`     | 3                   | 连发合并窗口，0=关闭                  |
 | `max_parallel`         | 4                   | 同时处理的会话数                     |
 | `context_messages`     | 50                  | 进提示词的最近消息条数                  |

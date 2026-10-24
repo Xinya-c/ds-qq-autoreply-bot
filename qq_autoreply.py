@@ -28,6 +28,7 @@ import json
 import time
 import queue
 import random
+import socket
 import base64
 import glob
 import uuid
@@ -552,8 +553,20 @@ class AutoReply:
         self.seen_set = set()
         # 群聊主动搭话：计数从「本次上线」开始，不翻旧账
         self._img_cache = {}              # 表情包目录 -> (缓存时间, 清单)：目录是静态的
-        # CodeBuddy CLI 同一时刻只跑一个子进程（共享登录态，并发容易互相踩）
-        self._cli_sem = threading.Semaphore(1)
+        # CodeBuddy CLI 并发控制。实测 3 个并发完全安全（都正常出话，登录态
+        # 没被写坏——明文 token 已设只读，CLI 写不进去），所以不再全局串行：
+        # 那会把多人聊天压成一队，后说话的人要等前面每个人各 60 秒。
+        #
+        # 分两个池，避免后台任务把实时回复挤掉：
+        #   实时池：私聊、群里 @我 —— 用户正等着，给足并发
+        #   后台池：补捞、主动搭话、摘要 —— 晚点没关系，只给 1 个槽，
+        #          这样一次补捞 5 条也不会把实时消息堵在后面
+        _cb = self.cfg.get("codebuddy") or {}
+        self._cli_rt = max(1, int(_cb.get("cli_parallel", 3) or 3))
+        self._cli_bg = max(1, int(_cb.get("cli_bg_parallel", 1) or 1))
+        self._cli_sem = threading.Semaphore(self._cli_rt)
+        self._cli_bg_sem = threading.Semaphore(self._cli_bg)
+        self._cli_slots = self._cli_rt + self._cli_bg   # 跨进程槽位总数
         self.pmsg = {}                    # conv_key -> 已攒的群内他人消息条数
         self.ptarget = {}                 # conv_key -> 本轮随机出的目标条数
         self.plast = {}                   # conv_key -> 上次主动发言的时间戳
@@ -627,10 +640,19 @@ class AutoReply:
         if backend == "cli" or not self.api_key:
             # 必须走模型链：这里以前写死 codebuddy.model，主力一限流，
             # 所有摘要/关系档案/阶段回顾就全静默失败了
-            for m in self._cli_ready_models():
-                text = self._cli_invoke(prompt, None, m, tools="")
-                if text:
-                    return text
+            #
+            # 走后台池——摘要晚几分钟没人察觉，但绝不能占用实时回复的槽位。
+            # 拿不到就跳过：memory 那边会按条数再触发，不必在这里死等。
+            if not self._cli_bg_sem.acquire(timeout=120):
+                log("  摘要/回顾：CLI 后台池忙，本次跳过（下次再补）")
+                return None
+            try:
+                for m in self._cli_ready_models():
+                    text = self._cli_invoke(prompt, None, m, tools="")
+                    if text:
+                        return text
+            finally:
+                self._cli_bg_sem.release()
             if self._cli_ready_models():
                 log("  摘要/回顾：模型链都跑完了但没产出结果")
             else:
@@ -687,77 +709,64 @@ class AutoReply:
 
     @contextlib.contextmanager
     def _cli_process_lock(self, timeout=300):
-        """跨进程文件锁：同一时间只让一个 CodeBuddy CLI 实例在跑。
+        """跨进程 CLI 槽位锁：允许 N 个 CLI 实例并发（N = 实时池 + 后台池）。
 
-        为什么需要：CodeBuddy CLI 把登录态存在**文件**里（~/.codebuddy），
-        多个进程并发跑时，刷新 token 会互相覆盖，写空的那份就把登录态
-        搞没了——表现为「突然所有回复都报 Authentication required」。
-        （真踩过：17:33 我起了个额外实例，17:34 起 hasSession 就变成 false
-        了，16:xx 明明还好的。）
+        为什么本来要加锁：CodeBuddy CLI 把登录态存在**文件**里，多个实例并发
+        刷新 token 会互相覆盖，写空的那份就把登录态搞丢了（踩过：17:33 起了
+        个额外实例，17:34 起 hasSession 就变 false，16:xx 明明还好）。
 
-        两层保护：
-          ① 进程内 threading.Lock——Windows 的 msvcrt.locking 是**进程级**的，
-             同进程多个线程会一起拿到锁，所以必须自己先加线程锁
-          ② 跨进程文件锁——挡另一个守护进程 / WorkBuddy 自己的 CLI 实例
-             （拿不到就退化成只靠线程锁，不至于彻底不能用）
+        但**并发本身并不危险**：实测 3 个并发全部正常出话、登录态没坏。因为
+        登录拿到的是明文 JWT，我们已把它同步到 CLI 实际读的
+        `workbuddy-desktop.info` 并设成只读（见 tools/sync_cli_auth.py），
+        CLI 想覆盖也写不进去——「把好的写坏」那条路已经堵死了。
+
+        所以这里不再是全局互斥：那会把多人聊天压成一队，后说话的人要等
+        前面每个人各 60 秒。改成 **N 个槽位**：同进程由两个信号量限流，
+        跨进程由 N 个锁文件限流。总数封顶 N，既护住登录态又不串行。
         """
-        if not self._cli_file_lock.acquire(timeout=timeout):
-            raise TimeoutError("等待 CLI 锁超时")
-        f = None
+        slots = max(1, getattr(self, "_cli_slots", 1))
+        deadline = time.time() + timeout
+        got_path = None
+        while got_path is None:
+            for i in range(slots):
+                p = os.path.join(BASE, ".cli.lock.%d" % i)
+                # 陈旧槽位清理：进程崩了锁文件会留下，永久占坑。
+                # 用 mtime 判断而不是 PID——Windows 上没有 PID 1，
+                # _pid_alive(1) 会返回 False，那样会误删别人的活锁。
+                try:
+                    if time.time() - os.path.getmtime(p) > 300:
+                        log("  清理陈旧 CLI 槽位 %d（超过 5 分钟没动）" % i)
+                        os.remove(p)
+                except Exception:
+                    pass
+                try:
+                    fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                    try:
+                        os.write(fd, b"%d" % os.getpid())
+                    except Exception:
+                        pass
+                    os.close(fd)
+                    got_path = p
+                    break
+                except FileExistsError:
+                    continue        # 这个槽位有人用，试下一个
+                except (IOError, OSError):
+                    continue
+            if got_path is None:
+                if time.time() > deadline:
+                    # 槽位全被占（更可能是另一个守护进程在跑）。降级为
+                    # 并发执行，不阻塞——宁可偶尔多跑一个，也不要卡住不回。
+                    log("  CLI 槽位全满（%d 个），本次降级并发执行" % slots)
+                    yield None
+                    return
+                time.sleep(0.3)
         try:
-            lock_path = os.path.join(BASE, ".cli.lock")
-            try:
-                # 用「原子创建锁文件」做跨进程互斥：O_CREAT|O_EXCL 保证
-                # 同一时刻只有一个进程能建成它（Windows 和 POSIX 都可靠）。
-                # 比 msvcrt.locking 稳——那个是遗留 API，行为不一致，
-                # 实测两个进程能同时拿到锁。
-                #
-                # 陈旧锁处理：进程崩了锁文件会留下，永久锁死。
-                # 用「最后修改时间」判断，不看 PID——PID 判断不可靠
-                # （Windows 上没有 PID 1，而 _pid_alive(1) 会返回 False，
-                #  那样会把别人的活锁误删）。
-                # 锁只活几秒（一次模型调用），超过 5 分钟没动就是陈旧的。
-                try:
-                    age = time.time() - os.path.getmtime(lock_path)
-                    if age > 300:
-                        log("  清理陈旧 CLI 锁（%.0f 分钟没更新）" % (age / 60.0))
-                        try:
-                            os.remove(lock_path)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                try:
-                    os.write(fd, b"%d" % os.getpid())
-                except Exception:
-                    pass
-                f = os.fdopen(fd, "r+")
-            except FileExistsError:
-                # 别的进程在跑 CLI。这个锁只用来保护登录态不被并发写坏，
-                # 并不需要严格互斥（真正防「登录态被写坏」的是「别并发跑
-                # CLI」，而那由调用方的信号量 + 这里的锁共同保证）。
-                # 所以拿不到锁就降级成「只用进程内锁」，不阻塞主流程——
-                # 宁可偶尔并发，也不要卡住不回复。
-                log("  跨进程 CLI 锁被占用（另一个进程在跑 CLI），"
-                    "本次只用进程内锁")
-                f = None
-            except (IOError, OSError) as e:
-                log("  跨进程 CLI 锁拿不到（%s），只用进程内锁" % e)
-                f = None
-            yield f
+            yield got_path
         finally:
-            if f:
-                try:
-                    f.close()
-                except Exception:
-                    pass
-                # 释放 = 删掉锁文件（只有持有者才删）
-                try:
-                    os.remove(lock_path)
-                except Exception:
-                    pass
-            self._cli_file_lock.release()
+            try:
+                os.remove(got_path)
+            except Exception:
+                pass
 
     # ---------- 图片提取（不落盘、不给模型文件权限）----------
     def _download_image(self, data):
@@ -1547,11 +1556,34 @@ class AutoReply:
         log("  模型 %s 额度/频率受限（429），%s 前不再尝试"
             % (tag, time.strftime("%m-%d %H:%M", time.localtime(until))))
 
+    def _pick_cli_port(self):
+        """给这次 CLI 调用挑一个当前空闲的本地端口。
+
+        为什么必须指定：不给 --port 时 CLI 会去抢一个「稳定端口」，跟
+        WorkBuddy 自己或另一个 CLI 实例撞上就 EADDRINUSE 直接起不来
+        （真踩过：PID 155860 的 WorkBuddy 占着 56266，机器人调 CLI 全失败）。
+        并发跑时没有各自的端口就必然撞。
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        except Exception:
+            return random.randint(58000, 60000)
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
     def _cli_invoke(self, prompt, image=None, model=None, tools=None):
         cb = self.cfg["codebuddy"]
         args = [cb["node"], cb["cli"]]
         if model:
             args += ["--model", model]
+        # 每次调用给独立端口，否则并发实例会互相撞（见 _pick_cli_port）
+        if cb.get("auto_port", True):
+            args += ["--port", str(self._pick_cli_port())]
         # tools=None 表示用配置里的默认值；摘要这类内部任务传 "" 关掉工具
         tools = (cb.get("tools") or "").strip() if tools is None else tools
         args += ["--tools", tools, "--no-session-persistence"]
@@ -1644,21 +1676,23 @@ class AutoReply:
                    proactive=False):
         prompt, hist = self._prompt(conv_key, user_text, bool(image), mid, bare,
                                     excludes, uid, stale, replay, proactive)
-        # CodeBuddy CLI 共享同一份登录态和缓存目录，两个子进程并发跑容易互相
-        # 踩（实测出现过「主动接话」和「普通回复」撞在一起，其中一个卡满
-        # 180 秒超时）。所以同一时刻只跑一个 CLI：
-        # - 正常回复：排队等（回复是用户等着的事，不能丢）
-        # - 主动接话：拿不到锁就直接跳过（它是可选的，错过这回下次再说）
-        wait = not proactive
-        got = self._cli_sem.acquire(timeout=300 if wait else 0)
+        # 分池：补捞/主动搭话走后台池，不和实时回复抢槽位。
+        # - 实时（私聊、群里 @我）：排队等，最多等满 timeout
+        # - 主动接话：它是可选的，槽位满就直接跳过（错过这回等下次）
+        # - 补捞：也是后台，但会等（补的是真人说过的话，值得等）
+        bg = bool(replay or proactive)
+        sem = self._cli_bg_sem if bg else self._cli_sem
+        pool = "后台" if bg else "实时"
+        got = sem.acquire(timeout=0 if proactive else 300)
         if not got:
-            log("  CLI 正忙（另一个会话在调模型），%s本次跳过"
-                % ("主动接话" if proactive else "回复"))
+            log("  CLI %s池已满（%d 个并发在用），%s本次跳过"
+                % (pool, self._cli_bg if bg else self._cli_rt,
+                   "主动接话" if proactive else "回复"))
             return None
         try:
             return self._cli_reply_locked(prompt, hist, image, user_text)
         finally:
-            self._cli_sem.release()
+            sem.release()
 
     def _cli_reply_locked(self, prompt, hist, image, user_text):
         text = None

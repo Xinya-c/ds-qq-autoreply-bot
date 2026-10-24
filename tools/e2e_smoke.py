@@ -1256,85 +1256,78 @@ def test_cli_auth_and_lock():
     """
     bot, tmp = new_bot()
     try:
-        # ① 进程内互斥：两个线程不能同时进临界区
+        # ① 并发度：允许 _cli_slots 个并行，超过才排队
+        #    旧版是全局互斥（=1），多人聊天被压成一队，后说话的人要等前面
+        #    每个人各 60 秒——这正是用户反馈「人多就变慢」的根因。
+        slots = bot._cli_slots
         marks = []
+        barrier = threading.Barrier(slots + 1)
+
         def worker():
+            barrier.wait()
             with bot._cli_process_lock(timeout=10):
                 marks.append(time.time())
                 time.sleep(0.6)
-        ths = [threading.Thread(target=worker) for _ in range(2)]
+
+        ths = [threading.Thread(target=worker) for _ in range(slots + 1)]
         for t in ths:
             t.start()
         for t in ths:
             t.join()
         marks.sort()
-        check("CLI 锁：同进程两个线程互斥",
-              len(marks) == 2 and marks[1] - marks[0] >= 0.5,
-              "间隔 %.2fs" % (marks[1] - marks[0]) if len(marks) == 2 else "只有 %d 个" % len(marks))
+        parallel = [m for m in marks if m - marks[0] < 0.25]
+        check("CLI 锁：允许 %d 个并发（不再全局串行）" % slots,
+              len(parallel) == slots,
+              "并行进了 %d 个，期望 %d" % (len(parallel), slots))
+        check("CLI 锁：超过并发上限要排队",
+              len(marks) == slots + 1 and marks[-1] - marks[0] >= 0.5,
+              "第 %d 个等了 %.2fs" % (len(marks), marks[-1] - marks[0]))
 
-        # ② 跨进程互斥：锁文件用 O_EXCL 原子创建
-        #    用一个「存在但不是自己」的 PID 当持有者（模拟别的进程持锁）。
-        #    注意不能用不存在的 PID——那种会被当陈旧锁清掉。
-        lock = os.path.join(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))), ".cli.lock")
-        try:
-            if os.path.exists(lock):
-                os.remove(lock)
-        except Exception:
-            pass
-        made = False
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            os.write(fd, b"1")
-            os.close(fd)
-            made = True
-        except FileExistsError:
-            # 守护进程正在跑、正占着这个锁（真实环境常见）。
-            # 这时没法造测试用的锁文件，跳过这两条断言——
-            # 不能让「测试跟生产抢资源」变成误报。
-            pass
-        if not made:
-            check("CLI 锁：跨进程互斥（跳过：守护进程正占用锁）", True)
+        # ② 槽位文件生命周期（占用即建、释放即删）
+        adir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        def slot_files():
+            return [os.path.join(adir, ".cli.lock.%d" % i)
+                    for i in range(slots)
+                    if os.path.exists(os.path.join(adir, ".cli.lock.%d" % i))]
+
+        if slot_files():
+            # 守护进程正在跑、占着槽位。测试不该跟生产抢资源。
+            check("CLI 锁：槽位文件生命周期（跳过：守护进程正占用）", True)
         else:
-            got = None
+            with bot._cli_process_lock(timeout=5):
+                check("CLI 锁：持锁期间有槽位文件", len(slot_files()) == 1)
+            check("CLI 锁：释放后槽位文件被删", not slot_files())
+
+        # ③ 陈旧槽位（进程崩了留下的）要能自动清理
+        stale = []
+        old = time.time() - 3600          # 一小时前（判据是 mtime 超过 5 分钟）
+        for i in range(slots):
+            pth = os.path.join(adir, ".cli.lock.%d" % i)
             try:
-                with bot._cli_process_lock(timeout=2):
-                    # 拿不到跨进程锁时不阻塞（降级成只用进程内锁），
-                    # 但**不能删掉别人持有的锁**
-                    got = os.path.exists(lock)
-            except Exception:
-                got = False
-            check("CLI 锁：别的进程持锁时不删掉别人的锁", got is True,
-                  "锁还在=%s" % got)
-            try:
-                os.remove(lock)
+                if os.path.exists(pth):
+                    continue
+                with open(pth, "w") as f:
+                    f.write("stale")
+                os.utime(pth, (old, old))
+                stale.append(pth)
             except Exception:
                 pass
-
-        # ③ 陈旧锁（很久没更新）要能自动清理
-        try:
-            if os.path.exists(lock):
-                os.remove(lock)
-        except Exception:
-            pass
-        with open(lock, "w") as f:
-            f.write("1")
-        old = time.time() - 3600          # 一小时前（陈旧判据是 mtime）
-        try:
-            os.utime(lock, (old, old))
-        except Exception:
-            pass
-        ok = False
-        try:
-            with bot._cli_process_lock(timeout=5):
-                ok = True
-        except Exception as e:
-            ok = False
-        check("CLI 锁：陈旧锁（很久没更新）能自动清理", ok)
-        try:
-            os.remove(lock)
-        except Exception:
-            pass
+        if len(stale) == slots:           # 所有槽位都是我造的，才测得出「全占」
+            got = False
+            try:
+                with bot._cli_process_lock(timeout=5):
+                    got = True
+            except Exception:
+                got = False
+            check("CLI 锁：陈旧槽位能自动清理（全占也拿得到）", got)
+            for pth in slot_files():
+                try:
+                    os.remove(pth)
+                except Exception:
+                    pass
+        else:
+            check("CLI 锁：陈旧槽位清理（跳过：守护进程正占用）", True)
 
         # ④ 登录态失效 → 标记 + 走兜底，而不是发占位回复
         bot2, tmp2 = new_bot()
@@ -1691,7 +1684,56 @@ def test_replay_no_flood():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 35. 纯函数
+# ------------------------------------------------------------ 35. CLI 并发池
+def test_cli_parallel():
+    """实时池和后台池要分离：一次补捞 5 条不该把实时消息堵在后面。
+
+    用户反馈「加了 CLI 锁以后多人聊天会变慢」——根因是全局互斥把并发压成
+    串行：4 个人同时说话，最后一个人要等前面 3 个各 60 秒。现在允许并发，
+    且后台任务（补捞/主动搭话/摘要）走单独的池，不占实时槽位。
+    """
+    bot, tmp = new_bot()
+    try:
+        rt, bg = bot._cli_rt, bot._cli_bg
+        check("CLI 并发：实时池 ≥ 2（多人同时说话不排长队）", rt >= 2, "rt=%d" % rt)
+        check("CLI 并发：槽位总数 = 实时 + 后台",
+              bot._cli_slots == rt + bg,
+              "%d != %d+%d" % (bot._cli_slots, rt, bg))
+
+        # 用假的生成函数，避免真的起 CLI（一条要几十秒）
+        bot._prompt = lambda *a, **k: ("p", [])
+        bot._cli_reply_locked = lambda prompt, hist, image, text: "ok"
+
+        # ① 后台池占满时，实时回复不受影响
+        for _ in range(bg):
+            bot._cli_bg_sem.acquire()
+        try:
+            r = bot._cli_reply("u2", "hi")
+            check("CLI 并发：后台池满时实时回复照样能跑", r == "ok", repr(r))
+        finally:
+            for _ in range(bg):
+                bot._cli_bg_sem.release()
+
+        # ② 实时池占满时，补捞（后台）照样能跑 —— 证明它走的是另一个池
+        for _ in range(rt):
+            bot._cli_sem.acquire()
+        try:
+            r2 = bot._cli_reply("u3", "hi", replay=True)
+            check("CLI 并发：补捞走后台池（实时池满也跑得动）", r2 == "ok", repr(r2))
+        finally:
+            for _ in range(rt):
+                bot._cli_sem.release()
+
+        # ③ 每次调用都给独立端口，否则并发实例会 EADDRINUSE 撞死
+        ports = [bot._pick_cli_port() for _ in range(8)]
+        check("CLI 并发：端口逐个分配（并发不会撞端口）",
+              all(1024 < p < 65536 for p in ports) and len(set(ports)) > 1,
+              str(ports[:4]))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 36. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1730,7 +1772,7 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_pure):
+               test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_replay_no_flood, test_cli_parallel, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

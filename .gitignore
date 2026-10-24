@@ -37,7 +37,7 @@ qq_autoreply.pid
 qq_autoreply_config.json
 
 # CLI 跨进程锁（运行时生成）
-.cli.lock
+.cli.lock*
 
 # ===== 本地脚本/旧版备份（含个人路径，仅本地保留）=====
 login_codebuddy.bat

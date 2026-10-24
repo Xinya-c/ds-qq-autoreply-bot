@@ -1514,7 +1514,59 @@ def test_poke_not_blocking():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ------------------------------------------------------------ 33. 纯函数
+# ------------------------------------------------------------ 33. 带 @ 的消息要能归档
+def test_at_message_archive():
+    """带 at 段的消息必须能归档。
+
+    踩过的坑：memory._msg_kind 被写成了 @staticmethod，但里面用 self.self_id
+    判断「@ 的是不是我」。于是**所有带 @ 的消息**归档都抛
+    NameError('self')，被调用方 try 吞掉，日志只留一句
+    「存图/归档失败（不影响回复）」——看着不影响，实际后果很严重：
+    这些消息一条都进不了归档，而补捞的判据正是「归档里有没有它」，
+    所以它们每次启动都被重新补捞、重复回复。
+    """
+    bot, tmp = new_bot()
+    try:
+        bot.self_id = 999
+        bot.mem.self_id = 999
+        evt = {
+            "post_type": "message", "message_type": "group",
+            "user_id": 333, "group_id": 222, "message_id": "g-at-1",
+            "time": int(time.time()),
+            "message": [
+                {"type": "reply", "data": {"id": "x"}},
+                {"type": "at", "data": {"qq": "888"}},
+                {"type": "text", "data": {"text": "你说的不对"}},
+            ],
+            "sender": {"nickname": "测试乙"},
+        }
+        err = None
+        try:
+            bot.mem.archive_incoming(evt)
+        except Exception as e:
+            err = e
+        check("带 @ 的消息能归档（_msg_kind 不再是 staticmethod）",
+              err is None, repr(err) if err else "")
+
+        p = os.path.join(bot.mem.archive_dir(), "group_222.md")
+        arch = open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+        check("带 @ 的消息真的写进了归档", "你说的不对" in arch)
+        check("归档里标了类型（引用）", "引用" in arch, arch[-60:].strip())
+
+        # @ 我 的情况要标成「@我」，@ 别人只标「@」
+        evt2 = dict(evt)
+        evt2["message"] = [{"type": "at", "data": {"qq": "999"}},
+                           {"type": "text", "data": {"text": "在吗"}}]
+        evt2["time"] = int(time.time())
+        bot.mem.archive_incoming(evt2)
+        arch2 = open(p, encoding="utf-8").read()
+        check("@我 的消息归档标成「@我」", "@我" in arch2,
+              arch2.strip().splitlines()[-1][:60])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------------------ 34. 纯函数
 def test_pure():
     check("sanitize 去掉首尾空白",
           qa.sanitize_reply("  嗯\n ") == "嗯")
@@ -1553,7 +1605,7 @@ def main():
                test_owner, test_restore_segments, test_last_night_dates,
                test_time_words, test_rate_per_session, test_group_layers,
                test_poke, test_image_limits, test_cli_auth_and_lock,
-               test_sweep_no_repeat, test_poke_not_blocking, test_pure):
+               test_sweep_no_repeat, test_poke_not_blocking, test_at_message_archive, test_pure):
         print("--- %s ---" % fn.__name__)
         fn()
     print("=" * 66)

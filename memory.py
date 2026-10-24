@@ -704,9 +704,15 @@ class BotMemory:
             return
         self._index_line(conv, line)      # 增量进检索索引（写入成功才索引）
 
-    @staticmethod
-    def _msg_kind(evt):
-        """给消息打类型标记（归档结构化用）：图 / 视频 / 语音 / 文件 / 引用 / @我 / 表情。"""
+    def _msg_kind(self, evt):
+        """给消息打类型标记（归档结构化用）：图 / 视频 / 语音 / 文件 / 引用 / @我 / 表情。
+
+        注意：**不能是 @staticmethod**。下面判断「@的是不是我」要用 self.self_id，
+        写成 staticmethod 就会抛 NameError('self')，被调用方 try 吞掉，
+        表现为「存图/归档失败（不影响回复）」——后果是所有带 @ 的消息
+        **一条都进不了归档**，而补捞的判定依据正是「归档里有没有它」，
+        于是这些消息每次启动都被重新补捞、重复回复。
+        """
         segs = evt.get("message") or []
         types = [s.get("type") for s in segs if isinstance(s, dict)]
         for t, name in (("image", "图"), ("video", "视频"),

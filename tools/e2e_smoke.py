@@ -2715,6 +2715,96 @@ def test_social_v2():
         line = m.tie_line(55556, 66667)
         check("社交v2：自曝多不等于熟（不判糙、也不判亲）",
               "糙" not in line and "客气" not in line, line)
+
+        # ⑦ 离线 LLM 判的 reply-to 能被应用（工具写文件，社交图读）
+        #    造两句毫无共同词的长句：规则连不上，写覆盖后必须连上。
+        # 中间插一个第三者：否则「二人世界」加分会让规则自己连上，测不出覆盖
+        rows = [(0, "甲(11111)", "明天上午我在公司开会"),
+                (20, "丙(33333)", "晚上要不要一起开黑几把"),
+                (200, "乙(22222)", "收到 那我下午再过去找你")]
+        load(rows, "g992")
+        d = m.social_map().get(11111, {}).get(22222, {})
+        before = len(d.get("threads") or ())
+        import json as _json
+        ov = os.path.join(m.archive_dir(), "_social_links.json")
+        def _ts(off):
+            return time.strftime("%Y-%m-%d %H:%M:%S",
+                                 time.localtime(base + off))
+        with open(ov, "w", encoding="utf-8") as f:
+            # 键是（时间, 正文），不是行号——行号会随新消息错位
+            _json.dump({"992": [[_ts(200), rows[2][2], _ts(0), rows[0][2]]]},
+                       f, ensure_ascii=False)
+        m._sm_cache = None
+        m._sm_key = None
+        d = m.social_map().get(11111, {}).get(22222, {})
+        after = len(d.get("threads") or ())
+        check("社交v2：离线 LLM 的 reply-to 覆盖能生效",
+              before == 0 and after == 1, "%d → %d" % (before, after))
+        os.remove(ov)            # 别把覆盖留给后面的断言
+        m._sm_cache = None
+        m._sm_key = None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_social_vec():
+    """向量相似度通路：有编码器走向量，没有就退字面，编码器报错也不能炸。"""
+    import numpy as _np
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = qa.load_config()
+        cfg["archive"]["dir"] = tmp
+        bot = qa.AutoReply(cfg)
+        m = bot.mem
+        base = time.mktime(time.strptime("2026-10-24 20:00:00", "%Y-%m-%d %H:%M:%S"))
+
+        class Fake:
+            def encode(self, texts):
+                out = []
+                for t in texts:
+                    v = _np.zeros(4, dtype=_np.float32)
+                    if any(k in t for k in ("饿", "饭", "吃", "肚子")):
+                        v[0] = 1
+                    if any(k in t for k in ("游戏", "开黑", "打")):
+                        v[1] = 1
+                    if not v.any():
+                        v[3] = 1
+                    out.append(v / (_np.linalg.norm(v) or 1))
+                return _np.stack(out)
+
+        A = "我今天特别饿想找点东西"
+        B = "肚子空空的还没进食"      # 与 A 字面重叠 0，但同话题
+        C = "晚上要不要一起开黑几把"
+
+        def build(emb, rows):
+            m._search.embedder = emb
+            m._vec_cache = {}
+            m._search.recs = [("g991",
+                               time.strftime("%Y-%m-%d %H:%M:%S",
+                                             time.localtime(base + o)), n, b)
+                              for o, n, b in rows]
+            m._sm_cache = None
+            m._sm_key = None
+            return m.social_map()
+
+        # 三人：甲乙同话题，丙插话 → 「二人世界」不成立，只能靠向量连
+        rows = [(0, "甲(11111)", A), (15, "丙(33333)", C), (30, "乙(22222)", B)]
+        sm = build(None, rows)
+        check("向量：没编码器时退回字面（同义改写连不上）",
+              not sm.get(11111, {}).get(22222, {}).get("threads"),
+              str(len(sm.get(11111, {}).get(22222, {}).get("threads") or ())))
+        sm = build(Fake(), rows)
+        check("向量：有编码器时同义改写能连上",
+              len(sm.get(11111, {}).get(22222, {}).get("threads") or ()) == 1)
+
+        # 编码器抛异常 → 不许影响出结果
+        class Bad:
+            def encode(self, texts):
+                raise RuntimeError("boom")
+
+        sm = build(Bad(), rows)
+        check("向量：编码器报错不炸（退回字面）",
+              isinstance(sm, dict) and 11111 in sm)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2824,7 +2914,7 @@ def main():
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
                test_tools_fallback, test_humanize_batch, test_batch23,
                test_ws_event_isolation, test_download_timeout,
-               test_social_v2,
+               test_social_v2, test_social_vec,
                test_person_brief,
                test_nonfriend_msg,
                test_scan_new_friends,

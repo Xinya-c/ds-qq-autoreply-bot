@@ -1506,6 +1506,11 @@ class BotMemory:
     LINK_SELF_GAP = 90
     # 「只有我们俩在说」的加分（见候选生成处）
     LINK_DUO_BONUS = 0.15
+    # 句向量相似度的映射区间（标定值，别凭感觉改）：
+    #   实测「同一话题」cos 0.51~0.77，「无关」0.30~0.46
+    #   → 0.45 以下算 0，0.75 以上算 1
+    VEC_SIM_LO = 0.45
+    VEC_SIM_SPAN = 0.30
 
     # 关系语用词表（LIWC 的中文近似）。依据 ACL 2012《Self-Disclosure and
     # Relationship Strength》：强关系里脏话频率接近弱关系的 7 倍，而正面客套话
@@ -1535,39 +1540,16 @@ class BotMemory:
           g        共同群             ← 最弱：大群里可能从没说过话
           prof/neg/polite  说话的糙度 ← ACL 2012：脏话≈熟，客气≈远
         """
-        key = len(self._search.recs)
+        over, over_mtime = self._link_overrides()
+        key = (len(self._search.recs), over_mtime)
         if self._sm_cache is not None and self._sm_key == key:
             return self._sm_cache
         pat_nick = re.compile(r"[(（]\s*(\d{5,12})\s*[)）]\s*$")
         pat_at = re.compile(r"@(\d{5,12})")
 
-        # ① 按群分组，每条消息的特征一次算好。
-        #    切词只做一次——放到配对里反复切会慢一个数量级（2.4 万次配对）。
-        by_group = {}
-        for conv, ts, nick, body in self._search.recs:
-            if not conv.startswith("g"):
-                continue
-            mm = pat_nick.search(nick or "")
-            if not mm:
-                continue
-            try:
-                t = time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
-            except Exception:
-                continue
-            txt = body or ""
-            uid = int(mm.group(1))
-            low = txt.lower()
-            by_group.setdefault(conv[1:], []).append({
-                "t": t, "uid": uid, "text": txt,
-                "toks": {x for x, _k in tokenize(txt)},
-                "q": self._is_question(txt),
-                "at": [int(x) for x in pat_at.findall(txt)
-                       if int(x) not in (uid, self.self_id)],
-                "mood": self.classify_mood(txt),
-                "prof": sum(1 for w in self.PROF_WORDS if w in low),
-                "neg": sum(1 for w in self.NEG_WORDS if w in txt),
-                "polite": sum(1 for w in self.POLITE_WORDS if w in txt),
-            })
+        by_group = self._group_rows()
+
+        self._attach_vectors(by_group)
 
         out = {}
 
@@ -1605,6 +1587,23 @@ class BotMemory:
                         sc += self.LINK_DUO_BONUS
                     if sc >= self.LINK_FLOOR:
                         cand.append((sc, i, j))
+
+            # ②b 离线 LLM 判的 reply-to（tools/social_llm_relink.py 生成）作为
+            #     最高置信候选：分数给 1.0，easy-first 会最先定型它们，规则连线
+            #     再挂到这些骨架上。**只在离线跑**——一次调用十几秒，绝不能进
+            #     回复路径（认人是在生成回复时调的）。
+            if over.get(gid):
+                pos = {}
+                for k, r in enumerate(rows):
+                    pos.setdefault((r["ts"], r["text"]), k)
+                for c_ts, c_tx, p_ts, p_tx in over[gid]:
+                    i = pos.get((c_ts, c_tx))
+                    j = pos.get((p_ts, p_tx))
+                    if i is None or j is None or i <= j:
+                        continue
+                    if rows[i]["t"] - rows[j]["t"] > self.LINK_MAX_GAP:
+                        continue
+                    cand.append((1.0, i, j))
 
             # ③ easy-first 解码：按置信度**从高到低**逐条定父。
             #
@@ -1736,6 +1735,126 @@ class BotMemory:
                 or any(k in t for k in ("吗", "怎么", "为什么", "啥", "什么",
                                         "哪", "谁", "咋", "多少", "是不是")))
 
+    def _group_rows(self):
+        """按群解析归档，把每条消息的特征一次算好。
+
+        切词只做一次——放到配对里反复切会慢一个数量级（2.4 万次配对）。
+        抽成独立方法是为了让 tools/social_llm_relink.py 用同一份解析，
+        免得工具和主逻辑各写一遍、以后调字段漏一处。
+        """
+        pat_nick = re.compile(r"[(（]\s*(\d{5,12})\s*[)）]\s*$")
+        pat_at = re.compile(r"@(\d{5,12})")
+        by_group = {}
+        for conv, ts, nick, body in self._search.recs:
+            if not conv.startswith("g"):
+                continue
+            mm = pat_nick.search(nick or "")
+            if not mm:
+                continue
+            try:
+                t = time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                continue
+            txt = body or ""
+            uid = int(mm.group(1))
+            low = txt.lower()
+            by_group.setdefault(conv[1:], []).append({
+                "t": t, "ts": ts, "uid": uid, "text": txt,
+                "toks": {x for x, _k in tokenize(txt)},
+                "q": self._is_question(txt),
+                "at": [int(x) for x in pat_at.findall(txt)
+                       if int(x) not in (uid, self.self_id)],
+                "mood": self.classify_mood(txt),
+                "prof": sum(1 for w in self.PROF_WORDS if w in low),
+                "neg": sum(1 for w in self.NEG_WORDS if w in txt),
+                "polite": sum(1 for w in self.POLITE_WORDS if w in txt),
+            })
+        return by_group
+
+    def _link_overrides(self):
+        """读离线 LLM 判的 reply-to。返回 ({gid: [(子ts,子文,父ts,父文)]}, mtime)。
+
+        格式（tools/social_llm_relink.py 生成）：
+            {"663611925": [["2026-10-24 20:40:00", "那就楼下集合",
+                            "2026-10-24 20:00:00", "今天谁去吃饭"], ...]}
+
+        为什么用时间+正文当键而不是行号：行号会随着新消息涌入全错位，
+        而「这一句在回那一句」用（时间, 正文）能稳定对上。找不到就跳过，
+        绝不会因为覆盖文件过期而把关系算错。
+        """
+        path = os.path.join(self.archive_dir(), "_social_links.json")
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            return {}, 0
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = json.load(f) or {}
+        except Exception:
+            return {}, 0
+        out = {}
+        for gid, pairs in d.items():
+            rows = []
+            for it in pairs or []:
+                if isinstance(it, (list, tuple)) and len(it) == 4:
+                    rows.append(tuple(str(x) for x in it))
+            if rows:
+                out[str(gid)] = rows
+        return out, mt
+
+    def _attach_vectors(self, by_group):
+        """给每条群消息挂上句向量（bge-small-zh，本地）。
+
+        为什么要向量：字面重叠对口语基本无效——「我饿了」和「没吃饭呢」共同词
+        为零，但明显是同一件事。实测这类改写字面分 0、向量分 0.66。
+
+        拿不到就静默跳过：所有消息都没有 "vec" 时，_pair_sim 自动退回字面相似。
+        模型没就绪、numpy 缺失、编码报错，都不该影响社交图能不能算出来。
+
+        带文本级缓存：一句话编一次。所以新增一条消息只多编一条（~3ms），
+        不会因为「记录数变了」把 2000 条重编一遍。
+        """
+        if not (self.cfg.get("memory") or {}).get("social_vec", True):
+            return False
+        emb = getattr(self._search, "embedder", None)
+        if emb is None:
+            return False
+        try:
+            import numpy as np
+        except Exception:
+            return False
+        cache = self.__dict__.setdefault("_vec_cache", {})
+        texts = {r["text"] for rows in by_group.values() for r in rows if r["text"]}
+        todo = [t for t in texts if t not in cache]
+        if todo:
+            try:
+                vecs = emb.encode(todo)
+            except Exception:
+                return False
+            for t, v in zip(todo, vecs):
+                cache[t] = v
+            if len(cache) > 12000:          # 上限：一句话 2KB，别无限涨
+                keep = {t: cache[t] for t in texts if t in cache}
+                self._vec_cache = cache = keep
+        np = np
+        for rows in by_group.values():
+            for r in rows:
+                r["vec"] = cache.get(r["text"])
+        return True
+
+    def _pair_sim(self, prev, cur):
+        """两句的话题相似度（0~1）。有向量用向量，否则退字面。"""
+        va = prev.get("vec")
+        vb = cur.get("vec")
+        if va is not None and vb is not None:
+            try:
+                cos = float(va @ vb)        # 编码时已 L2 归一化
+            except Exception:
+                cos = 0.0
+            return max(0.0, min(1.0,
+                                (cos - self.VEC_SIM_LO) / self.VEC_SIM_SPAN))
+        return self._jaccard(prev["toks"], cur["toks"])
+
     @staticmethod
     def _jaccard(sa, sb):
         if not sa or not sb:
@@ -1756,7 +1875,7 @@ class BotMemory:
         长度断崖、情绪翻面、标点爆发——是语义向量抓不到的边界线索。
         """
         same = prev["uid"] == cur["uid"]
-        sim = self._jaccard(prev["toks"], cur["toks"])
+        sim = self._pair_sim(prev, cur)
         s = 0.0
         # ① 时间：越近越可能（权重压得低，语义权重更高，见 ④）
         s += max(0.0, 1.0 - gap / float(self.LINK_MAX_GAP)) * 0.10

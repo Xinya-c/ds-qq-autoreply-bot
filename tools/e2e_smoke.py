@@ -1350,7 +1350,20 @@ def test_cli_auth_and_lock():
         finally:
             shutil.rmtree(tmp2, ignore_errors=True)
 
-        # ⑤ 直连 API：reasoning 模型正文在 reasoning_content 时也要能取到
+        # ⑥ 噪音事件不该记日志（否则真正的消息被淹掉）
+        #    实测：心跳 30 秒一条、「对方正在输入」每次打字推两条，
+        #    全记的话几分钟上千行，18:48 那条私聊就被埋得找不到了
+        noise = [
+            ({"post_type": "meta_event", "meta_event_type": "heartbeat"}, True),
+            ({"post_type": "notice", "sub_type": "input_status"}, True),
+            ({"post_type": "notice", "sub_type": "poke"}, False),
+            ({"post_type": "notice", "sub_type": "group_increase"}, False),
+        ]
+        bad = [(e, qa.AutoReply._is_noise_event(e))
+               for e, want in noise if qa.AutoReply._is_noise_event(e) != want]
+        check("噪音事件（心跳/输入状态）不记日志", not bad, str(bad)[:80])
+
+        # ⑦ 直连 API：reasoning 模型正文在 reasoning_content 时也要能取到
         bot3, tmp3 = new_bot()
         try:
             bot3.api_key = "sk-test"

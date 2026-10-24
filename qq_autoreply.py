@@ -1891,13 +1891,37 @@ class AutoReply:
             log("  戳一戳的记忆/归档失败（不影响回复）: %s" % e)
         self._handle(evt2)
 
+    # 噪音事件：心跳、输入状态、这类高频又没信息量的，日志里不记。
+    # 判断依据是「处理过它」或「它天然每几秒来一次」。
+    NOISE_EVENTS = frozenset({
+        "meta_event",           # 心跳 / 生命周期，30 秒一条
+    })
+    NOISE_NOTICE_SUBTYPES = frozenset({
+        "input_status",         # 「对方正在输入…」每次打字推两条
+        "online_file_ts",       # 文件状态心跳
+    })
+
+    @classmethod
+    def _is_noise_event(cls, evt):
+        """高频、无信息量的事件——记了只会把真正的消息淹掉。"""
+        if evt.get("post_type") in cls.NOISE_EVENTS:
+            return True
+        if evt.get("post_type") == "notice" and \
+                str(evt.get("sub_type") or "") in cls.NOISE_NOTICE_SUBTYPES:
+            return True
+        return False
+
     def on_event(self, evt):
         try:
             ptype = evt.get("post_type")
             # 原始事件落盘：诊断用。有些事件（戳一戳、各种 notice）在日志里
-            # 完全看不见——因为它们没走到下面任何一个分支。全部记下来，
-            # 才能确认 NapCat 到底推了什么（格式、字段名）。
-            if ptype not in ("message",):
+            # 完全看不见——因为它们没走到下面任何一个分支。记下来才能确认
+            # NapCat 到底推了什么（格式、字段名）。
+            #
+            # 但**不能全记**：心跳（meta_event）每 30 秒一条、「对方正在输入」
+            # 每次打字都推两条。全记的话日志几分钟就上千行，真正的消息被淹没
+            # 得根本看不见（实测过）。只记「没处理过、又值得看」的。
+            if ptype not in ("message",) and not self._is_noise_event(evt):
                 try:
                     log("原始事件 post_type=%s: %s" % (
                         ptype, json.dumps(evt, ensure_ascii=False)[:400]))

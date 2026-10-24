@@ -649,6 +649,9 @@ class AutoReply:
         # 防编造：上次重生成的时间（按会话冷却）、当前需要警告的会话集合
         self._fab_at = {}
         self._fab_warn = set()
+        # 打分发言：上一条群消息时间 / 名字缓存
+        self._p_last_msg = {}
+        self._p_name_cache = None
         # 好友 ID 缓存：(拉取时间, {uid,...})。判断「是不是好友」要在每条
         # 陌生人消息上做，每次现拉一遍太浪费。
         self._friend_cache = None
@@ -3063,7 +3066,7 @@ class AutoReply:
             if evt.get("message_type") == "group" and not evt.get("_replay") \
                     and self.mem.allowed(evt):
                 try:
-                    self._proactive_note(self.mem.conv_of(evt))
+                    self._proactive_note(self.mem.conv_of(evt), evt)
                 except Exception as e:
                     log("  主动搭话计数失败（不影响回复）: %s" % e)
             self._schedule(evt)
@@ -3636,27 +3639,96 @@ class AutoReply:
         if spoken:
             self.phour.setdefault(conv, deque()).append(now)
 
-    def _proactive_note(self, conv):
-        """群里每来一条他人消息调一次；攒满本轮目标就安排一次主动接话。"""
+    def _p_names(self):
+        """我的名字（群里有人叫名字就该接话）。从人设第一句抽，抽不到就空。"""
+        if self._p_name_cache is not None:
+            return self._p_name_cache
+        names = []
+        try:
+            m = re.search(r"你是「([^」]{1,12})」", self.cfg.get("system_prompt") or "")
+            if m:
+                names.append(m.group(1))
+        except Exception:
+            pass
+        for n in (self.cfg.get("proactive") or {}).get("names") or []:
+            if n and str(n) not in names:
+                names.append(str(n))
+        self._p_name_cache = names
+        return names
+
+    def _p_score(self, conv, text, now=None):
+        """这条群消息值不值得接：0~1。纯规则，不花 token。
+
+        为什么要打分而不是只看条数：攒够 N 条就开口像排班——不管群里在聊
+        什么，到点就说话。真人是「这句我能接」才开口。条数下限保留（不能让
+        它彻底沉默），打分负责「提前」，两个条件是「或」的关系。
+        """
+        now = now or time.time()
+        t = (text or "").strip()
+        if not t:
+            return 0.0
+        s = 0.0
+        # 有人真在问
+        if any(k in t for k in ("？", "?", "吗", "怎么", "为什么", "啥",
+                                "什么", "哪", "谁", "咋", "多少")):
+            s += 0.30
+        # 叫我了
+        if any(n and n in t for n in self._p_names()):
+            s += 0.35
+        # 有情绪，有戏
+        if any(k in t for k in ("哈哈", "笑死", "233", "草", "卧槽", "妈的",
+                                "烦", "累", "崩", "无语", "醉了", "服了")):
+            s += 0.20
+        # 冷场了，该有人说话（首条消息不算冷场——那时 _p_last_msg 还是空的）
+        prev = self._p_last_msg.get(conv)
+        if prev:
+            gap = now - float(prev)
+            if gap > 900:
+                s += 0.25
+            elif gap > 300:
+                s += 0.15
+        # 我刚说过话就别抢
+        if now - float(self.plast.get(conv) or 0) < 120:
+            s -= 0.50
+        return max(0.0, min(1.0, s))
+
+    def _proactive_note(self, conv, evt=None):
+        """群里每来一条他人消息调一次；攒满本轮目标或打分够格就安排主动接话。"""
         cfg = self.cfg.get("proactive") or {}
         if not cfg.get("enabled", True):
             return
         if not self.cfg.get("reply_in_group_when_at", True):
             return
         now = time.time()
+        text = ""
+        if evt is not None:
+            try:
+                text = flatten_message(evt.get("message"))
+            except Exception:
+                text = ""
         n = self.pmsg.get(conv, 0) + 1
         target = self._p_target(conv)
-        if n < target:
+        thr = float(cfg.get("score_threshold", 0.6) or 0.6)
+        score = self._p_score(conv, text, now)
+        # 够格也不一定开口：加概率抖动，否则凑巧每条都在问句上就要连发
+        hit_p = float(cfg.get("score_hit_prob", 0.75) or 0.75)
+        early = score >= thr and random.random() < hit_p
+        self._p_last_msg[conv] = now
+        if n < target and not early:
             self.pmsg[conv] = n
             return
-        # 攒满了：先清零重抽（没过闸的话下次攒满再试），再看让不让我说
+        # 攒满了 / 打分够格：先清零重抽（没过闸的话下次攒满再试），再看让不让我说
         self.pmsg[conv] = 0
         self.ptarget[conv] = self._p_new_target()
         if not self._p_allowed(conv, now):
             log("群%s 攒够 %d 条群消息，但还在冷却或已达每小时上限，本次不主动接话"
                 % (conv, target))
             return
-        log("群%s 已攒 %d 条群消息，安排一次主动接话" % (conv, target))
+        if early and n < target:
+            log("群%s 只攒了 %d 条（目标 %d），但这条打分 %.2f 够格，提前接话"
+                % (conv, n, target, score))
+        else:
+            log("群%s 已攒 %d 条群消息，安排一次主动接话" % (conv, target))
         # 入队就按下冷却计时：模型再慢也不会连着安排第二次（防排队连发）
         self.plast[conv] = now
         self._enqueue(conv, {

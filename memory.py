@@ -1482,53 +1482,121 @@ class BotMemory:
         return [gid for gid, s in self.group_members().items()
                 if a in s and b in s]
 
+    THREAD_GAP = 300               # 线程内两条消息最长间隔（秒）
+
     def social_map(self):
-        """uid -> {peer: {"g": {群号}, "at": 次数}}：谁跟谁有交集。
+        """uid -> {peer: {...}}：谁跟谁真的有来往。
 
-        两条边，都从归档现算（不扫文件、不花额度）：
-          同在群   — 从群消息 nick 里的 (QQ号) 推，这是**事实**
-          @ 互动   — 从群消息正文里的 @QQ号 推，这是**行为**
+        信号按可信度排（依据 Gilbert & Karahalios 2009：亲密度 > 强度 > 结构）：
+          threads  一起参与过几段对话    ← 最强：真聊过
+          turns    在这些对话里说了几句
+          at       @ 次数（降权：@ 只是开场，不代表聊过）
+          last     最后一次互动时间（recency 是最强预测因子之一）
+          g        共同群（最弱：同一个大群里可能从没说过话）
 
-        为什么要这张图：光看「有没有共同群」太粗——两个人可能在一个大群里
-        从没说过话。有了 @ 次数，认人时能多说一句「那个老 @ 我的」，
-        而不是干巴巴一句「我知道有这么个人」。
+        **对话线程怎么切**（借 Ubuntu Dialogue Corpus 的做法）：
+        @ 只是**开场标记**，不是关系本身。真实情况是「@ 完第一次，后面顺着
+        聊了几句」——所以先按 @ 找对话起点，再把后续没 @ 的发言按「发送者
+        已经在这个线程里 + 时间连续」归进去。中途第三个人 @ 进来，算加入
+        这个线程（同一话题），不是另起一段。
         """
         key = len(self._search.recs)
         if self._sm_cache is not None and self._sm_key == key:
             return self._sm_cache
         pat_nick = re.compile(r"[(（]\s*(\d{5,12})\s*[)）]\s*$")
         pat_at = re.compile(r"@(\d{5,12})")
-        gmem = {}                      # gid -> {uid}
-        edges = {}                     # (a,b) -> {"g": set(), "at": n}
-        for conv, _ts, nick, body in self._search.recs:
+
+        # ① 按群分组、解析发送者、按时间排序
+        by_group = {}
+        for conv, ts, nick, body in self._search.recs:
             if not conv.startswith("g"):
                 continue
-            gid = conv[1:]
             m = pat_nick.search(nick or "")
             if not m:
                 continue
-            a = int(m.group(1))
-            gmem.setdefault(gid, set()).add(a)
-            for t in pat_at.findall(body or ""):
-                b = int(t)
-                if a == b or b == self.self_id:
-                    continue           # 自己 @ 自己、@ 机器人都不算人际互动
-                k = (min(a, b), max(a, b))
-                e = edges.setdefault(k, {"g": set(), "at": 0})
-                e["g"].add(gid)
-                e["at"] += 1
+            try:
+                t = time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                continue
+            by_group.setdefault(conv[1:], []).append(
+                (t, int(m.group(1)), body or ""))
+
         out = {}
-        for gid, ids in gmem.items():
-            for a in ids:
-                for b in ids:
+
+        def edge(a, b):
+            return out.setdefault(a, {}).setdefault(
+                b, {"g": set(), "threads": set(), "turns": 0, "at": 0,
+                    "last": 0.0})
+
+        for gid, rows in by_group.items():
+            rows.sort(key=lambda r: r[0])
+            gmem = {r[1] for r in rows}
+            active = []
+            seq = 0
+            for t, sender, body in rows:
+                ats = [int(x) for x in pat_at.findall(body)
+                       if int(x) not in (sender, self.self_id)]
+                # 过期的线程不再接收新消息（冷场就算结束）
+                active = [a for a in active
+                          if t - a["last"] <= self.THREAD_GAP]
+                target = None
+                if ats:
+                    # 有 @：优先并入「sender 已在其中、且被 @ 的人也在」的线程，
+                    # 其次并入「sender 已在其中」的线程——后者就是
+                    # 「@ 完第一次，后面接着聊」的情形
+                    for pool in (lambda a: sender in a["members"]
+                                 and set(ats) & a["members"],
+                                 lambda a: sender in a["members"]):
+                        for a in active:
+                            if pool(a):
+                                target = a
+                                break
+                        if target:
+                            break
+                    if target is None:
+                        seq += 1
+                        target = {"members": set(), "last": t, "turns": 0,
+                                  "tid": (gid, seq)}
+                        active.append(target)
+                    target["members"] |= {sender} | set(ats)
+                else:
+                    for a in active:
+                        if sender in a["members"]:
+                            target = a
+                            break
+                if target is None:
+                    continue              # 冷场里的一句独白，不构成关系
+                target["last"] = t
+                target["turns"] += 1
+                for other in target["members"]:
+                    if other == sender:
+                        continue
+                    e = edge(sender, other)
+                    e["g"].add(gid)
+                    e["threads"].add(target["tid"])
+                    e["turns"] += 1
+                    e["last"] = max(e["last"], t)
+                    if other in ats:
+                        e["at"] += 1
+            # 同群补全（最弱的边：只是在一个群里）
+            for a in gmem:
+                for b in gmem:
                     if a != b:
-                        out.setdefault(a, {}).setdefault(
-                            b, {"g": set(), "at": 0})["g"].add(gid)
-        for (a, b), e in edges.items():
-            for x, y in ((a, b), (b, a)):
-                d = out.setdefault(x, {}).setdefault(y, {"g": set(), "at": 0})
-                d["g"] |= e["g"]
-                d["at"] += e["at"]
+                        edge(a, b)["g"].add(gid)
+        # 对称化：关系是双向的，但统计时「中途加入线程的人」拿不到早期轮次，
+        # 会出现 A→B 3 段、B→A 2 段。取并集补平，免得同一段关系两边说法不一。
+        for a, peers in list(out.items()):
+            for b, d in list(peers.items()):
+                rev = out.get(b, {}).get(a)
+                if rev is None:
+                    out.setdefault(b, {})[a] = {
+                        "g": set(d["g"]), "threads": set(d["threads"]),
+                        "turns": d["turns"], "at": d["at"], "last": d["last"]}
+                else:
+                    d["threads"] |= rev["threads"]
+                    d["turns"] = max(d["turns"], rev["turns"])
+                    d["at"] = max(d["at"], rev["at"])
+                    d["last"] = max(d["last"], rev["last"])
         self._sm_cache = out
         self._sm_key = key
         return out
@@ -1536,20 +1604,47 @@ class BotMemory:
     def tie_line(self, viewer, uid):
         """给 prompt 用：viewer 和 uid 之间是什么关系（没交集返回空）。
 
-        这个是「关系」，不是「内容」——只描述他们怎么认识的、互动过几次，
+        这个是「关系」，不是「内容」——只描述怎么认识的、来往多密，
         不含任何一方的私密信息，所以哪个场景都能说。
+
+        先报「一起聊过几段」而不是「@ 过几次」：@ 是开场动作，聊起来才是
+        关系。只 @ 一次后面没接话的，说明更多是「喊了一声」。
         """
         try:
             d = (self.social_map().get(int(viewer)) or {}).get(int(uid)) or {}
         except (TypeError, ValueError):
             return ""
-        gs = sorted(d.get("g") or [])
+        th = len(d.get("threads") or ())
         at = int(d.get("at") or 0)
+        turns = int(d.get("turns") or 0)
+        last = float(d.get("last") or 0)
+        gs = sorted(d.get("g") or [])
         parts = []
-        if gs:
-            parts.append("你们都在 %s 群" % "、".join(gs[:2]))
-        if at:
-            parts.append("互相 @ 过 %d 次" % at)
+        # 分级：真聊过 > 只喊过 > 只在一个群
+        # （原来写成 `if th: 聊过 / elif at: 喊过`，但只要有 @ 就会建线程，
+        #  at 那条分支永远走不到——「喊了一声就走」被算成「聊过一回」。）
+        if th >= 2 or (th == 1 and turns >= 4):
+            parts.append("一起聊过 %d 回" % th)
+            if turns >= 4:
+                parts.append("来回说了 %d 句" % turns)
+        elif at >= 2:
+            parts.append("喊过你 %d 次，没怎么接上话" % at)
+        elif th == 1:
+            parts.append("聊过一两句")
+        elif at:
+            parts.append("喊过你 %d 次" % at)
+        if last:
+            age = time.time() - last
+            if age < 3600:
+                parts.append("刚才还在说")
+            elif age < 86400:
+                parts.append("今天聊过")
+            elif age < 86400 * 3:
+                parts.append("%d 天前聊过" % int(age // 86400))
+            elif age > 86400 * 30:
+                parts.append("很久没来往了")
+        if gs and not th:
+            parts.append("都在 %s 群" % "、".join(gs[:2]))
         return ("你跟他的关系：" + "，".join(parts)) if parts else ""
 
     def person_brief(self, uid, scope=None, viewer=None, max_msgs=4):

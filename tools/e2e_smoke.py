@@ -2594,8 +2594,21 @@ def test_person_brief():
               "663611925" not in str(m.social_map().get(55555, {}).get(66666))
               and bool(m.tie_line(55555, 66666)),
               m.tie_line(55555, 66666))
-        check("社交：统计互相 @ 的次数", "2 次" in m.tie_line(55555, 66666),
+        # 连续两轮 @ + 接话 → 算「聊过」；不再是干巴巴的「@ 过 2 次」
+        check("社交：连续接话算「聊过」",
+              ("聊过" in m.tie_line(55555, 66666)
+               or "喊过" in m.tie_line(55555, 66666)),
               m.tie_line(55555, 66666))
+        # 间隔超过线程窗口（5 分钟）的 @ 不该连成一段对话
+        before = len(m.social_map().get(55555, {}).get(66666, {}).get("threads", ()))
+        m._search.recs.extend([
+            ("g222", "2026-10-22 20:00:00", "小王(55555)", "@66666 在吗"),
+            ("g222", "2026-10-22 20:30:00", "小王(55555)", "@66666 在吗在吗"),
+        ])
+        m._sm_cache = None
+        after = len(m.social_map().get(55555, {}).get(66666, {}).get("threads", ()))
+        check("社交：间隔太久不算一段对话（各算各的）", after > before,
+              "%d → %d" % (before, after))
         check("社交：没交集的人没有关系行", m.tie_line(55555, 77777) == "")
         brief = m.person_brief(66666, ["222"], viewer=55555)
         check("社交：认人时带上关系行",

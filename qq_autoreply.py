@@ -1695,6 +1695,31 @@ class AutoReply:
                 lines.append("")
         except Exception:
             pass
+        # 「你记得 123456 吗」——他问的是**另一个人**，那个人的资料在
+        # u<123456> 那个会话里：related() 只搜当前会话，结构上搜不到；
+        # 用整句话做语义检索也匹配不上（"现在想起来…了吗" vs "你会背出师吗"）。
+        # 所以这里按 QQ 号直接取档案，不走检索。
+        #
+        # **只在主人私聊里认人**：别人问「你记得 123456 吗」不能把那个人的
+        # 档案念出来——那是隐私。
+        #
+        # 先只算好、不立刻写进 prompt：这个信息要放在**靠后**的位置（贴着
+        # 「对方刚说」），中间隔两千多字的话模型根本看不见。实测过：放在
+        # 人设后面时，模型仍然回「没印象，这人到底是谁」。
+        _who = None
+        if not conv_key.startswith("g") and user_text:
+            try:
+                _owner = str(self.cfg.get("owner_qq") or "").strip()
+                if _owner and str(uid or "") == _owner:
+                    for _num in re.findall(r"\d{5,12}", user_text):
+                        if _num in (_owner, str(uid)):
+                            continue
+                        _brief = self.mem.person_brief(_num)
+                        if _brief:
+                            _who = (_num, _brief)
+                            break
+            except Exception:
+                pass
         recent_kao = list(self.kaomoji_hist.get(conv_key) or [])
         if recent_kao:
             lines.append("最近用过的颜文字（这几个别再用了，换新的）：" + "、".join(recent_kao))
@@ -1765,6 +1790,16 @@ class AutoReply:
             lines.append("（这些是检索出来的，**不一定真相关**。用得上就自然接一句，"
                          "用不上就当没看见——别硬扯，也别原样复述。"
                          "对方没问起的时候，别主动翻这些旧账。）")
+            lines.append("")
+        # 「你记得 123456 吗」：他点名了一个人。放在这里（贴紧「对方刚说」）
+        # 而不是人设后面——实测放在前面时模型照样回「没印象，这人到底是谁」，
+        # 因为隔了两千多字早被稀释了。
+        if _who:
+            lines.append("【%s 是你认识的人，**不是陌生人**】" % _who[0])
+            lines.append("他问这句就是在考你记不记得。你确实跟他聊过：")
+            lines.extend(_who[1])
+            lines.append("（顺着接一句就行，别把上面的话原样念出来。"
+                         "但**绝对不能说「没印象」「不认识」**——你认识他。）")
             lines.append("")
         ctx = mem["context"]
         if ctx and conv_key.startswith("g"):

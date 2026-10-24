@@ -1362,6 +1362,66 @@ class BotMemory:
             out.append("他最近在群里说过：%s" % t[:60])
         return out
 
+    def person_brief(self, uid, max_msgs=4):
+        """按 QQ 号取一个人的概况：关系档案 + 群档案 + 最近说过的话。
+
+        为什么需要：主人在自己私聊里问「你记得 3207399168 吗」，那个人的
+        资料全在 u<3207399168> 那个会话里。related() 只搜当前会话，结构上
+        搜不到；而且「现在想起来3207399168了吗」这句话跟那个人说过的
+        「你会背出师吗」语义上也不相似，拿整句去检索一样空手。
+
+        所以这里不用语义检索，直接按 QQ 号定位——用户点名了谁，就去取谁的
+        档案。三处来源都从内存读，不扫文件。
+        """
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return []
+        conv = "u%d" % uid
+        out = []
+        prof = " ".join((self.profile.get(conv) or "").split())
+        if prof:
+            out.append("你跟他在私聊里的关系：%s" % prof[:180])
+        for k, v in self.user_profile.items():
+            if k.endswith("|u%d" % uid):
+                body = " ".join(str(v or "").split())
+                if body:
+                    out.append("他在群里是这样的：%s" % body[:140])
+                break
+        d = self.recent.get(conv)
+        if d:
+            said = []
+            for m in list(d)[-10:]:
+                t = (m.get("text") or "").strip()
+                if len(t) < 3:
+                    continue
+                if t[0] in "（(【" and t[-1] in "）)】":
+                    continue                  # （图片）（空消息）这类占位
+                said.append(t)
+            if said:
+                out.append("他最近跟你说过：%s" % " / ".join(said[-max_msgs:])[:200])
+        # 最早那几条最能说明「这人是谁」——开场通常就是问候、自我介绍、
+        # 让你背诗这类。只靠最近几句的话，模型只知道「他抱怨过什么」，
+        # 认不出人（实测：只给最近 4 句时，它回「好像有点影子」）。
+        try:
+            recs = [(r[2], r[3].strip()) for r in self._search.recs if r[0] == conv]
+        except Exception:
+            recs = []
+        early = []
+        for nick, body in recs[:20]:
+            if nick == "我":
+                continue                      # 自己的话不算「他说过什么」
+            if len(body) < 3 or body in early:
+                continue
+            if body[0] in "（(【" and body[-1] in "）)】":
+                continue
+            early.append(body)
+            if len(early) >= 4:
+                break
+        if early:
+            out.append("他最开始来找你时说的是：%s" % " / ".join(early)[:180])
+        return out
+
     # ---------- 关系档案 ----------
     def _profile_path(self, key):
         # key 三种形态："u123" 私聊 | "g123" 群级 | "g123|u456" 群内个人

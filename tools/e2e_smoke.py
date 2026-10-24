@@ -2512,6 +2512,48 @@ def test_download_timeout():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_person_brief():
+    """「你记得 123456 吗」——按 QQ 号取另一个人的资料。
+
+    背景：主人在自己私聊里问「现在想起来 3207399168 了吗」，那个人的资料
+    全在 u3207399168 那个会话里。related() 只搜当前会话，结构上搜不到；
+    拿整句话做语义检索也匹配不上（"现在想起来…了吗" vs "你会背出师吗"）。
+    实测：修之前模型回「没印象，这人到底是谁」，修之后回「哦——背出师表
+    那个？好像有点印象了」。
+    """
+    bot, tmp = new_bot()
+    try:
+        m = bot.mem
+        # 造一个人（u555）的会话：开场几句 + 最近几句，混一条机器人自己说的
+        m._search.recs.extend([
+            ("u555", "2026-10-20 10:00:00", "甲", "你会背出师吗"),
+            ("u555", "2026-10-20 10:00:20", "我", "出师表嘛，会背一点点"),
+            ("u555", "2026-10-20 10:01:00", "甲", "你来这的目的是什么"),
+            ("u555", "2026-10-21 09:00:00", "甲", "还想着那盒子呢？"),
+        ])
+        brief = m.person_brief(555)
+        joined = " ".join(brief)
+        check("认人：能取到那个人说过的话", "你会背出师吗" in joined, joined[:80])
+        check("认人：不把机器人自己的话当成「他说过」",
+              "出师表嘛，会背一点" not in joined, joined[:80])
+        check("认人：查不存在的人返回空", m.person_brief(99999999) == [])
+
+        # 隐私边界：只在主人私聊里认人
+        bot.cfg["owner_qq"] = "111"
+        bot.cfg["reply_images"]["enabled"] = False
+        # 用 5 位号：正则要求 5~12 位（真实 QQ 号都是这个长度），
+        # 拿 3 位的 555 测会被长度门槛挡住，测的就不是隐私边界了
+        m._search.recs.extend([("u55555", "2026-10-20 10:00:00", "甲", "你会背出师吗")])
+        pr_owner = bot._prompt("u111", "还记得 55555 吗", uid=111)[0]
+        check("认人：主人私聊里注入他人资料", "55555 是你认识的人" in pr_owner)
+        pr_other = bot._prompt("u333", "还记得 55555 吗", uid=333)[0]
+        check("认人：非主人问起不注入（隐私）", "55555 是你认识的人" not in pr_other)
+        pr_group = bot._prompt("g222", "还记得 55555 吗", uid=111)[0]
+        check("认人：群聊里不注入（旁边有人在看）", "55555 是你认识的人" not in pr_group)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_face_text():
     """QQ 自带表情要带上名字，不能只留个「[表情]」。
 
@@ -2617,6 +2659,7 @@ def main():
                test_poke_not_swept, test_poke, test_image_limits, test_cli_auth_and_lock,
                test_tools_fallback, test_humanize_batch, test_batch23,
                test_ws_event_isolation, test_download_timeout,
+               test_person_brief,
                test_nonfriend_msg,
                test_scan_new_friends,
                test_stranger_flow,
